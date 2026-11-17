@@ -6,7 +6,7 @@
 
 import type { VdlBlockEntry, VdlDownload, VdlFilter, VdlSearchCtx, VdlView } from './-vdl.types';
 
-import { VDL_ACTIVE_STATUSES, VDL_FAILED_STATUSES } from './-vdl.types';
+import { VDL_ACTIVE_STATUSES, VDL_FAILED_STATUSES, VDL_REMOVABLE_STATUSES } from './-vdl.types';
 
 /* ── kinds / statuses ──────────────────────────────────────────────────── */
 
@@ -63,6 +63,11 @@ export function vdlIsActive(status: string | null | undefined): boolean {
 
 export function vdlIsFail(status: string | null | undefined): boolean {
   return (VDL_FAILED_STATUSES as readonly string[]).includes(status || '');
+}
+
+/** A failed or cancelled row: 'Remove from list' and 'Clear failed' take it. */
+export function vdlIsRemovable(status: string | null | undefined): boolean {
+  return (VDL_REMOVABLE_STATUSES as readonly string[]).includes(status || '');
 }
 
 /** The old page's pill matching: 'all' | 'active' | 'completed' | 'failed'. */
@@ -228,6 +233,16 @@ export function vdlFmtBytes(bytes: number | null | undefined): string {
     i += 1;
   }
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${u[i]}`;
+}
+
+/** The bin's count line: "3 files", or "1 folder · 2 files" once a whole
+ *  title folder (Delete Show / Delete Movie) is in it. */
+export function vdlBinCountLabel(items: { is_folder?: boolean | null }[]): string {
+  const folders = items.filter((e) => e.is_folder).length;
+  const files = items.length - folders;
+  const part = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  if (!folders) return part(files, 'file');
+  return files ? `${part(folders, 'folder')} · ${part(files, 'file')}` : part(folders, 'folder');
 }
 
 /* ── meta URLs ─────────────────────────────────────────────────────────── */

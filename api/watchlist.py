@@ -8,9 +8,12 @@ from core.watchlist_sources import (
     ARTIST_ID_COLUMNS, SOURCE_COLUMNS, artist_id_match_sql, normalize_source,
 )
 from database.music_database import get_database
+from utils.logging_config import get_logger
 from .auth import require_api_key
 from .helpers import api_success, api_error, parse_fields, parse_profile_id
 from .serializers import serialize_watchlist_artist
+
+logger = get_logger("api.watchlist")
 
 
 def _parse_quality_profile_id(db, body):
@@ -116,8 +119,18 @@ def register_routes(bp):
         profile_id = parse_profile_id(request)
         try:
             db = get_database()
+            # §69.1 reverse edge: capture identity before delete, demonitor the
+            # matching lib2 artist afterwards (both-way sync).
+            descriptor = db.get_watchlist_artist_descriptor(artist_id, profile_id=profile_id)
             ok = db.remove_artist_from_watchlist(artist_id, profile_id=profile_id)
             if ok:
+                try:
+                    from core.settings import config_manager
+                    from core.library2.monitor_sync import sync_watchlist_removal
+                    sync_watchlist_removal(db, config_manager, descriptor,
+                                           profile_id=profile_id)
+                except Exception as sync_e:
+                    logger.debug("watchlist reverse-sync skipped: %s", sync_e)
                 return api_success({"message": "Artist removed from watchlist."})
             return api_error("NOT_FOUND", "Artist not found in watchlist.", 404)
         except Exception as e:
@@ -130,8 +143,12 @@ def register_routes(bp):
 
         Body: {"include_albums": true, "include_live": false, ...}
         Accepts any combination of: include_albums, include_eps, include_singles,
-        include_live, include_remixes, include_acoustic, include_compilations,
-        follow_defaults.
+        include_live, include_live_tracks, include_remixes, include_acoustic,
+        include_compilations, follow_defaults.
+
+        include_live is about live albums, include_live_tracks about a live
+        version on any other release. Until include_live_tracks is sent once
+        it follows include_live (#2082).
 
         follow_defaults true puts the artist back on the watchlist defaults.
         Sending release rules for an artist that follows the defaults gives it
@@ -142,7 +159,8 @@ def register_routes(bp):
 
         allowed_fields = {
             "include_albums", "include_eps", "include_singles",
-            "include_live", "include_remixes", "include_acoustic", "include_compilations",
+            "include_live", "include_live_tracks", "include_remixes", "include_acoustic",
+            "include_compilations",
         }
         # Only fields the client actually SENT are touched — this is a real
         # partial PATCH, unlike the legacy full-form endpoint (P2-03).
@@ -187,11 +205,16 @@ def register_routes(bp):
                         updates = {**{k: v for k, v in default_values(config_manager).items()
                                       if k not in updates}, **updates}
                         updates["follow_defaults"] = False
+                        # a client that sets Live and has never heard of live
+                        # tracks means both, as it always did (#2082): NULL
+                        # follows include_live
+                        if "include_live" in body and "include_live_tracks" not in body:
+                            updates["include_live_tracks"] = None
 
                 # Build SET clause
                 set_parts = [f"{k} = ?" for k in updates]
                 values = [
-                    int(v) if key == "quality_profile_id" else int(bool(v))
+                    None if v is None else int(v) if key == "quality_profile_id" else int(bool(v))
                     for key, v in updates.items()
                 ]
 

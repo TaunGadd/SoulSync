@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { RepairFinding } from '../-tools.types';
@@ -89,5 +89,249 @@ describe('FindingDetail duplicate rows', () => {
       'In playlist: Road Trip, Gym',
     );
     expect(rows[1].textContent).toContain('KEEP');
+  });
+
+  it('an old 3.6.1 duplicate finding is read-only and points at the Duplicate Detector', () => {
+    // third #1062 review G16-3: its fixer is gone, so "keep this version"
+    // opened a destructive confirm the server could only refuse
+    const onKeep = vi.fn();
+    const { container } = render(
+      <FindingDetail
+        finding={duplicateFinding()}
+        onKeepDuplicate={onKeep}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    fireEvent.click(container.querySelectorAll('.repair-detail-subitem')[0]);
+    expect(onKeep).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('Run the Duplicate Detector');
+  });
+});
+
+const nativeFinding = (requiresConfirmation = false): RepairFinding =>
+  duplicateFinding({
+    finding_type: 'native_duplicate_tracks',
+    entity_id: 'lib2:7',
+    details: {
+      schema: 'native_duplicate_review/v1',
+      recommended_file_id: 102,
+      requires_recording_confirmation: requiresConfirmation,
+      tracks: [
+        {
+          id: 101,
+          file_id: 101,
+          track_id: 7,
+          title: 'Song',
+          artist: 'Artist',
+          file_path: '/music/Song.flac',
+          bitrate: 900,
+          protected_reasons: ['manual_primary'],
+        },
+        {
+          id: 102,
+          file_id: 102,
+          track_id: 7,
+          title: 'Song',
+          artist: 'Artist',
+          file_path: '/music/Song.mp3',
+          bitrate: 320,
+          protected_reasons: [],
+        },
+        {
+          id: 103,
+          file_id: 103,
+          track_id: 8,
+          title: 'Song',
+          artist: 'Artist',
+          file_path: '/music/companion.mp3',
+          protected_reasons: ['intentional_format', 'playlist_reference'],
+          playlists: ['Road Trip'],
+        },
+      ],
+    },
+  });
+
+describe('Native duplicate review', () => {
+  it('uses the native recommendation, keeps protected copies, and selects an exact file', () => {
+    const select = vi.fn();
+    const { container } = render(
+      <FindingDetail
+        finding={nativeFinding()}
+        onKeepDuplicate={select}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    const rows = container.querySelectorAll('.repair-detail-subitem');
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain('PROTECTED');
+    expect(rows[1].textContent).toContain('KEEP');
+    expect(rows[2].textContent).toContain('PROTECTED');
+    expect(rows[2].textContent).toContain('Road Trip');
+    expect(container.textContent).not.toContain('REMOVE');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Keep this file' })[1]);
+    expect(select).toHaveBeenCalledWith(1, 'file-102');
+  });
+
+  it('requires explicit same-recording confirmation before choosing a fuzzy copy', () => {
+    const select = vi.fn();
+    render(
+      <FindingDetail
+        finding={nativeFinding(true)}
+        onKeepDuplicate={select}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    const pick = screen.getAllByRole('button', { name: 'Keep this file' })[1];
+    expect(pick).toBeDisabled();
+    fireEvent.click(pick);
+    expect(select).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /same recording/i }));
+    fireEvent.click(pick);
+    expect(select).toHaveBeenCalledWith(1, 'file-102:confirmed');
+    fireEvent.click(screen.getByRole('button', { name: 'Keep Best' }));
+    expect(select).toHaveBeenLastCalledWith(1, 'keep_best:confirmed');
+  });
+});
+
+const catalogueFinding = (eligible = true): RepairFinding =>
+  duplicateFinding({
+    finding_type: 'native_duplicate_releases',
+    entity_type: 'album',
+    entity_id: 'lib2:995',
+    details: {
+      schema: 'native_duplicate_releases/v1',
+      merge_eligible: eligible,
+      blocked_reasons: eligible ? [] : ['An acquisition is still active.'],
+      albums: [995, 1125].map((album_id, index) => ({
+        album_id,
+        title: 'Ark',
+        artist_name: 'Star Party',
+        release_date: '2016-02-04',
+        file_count: 0,
+        provider_ids: { spotify: 'release-' + index },
+        tracks: [
+          {
+            id: index + 1,
+            title: 'Ark',
+            duration: 180800,
+            isrc: 'GB2LD2010147',
+            evidence_source: 'cache:spotify:track-' + index,
+          },
+        ],
+      })),
+    },
+  });
+
+describe('Catalogue duplicate review', () => {
+  it('compares fileless releases and selects the exact surviving album', () => {
+    const choose = vi.fn();
+    const { container } = render(
+      <FindingDetail
+        finding={catalogueFinding()}
+        onKeepDuplicate={choose}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    expect(container.textContent).toContain('GB2LD2010147');
+    expect(container.textContent).toContain('3:01');
+    expect(container.textContent).toContain('release-1');
+    fireEvent.click(screen.getByRole('button', { name: 'Merge into release #1125' }));
+    expect(choose).toHaveBeenCalledWith(1, 'merge-1125');
+    expect(container.textContent).not.toContain('quarantine');
+  });
+
+  it('explains an active-download blocker and disables merging', () => {
+    render(
+      <FindingDetail
+        finding={catalogueFinding(false)}
+        onKeepDuplicate={vi.fn()}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('An acquisition is still active.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Merge into release #995' })).toBeDisabled();
+  });
+});
+
+describe('Library re-tag checks (Storm)', () => {
+  const retag = {
+    id: 9,
+    finding_type: 'library_retag',
+    severity: 'info',
+    entity_type: 'track',
+    entity_id: 'lib2:1',
+    title: 'Tags out of date',
+    description: '',
+    details: {
+      validation: { checks: { album: 'correct', albumartist: 'mismatch', genre: 'unknown' } },
+      diff: [
+        { file_key: 'album', file_value: 'Views', db_value: 'Views' },
+        { file_key: 'album_artist', file_value: 'Jim O’Rourke', db_value: 'Jim O Rourke' },
+      ],
+    },
+  } as unknown as RepairFinding;
+
+  it('a genre or year that only differs is shown as left alone, not as a fault', () => {
+    const quiet = {
+      ...retag,
+      details: {
+        validation: {
+          checks: { genre: 'differs', year: 'differs', total_discs: 'missing' },
+          reference: { genres: ['Electronic'], year: 1996 },
+        },
+      },
+    } as unknown as RepairFinding;
+    const { container } = render(
+      <FindingDetail finding={quiet} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('differs from the library, which has Electronic. Left as it is');
+    expect(text).toContain('differs from the library, which has 1996. Left as it is');
+    // never the raw state word, and never dressed as something to fix
+    expect(text).not.toMatch(/Genre\s*differs$/);
+    expect(text).toContain('missing from the file');
+  });
+
+  it('says what the file has and what SoulSync would write for a mismatch', () => {
+    const { container } = render(
+      <FindingDetail finding={retag} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('mismatch: file "Jim O’Rourke", SoulSync "Jim O Rourke"');
+    // a correct field stays a single word
+    expect(text).not.toContain('correct: file');
+  });
+
+  it('lists every field Apply Tags writes, source ids, siblings and hand edits too', () => {
+    // third #1062 review G16-2: the checks grid has no row for these, so a
+    // finding whose only drift was an id said every check was correct
+    const finding = {
+      ...retag,
+      details: {
+        validation: { checks: { title: 'correct' } },
+        diff: [
+          {
+            field: 'MusicBrainz Recording ID',
+            file_key: 'musicbrainz_recording_id',
+            file_value: '',
+            db_value: 'mb-1',
+            changed: true,
+          },
+          { field: 'Title (song.mp3)', file_value: 'Old', db_value: 'New', changed: true },
+          { field: 'Genre', file_value: 'Rock', db_value: 'Pop', changed: true, manual: true },
+        ],
+      },
+    } as unknown as RepairFinding;
+    const { container } = render(
+      <FindingDetail finding={finding} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('Apply Tags will write');
+    expect(text).toContain('MusicBrainz Recording ID');
+    expect(text).toContain('∅   →   mb-1');
+    expect(text).toContain('Title (song.mp3)');
+    expect(text).toContain('Rock   →   Pop   (set by hand)');
+    // the checks still show, below
+    expect(text).toContain('Tag checks');
   });
 });

@@ -105,6 +105,7 @@ class ConfigManager:
         'plex.token',
         'jellyfin.api_key',
         'navidrome.password',
+        'music_assistant.token',
         # Download sources
         'soulseek.api_key',
         'deezer_download.arl',
@@ -121,6 +122,7 @@ class ConfigManager:
         'lastfm.session_key',
         'genius.access_token',
         'pollinations.api_key',
+        'fanart.api_key',
         # Deezer OAuth
         'deezer.app_id',
         'deezer.app_secret',
@@ -539,6 +541,18 @@ class ConfigManager:
                 "password": "",
                 "auto_detect": True
             },
+            "music_assistant": {
+                "base_url": "",
+                # a long-lived token from Music Assistant (Settings > Users)
+                "token": "",
+                # instance id of the Local files / SMB source the scan reads
+                "source_instance": "",
+                # the folder that source reads, as music assistant sees it. only
+                # used when music assistant won't say (2.10.9 keeps it private)
+                "source_folder": "",
+                "auto_detect": True,
+                "request_timeout_seconds": 30
+            },
             "soulseek": {
                 "slskd_url": "",
                 "api_key": "",
@@ -645,6 +659,11 @@ class ConfigManager:
             },
             "tidal_download": {
                 "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
+                # #2069: seconds between two download requests (search or
+                # manifest). Downloads are one at a time already; this spaces
+                # the requests one track makes as it steps down the quality
+                # chain. 0 turns it off.
+                "min_request_gap_seconds": 1.0,
                 "session": {
                     "token_type": "",
                     "access_token": "",
@@ -729,6 +748,10 @@ class ConfigManager:
                 "password": "",
                 "category": "soulsync",
                 "save_path": "",
+                # qBittorrent only (#2087): start what SoulSync adds even when the
+                # client is set to add torrents stopped, or to stop them once the
+                # metadata is in. Off = the client's own setting decides.
+                "start_torrents": False,
                 # Seeding lifecycle (mirror of the video side): seed a completed
                 # music torrent grab until the ratio/time goal is met, then remove
                 # it from the client. BOTH goals default 0 = sweep OFF = grabs seed
@@ -754,6 +777,14 @@ class ConfigManager:
                 "username": "",
                 "password": "",
                 "category": "soulsync",
+                "acquisition_monitor_interval_seconds": 15,
+                # Remove Completed: what happens to a music usenet job once it
+                # has imported -- "off" (default, leave it in the client),
+                # "history" (remove it from the client's history) or "files"
+                # (remove it and delete what's left in its folder). Album and
+                # track grabs COPY the audio out, so without this the whole
+                # release stays in the client's completed folder.
+                "remove_completed": "off",
             },
             "soundcloud_download": {
                 # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
@@ -792,6 +823,11 @@ class ConfigManager:
             # optional. cover art works without it (one image every 45s with
             # their logo); a key from enter.pollinations.ai lifts both
             "pollinations": {
+                "api_key": ""
+            },
+            # optional. HD artist photos and backgrounds for Plex/Jellyfin
+            # (#1957); a free personal key from fanart.tv
+            "fanart": {
                 "api_key": ""
             },
             # Two providers answering two different questions: Ticketmaster for
@@ -942,6 +978,10 @@ class ConfigManager:
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
                 "write_artist_nfo": False,
+                # Library v2: a monitored track whose file was deleted outside
+                # SoulSync is downloaded again (Lidarr behaviour). Off, the
+                # deletion counts as "don't download again" for that track.
+                "redownload_externally_deleted": True,
             },
             "file_organization": {
                 "enabled": True,

@@ -28,6 +28,48 @@ from utils.logging_config import get_logger
 
 logger = get_logger("web_server")
 
+# the list's per-playlist status counts: ~0.6s on a 10k-track mirror set with
+# nothing else running, and the dashboard band, the sync page and the cards
+# each ask, often at the same moment. concurrent asks share one computation
+# and the answer is reused this long; a count a few seconds old on a card is
+# fine, four of them stacked behind a sync's writes was not
+# (the test suite sets it to 0: a test writes then reads straight away)
+STATUS_COUNTS_TTL = float(os.environ.get('SOULSYNC_STATUS_COUNTS_TTL', '5'))
+_status_counts_lock = threading.Lock()
+_status_counts_cache: dict = {}   # key -> (computed_at, counts)
+_status_counts_inflight: dict = {}  # key -> threading.Event
+
+
+def _status_counts(database, profile_id):
+    key = (str(getattr(database, 'database_path', id(database))), profile_id)
+    while True:
+        with _status_counts_lock:
+            hit = _status_counts_cache.get(key)
+            if hit and time.monotonic() - hit[0] < STATUS_COUNTS_TTL:
+                return hit[1]
+            waiting = _status_counts_inflight.get(key)
+            if waiting is None:
+                done = threading.Event()
+                _status_counts_inflight[key] = done
+                break
+        # someone else is computing it; their answer is ours
+        if not waiting.wait(60):
+            break
+        with _status_counts_lock:
+            hit = _status_counts_cache.get(key)
+            if hit:
+                return hit[1]
+    try:
+        counts = database.get_all_mirrored_playlist_status_counts(profile_id=profile_id)
+        with _status_counts_lock:
+            _status_counts_cache[key] = (time.monotonic(), counts)
+        return counts
+    finally:
+        with _status_counts_lock:
+            event = _status_counts_inflight.pop(key, None)
+        if event is not None:
+            event.set()
+
 # injected by configure()
 get_database = None
 config_manager = None
@@ -39,6 +81,7 @@ _save_sync_status_file = None
 _spotify_client = None
 _matching_engine = None
 _get_automation_deps = None
+_repair_worker = None
 
 
 def configure(**deps):
@@ -139,7 +182,7 @@ def get_mirrored_playlists_endpoint():
         # Single batched query instead of N per-playlist round-trips. Used to
         # take ~50ms per playlist (new connection + 4 sub-queries) — at 30
         # playlists that's 1.5s of modal load time just for status counts.
-        batch_counts = database.get_all_mirrored_playlist_status_counts(profile_id=profile_id)
+        batch_counts = _status_counts(database, profile_id)
         # the name each one lands on the server under, when two mirrors share a name
         try:
             from core.playlists.sync_names import all_sync_names
@@ -244,12 +287,10 @@ def check_mirrored_playlist_library_endpoint(playlist_id):
         if not playlist:
             return jsonify({"error": "Playlist not found"}), 404
         tracks = database.get_mirrored_playlist_tracks(playlist_id)
-        active = config_manager.get_active_media_server() if config_manager else None
         result = check_mirror_tracks(
             database, tracks,
             profile_id=int(playlist.get('profile_id') or get_current_profile_id() or 1),
             source=playlist.get('source'),
-            active_server=active,
         )
         return jsonify({"success": True, **result})
     except Exception as e:
@@ -476,7 +517,8 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
     """Update per-playlist download preferences (e.g. organize by playlist folder)."""
     try:
         data = request.get_json() or {}
-        if not ({'organize_by_playlist', 'quality_profile_id', 'sync_mode'} & set(data)):
+        if not ({'organize_by_playlist', 'quality_profile_id', 'sync_mode', 'rotating',
+                 'allow_uncatalogued'} & set(data)):
             return jsonify({"error": "No supported preference supplied"}), 400
 
         database = get_database()
@@ -510,6 +552,24 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
             else:
                 return jsonify({"error": "Invalid sync_mode"}), 400
 
+        # #2039: a rotating playlist's downloads go once the track leaves it
+        rotating = None
+        if 'rotating' in data:
+            rotating = parse_strict_bool(data.get('rotating'))
+            if rotating is None:
+                return jsonify({"error": "Invalid rotating"}), 400
+            if rotating:
+                refusal = _rotation_refusal(playlist)
+                if refusal:
+                    return jsonify({"error": refusal}), 400
+
+        # #2097: search for the tracks no catalogue has by their own text
+        allow_uncatalogued = None
+        if 'allow_uncatalogued' in data:
+            allow_uncatalogued = parse_strict_bool(data.get('allow_uncatalogued'))
+            if allow_uncatalogued is None:
+                return jsonify({"error": "Invalid allow_uncatalogued"}), 400
+
         # Both fields are validated and written in ONE transaction: a rejected
         # Quality Profile used to leave the already-committed organize toggle
         # behind while the response said 400 (P2-02).
@@ -519,7 +579,16 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
             organize_by_playlist=organize_by_playlist,
             quality_profile_id=quality_profile_id,
             sync_mode=sync_mode,
+            rotating=rotating,
+            allow_uncatalogued=allow_uncatalogued,
         )
+        if allow_uncatalogued is not None and outcome == 'ok':
+            from core.playlists import uncatalogued
+            uncatalogued.forget()
+            if allow_uncatalogued != bool(playlist.get('allow_uncatalogued')):
+                # the next sync has to look at this playlist's unmatched
+                # tracks again, not skip it as unchanged
+                _invalidate_mirror_sync_fingerprint(playlist_id)
         if outcome == 'not_found':
             return jsonify({"error": "Playlist not found"}), 404
         if outcome == 'unknown_quality_profile':
@@ -536,10 +605,61 @@ def update_mirrored_playlist_preferences_endpoint(playlist_id):
             _invalidate_mirror_sync_fingerprint(playlist_id)
 
         updated = _owned_mirrored_playlist(database, playlist_id) or {}
-        return jsonify({"success": True, "playlist": updated})
+        body = {"success": True, "playlist": updated}
+        if rotating:
+            # the toggle does nothing while the cleaner is off, so it comes on
+            # with it. its own dry run setting is left alone
+            body["cleaner_turned_on"] = _ensure_cleaner_enabled()
+        return jsonify(body)
     except Exception as e:
         logger.error(f"Error updating mirrored playlist preferences: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+def _rotation_refusal(playlist):
+    """why this playlist can't rotate, or None. a request list drops a track
+    the moment it downloads, and Liked Songs is not a rotation."""
+    if playlist.get('is_request_list'):
+        return "Request lists can't be rotating"
+    if _up.is_liked_playlist(playlist):
+        return "Liked Songs can't be rotating"
+    return None
+
+
+def _ensure_cleaner_enabled():
+    """turn the Expired Download Cleaner on if it's off. True when this call
+    is what turned it on."""
+    from core.repair_jobs.expired_download_cleaner import JOB_ID, cleaner_state
+    if cleaner_state(config_manager)['cleaner_enabled']:
+        return False
+    worker = _repair_worker() if callable(_repair_worker) else None
+    if worker is not None:
+        worker.set_job_enabled(JOB_ID, True)
+    elif config_manager is not None:
+        config_manager.set(f'repair.jobs.{JOB_ID}.enabled', True)
+    else:
+        return False
+    return True
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/rotation', methods=['GET'])
+def mirrored_playlist_rotation_endpoint(playlist_id):
+    """what rotating does for this playlist right now (#2039): how many of
+    its downloads have left it, how many would be removed and why the rest
+    are kept. read-only."""
+    try:
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        from core.repair_jobs.expired_download_cleaner import rotation_preview
+        preview = rotation_preview(database, config_manager, playlist)
+        preview['rotating'] = bool(playlist.get('rotating'))
+        preview['allowed'] = _rotation_refusal(playlist) is None
+        return jsonify({"success": True, **preview})
+    except Exception as e:
+        logger.error(f"Error reading rotation for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Couldn't read rotation"}), 500
 
 
 @bp.route('/api/mirrored-playlists/<int:playlist_id>/copy-to-request-list', methods=['POST'])

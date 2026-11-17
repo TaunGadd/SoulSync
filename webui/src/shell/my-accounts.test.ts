@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { server } from '@/test/msw';
 
 import {
+  _maLastfmScrobbleSignIn,
   _maPlexConnect,
   closeMyAccountsModal,
   openMyAccountsModal,
@@ -38,8 +39,19 @@ function mockAccount({
   server: activeServer = 'navidrome',
   library = {} as Record<string, string>,
   imports = {} as Record<string, unknown>,
+  scrobbling = {} as Record<string, unknown>,
+  navidromeLibraries = { own_library: false, supported: true, folders: [] } as Record<
+    string,
+    unknown
+  >,
 } = {}) {
   server.use(
+    http.get('/api/profiles/me/navidrome-libraries', () =>
+      HttpResponse.json({ success: true, ...navidromeLibraries }),
+    ),
+    http.get('/api/profiles/me/scrobbling', () =>
+      HttpResponse.json({ success: true, ...scrobbling }),
+    ),
     http.get('/api/profiles/me/connections', () =>
       HttpResponse.json({ success: true, is_admin: isAdmin, connections, listening }),
     ),
@@ -265,6 +277,71 @@ describe('My Account', () => {
         { url: '/api/profiles/me/navidrome-login', body: { username: 'kim', password: 'pw' } },
       ]),
     );
+  });
+
+  it('an own library on navidrome picks its library from what the login sees (#2031)', async () => {
+    mockAccount({
+      library: { navidrome_username: 'kim' },
+      navidromeLibraries: {
+        own_library: true,
+        supported: true,
+        selected: '',
+        folders: [
+          { id: '1', name: 'Music', shared: true },
+          { id: '2', name: 'Kim', shared: false },
+        ],
+      },
+    });
+    capturePosts('/api/profiles/me/server-library');
+    await opened();
+    click('[data-ma="toggle"][data-id="server"]');
+    const pick = document.getElementById('ma-nd-lib') as HTMLSelectElement;
+    expect([...pick.options].map((o) => o.textContent)).toEqual([
+      'Pick your library',
+      'Music (shared)',
+      'Kim',
+    ]);
+    // nothing picked: nothing sent
+    click('[data-ma="nd-lib-save"]');
+    expect(toasts).toContain('Pick your library first');
+    expect(posted).toEqual([]);
+    pick.value = '2';
+    click('[data-ma="nd-lib-save"]');
+    await vi.waitFor(() =>
+      expect(posted).toEqual([
+        {
+          url: '/api/profiles/me/server-library',
+          body: { server_type: 'navidrome', library_id: '2' },
+        },
+      ]),
+    );
+  });
+
+  it('an own library on an old navidrome says why instead of a picker (#2031)', async () => {
+    mockAccount({
+      library: { navidrome_username: 'kim' },
+      navidromeLibraries: {
+        own_library: true,
+        supported: false,
+        message:
+          'Own libraries need Navidrome 0.58 or newer (multiple libraries). This server runs 0.57.0.',
+        folders: [],
+      },
+    });
+    await opened();
+    click('[data-ma="toggle"][data-id="server"]');
+    expect(document.getElementById('ma-nd-lib')).toBeNull();
+    expect(document.getElementById('ma-nd-lib-note')?.textContent).toContain(
+      'Navidrome 0.58 or newer',
+    );
+  });
+
+  it('a shared-library profile on navidrome gets no library picker', async () => {
+    mockAccount({ library: { navidrome_username: 'kim' } });
+    await opened();
+    click('[data-ma="toggle"][data-id="server"]');
+    expect(document.getElementById('ma-nd-lib')).toBeNull();
+    expect(document.getElementById('ma-nd-lib-note')).toBeNull();
   });
 
   it('plex asks for the pin only for a protected home user', async () => {
@@ -519,5 +596,97 @@ describe('My Account: sign in with oidc', () => {
     });
     window.dispatchEvent(new CustomEvent('ss:webui-profile-context-changed'));
     expect(modal().querySelector('.ma-title')!.textContent).toBe('Kim');
+  });
+});
+
+describe('My Account: scrobbling your own plays (Phonk_Ben_67)', () => {
+  it('names a linked jellyfin user as where your listening comes from', async () => {
+    mockAccount({ listening: { scope: 'profile', sources: ['jellyfin'] } });
+    await opened();
+    const card = body().querySelector('.ma-listening.is-own');
+    expect(card?.textContent).toContain('your plays from Jellyfin');
+  });
+
+  it('a listenbrainz switch once your token is connected', async () => {
+    mockAccount({
+      connections: conns({ listenbrainz: { connected: true, account: 'kim_lb' } }),
+      scrobbling: {
+        listenbrainz: { available: true, enabled: false },
+        lastfm: { available: false },
+      },
+    });
+    capturePosts('/api/profiles/me/listenbrainz/scrobble', { success: true });
+    await opened();
+    const toggle = body().querySelector<HTMLInputElement>('[data-ma-scrobble="listenbrainz"]');
+    expect(toggle?.checked).toBe(false);
+    toggle!.checked = true;
+    toggle!.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].body).toEqual({ enabled: true });
+    // last.fm isn't set up for scrobbling on this server: no line at all
+    expect(body().textContent).not.toContain('Scrobble your plays to Last.fm');
+  });
+
+  it('last.fm offers sign in, and when signed in says where and can stop', async () => {
+    mockAccount({ scrobbling: { lastfm: { available: true, connected: false } } });
+    await opened();
+    expect(body().querySelector('[data-ma="scrobble-signin"]')).not.toBeNull();
+
+    closeMyAccountsModal();
+    let deleted = false;
+    mockAccount({ scrobbling: { lastfm: { available: true, connected: true, user: 'kimfm' } } });
+    server.use(
+      http.delete('/api/profiles/me/lastfm/scrobble', () => {
+        deleted = true;
+        return HttpResponse.json({ success: true });
+      }),
+    );
+    await opened();
+    expect(body().textContent).toContain('Scrobbling your plays to kimfm');
+    click('[data-ma="scrobble-stop"]');
+    await vi.waitFor(() => expect(deleted).toBe(true));
+  });
+
+  it('sign in waits for last.fm in a popup, then says who', async () => {
+    let checks = 0;
+    server.use(
+      http.get('/api/profiles/me/lastfm/scrobble/auth-url', () =>
+        HttpResponse.json({ success: true, url: 'https://www.last.fm/api/auth/?x' }),
+      ),
+      http.get('/api/profiles/me/scrobbling', () => {
+        checks += 1;
+        return HttpResponse.json({
+          success: true,
+          lastfm: { available: true, connected: checks >= 2, user: 'kimfm' },
+        });
+      }),
+    );
+    const popup = { location: { href: '' }, closed: false, close: vi.fn() };
+    const ok = await _maLastfmScrobbleSignIn(
+      null,
+      () => popup as unknown as Window,
+      async () => {},
+    );
+    expect(ok).toBe(true);
+    expect(popup.location.href).toBe('https://www.last.fm/api/auth/?x');
+    expect(popup.close).toHaveBeenCalled();
+    expect(toasts).toContain('Scrobbling to kimfm');
+  });
+
+  it('sign in shows why the server refused', async () => {
+    server.use(
+      http.get('/api/profiles/me/lastfm/scrobble/auth-url', () =>
+        HttpResponse.json({ success: false, error: 'ask the admin' }, { status: 400 }),
+      ),
+    );
+    const popup = { location: { href: '' }, closed: false, close: vi.fn() };
+    const ok = await _maLastfmScrobbleSignIn(
+      null,
+      () => popup as unknown as Window,
+      async () => {},
+    );
+    expect(ok).toBe(false);
+    expect(popup.close).toHaveBeenCalled();
+    expect(toasts).toContain('ask the admin');
   });
 });

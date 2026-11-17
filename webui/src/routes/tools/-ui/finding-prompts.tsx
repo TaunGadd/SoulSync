@@ -35,6 +35,7 @@ import type {
   DeadFileFixAction,
   OrphanFixAction,
   QualityFixAction,
+  RetagFixAction,
 } from '../-tools.types';
 
 import styles from './finding-prompts.module.css';
@@ -42,7 +43,12 @@ import styles from './finding-prompts.module.css';
 // ── Transcribed inline styles ────────────────────────────────────────────────
 
 /** The box's max-width per prompt, in px. */
-const BOX_WIDTH = { 380: styles.box380, 420: styles.box420, 460: styles.box460 };
+const BOX_WIDTH = {
+  380: styles.box380,
+  420: styles.box420,
+  460: styles.box460,
+  480: styles.box480,
+};
 
 const TITLE: CSSProperties = {
   fontSize: '1.1em',
@@ -172,8 +178,8 @@ function DeadFilePrompt({ resolve }: { resolve: (value: DeadFileFixAction | null
   return (
     <PromptOverlay
       maxWidth={420}
-      title="Dead File Action"
-      body="This track's file no longer exists on disk. Choose how to handle it."
+      title="This file is gone"
+      body="The library lists this track, but its file is no longer on disk. Download a fresh copy, or take the track out of your library."
       cancelId="_dead-cancel"
       onCancel={() => resolve(null)}
     >
@@ -187,7 +193,7 @@ function DeadFilePrompt({ resolve }: { resolve: (value: DeadFileFixAction | null
           Re-download
         </button>
         <button id="_dead-remove" type="button" style={RED} onClick={() => resolve('remove')}>
-          Remove from DB
+          Remove from library
         </button>
       </div>
     </PromptOverlay>
@@ -414,6 +420,89 @@ function BackfillPrompt({
   );
 }
 
+/** Two requests wear one button here: write the library's values into the
+ *  files, and write them EVEN OVER the fields this user edited by hand.
+ *
+ *  lib2 keeps a per-field override layer and a re-tag respects it, so the
+ *  normal apply leaves those alone. That is the right default and the wrong
+ *  thing to make silent — someone who fixed a title six months ago and has
+ *  since fixed the catalogue too needs a way to say "the catalogue wins now".
+ *  The count is what makes the choice informed rather than a coin toss. */
+function RetagPrompt({
+  bulk,
+  count,
+  manualCount,
+  resolve,
+}: {
+  /** a whole group, not the one finding in front of the person */
+  bulk: boolean;
+  count: number;
+  manualCount: number;
+  resolve: (value: RetagFixAction | null) => void;
+}) {
+  const safeCount = Math.max(count - manualCount, 0);
+  if (bulk) {
+    // a bulk run fills and does not replace: the safe answer is the big one,
+    // and the one that throws tags away is a quiet link that asks again
+    return (
+      <PromptOverlay
+        maxWidth={480}
+        title={`Apply Tags (${count.toLocaleString()})`}
+        body="Fix All fills the tags that are blank in a file. A tag a file already has is left as it is, even where the library says something else: those findings stay open, and you apply or dismiss each one where both values are shown."
+        cancelId="_retag-cancel"
+        onCancel={() => resolve(null)}
+      >
+        <div style={ROW_WRAP}>
+          <button id="_retag-safe" type="button" style={GREEN} onClick={() => resolve('safe')}>
+            Fill blank tags
+          </button>
+          <button
+            id="_retag-replace"
+            type="button"
+            style={INDIGO_LIGHT}
+            onClick={() => resolve('replace_differences')}
+          >
+            Also replace tags that differ…
+          </button>
+        </div>
+        <div style={HINT}>
+          Every change is kept on its finding with the value before and after, and can be undone
+          there.
+        </div>
+      </PromptOverlay>
+    );
+  }
+  return (
+    <PromptOverlay
+      maxWidth={480}
+      title={`Apply Tags (${count})`}
+      body={
+        manualCount > 0
+          ? `${count} finding(s), ${manualCount} of them holding a field you set by hand. Applying keeps your value unless you say otherwise.`
+          : `Write the library's metadata into ${count} file(s)? Nothing here was edited by hand.`
+      }
+      cancelId="_retag-cancel"
+      onCancel={() => resolve(null)}
+    >
+      <div style={ROW_WRAP}>
+        <button id="_retag-safe" type="button" style={GREEN} onClick={() => resolve('safe')}>
+          {manualCount > 0 ? `Keep My Edits (${safeCount} changed)` : `Apply All ${count}`}
+        </button>
+        {manualCount > 0 ? (
+          <button
+            id="_retag-overwrite"
+            type="button"
+            style={INDIGO_LIGHT}
+            onClick={() => resolve('overwrite_manual')}
+          >
+            Overwrite My Edits Too ({count})
+          </button>
+        ) : null}
+      </div>
+    </PromptOverlay>
+  );
+}
+
 // ── The mass-deletion gate ───────────────────────────────────────────────────
 
 /** The exact phrase, compared case-insensitively after trimming. */
@@ -537,10 +626,13 @@ type PendingPrompt =
       resolve: (value: string | null) => void;
     }
   | { kind: 'quality'; resolve: (value: QualityFixAction | null) => void }
+  | { kind: 'backfill'; count: number; resolve: (value: BackfillFixAction | null) => void }
   | {
-      kind: 'backfill';
+      kind: 'retag';
+      bulk: boolean;
       count: number;
-      resolve: (value: BackfillFixAction | null) => void;
+      manualCount: number;
+      resolve: (value: RetagFixAction | null) => void;
     }
   | { kind: 'witness'; count: number; resolve: (value: boolean) => void };
 
@@ -550,6 +642,11 @@ export interface FindingPrompts {
   promptAcoustid: (candidates?: string[], count?: number) => Promise<string | null>;
   promptQuality: () => Promise<QualityFixAction | null>;
   promptBackfill: (count: number) => Promise<BackfillFixAction | null>;
+  promptRetag: (
+    count: number,
+    manualCount: number,
+    bulk?: boolean,
+  ) => Promise<RetagFixAction | null>;
   promptWitnessMe: (count: number) => Promise<boolean>;
   /** Render this somewhere inside the findings tab. */
   promptNode: React.ReactNode;
@@ -599,6 +696,13 @@ export function useFindingPrompts(): FindingPrompts {
       }),
     [],
   );
+  const promptRetag = useCallback(
+    (count: number, manualCount: number, bulk = false) =>
+      new Promise<RetagFixAction | null>((resolve) => {
+        setPending({ kind: 'retag', bulk, count, manualCount, resolve });
+      }),
+    [],
+  );
   const promptWitnessMe = useCallback(
     (count: number) =>
       new Promise<boolean>((resolve) => {
@@ -626,6 +730,15 @@ export function useFindingPrompts(): FindingPrompts {
     promptNode = (
       <BackfillPrompt count={pending.count} resolve={(v) => settle(pending.resolve as never, v)} />
     );
+  } else if (pending?.kind === 'retag') {
+    promptNode = (
+      <RetagPrompt
+        bulk={pending.bulk}
+        count={pending.count}
+        manualCount={pending.manualCount}
+        resolve={(v) => settle(pending.resolve as never, v)}
+      />
+    );
   } else if (pending?.kind === 'witness') {
     promptNode = (
       <WitnessMeDialog
@@ -641,6 +754,7 @@ export function useFindingPrompts(): FindingPrompts {
     promptAcoustid,
     promptQuality,
     promptBackfill,
+    promptRetag,
     promptWitnessMe,
     promptNode,
   };

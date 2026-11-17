@@ -29,6 +29,17 @@ export interface FindingGroup {
   severity_max: string;
   last_seen?: string | null;
   job_ids?: string[];
+  /** a few covers off this type's newest open findings, for the inbox row */
+  art?: string[];
+  /** Pending rows in this group that would overwrite a value someone set by
+   *  hand. Counted server-side: "apply all" and "apply all except my own
+   *  edits" are two different requests, and the choice has to be made before
+   *  the click — not after walking every finding's diff. */
+  manual_conflicts?: number;
+  /** rows per status per severity, e.g. {pending: {warning: 3, error: 1}}.
+   *  what the severity filter reads: severity_max is the worst pending row
+   *  only, so it hid resolved errors and pending warnings (review 5 R5-L-3) */
+  severities?: Record<string, Record<string, number>>;
 }
 
 /** One row of `GET /api/repair/finding-types`. The backend owns this: the
@@ -70,22 +81,31 @@ export function isSafeType(info: FindingTypeInfo | undefined): boolean {
  */
 export const FINDING_TYPE_BLURBS: Record<string, string> = {
   dead_file: 'Library rows whose audio file is missing from disk.',
+  library_unreachable: 'Most of the library could not be reached at once.',
   orphan_file: 'Audio files on disk with no matching row in the library.',
   track_number_mismatch: "Tag track numbers disagree with the release's order.",
   missing_cover_art: 'Albums or artists with no artwork stored.',
   missing_lyrics: 'Tracks with no lyrics saved.',
   missing_replaygain: 'No loudness tags, so playback volume jumps between tracks.',
   replaygain_retag: 'Loudness tags written before your current target level.',
+  zero_length_mp4: "AAC that shows 0:00 and won't seek. Fixing keeps audio and tags.",
   untagged_download: 'Downloads with no title, artist or album tag.',
   empty_folder: 'Folders left behind with no audio inside.',
   expired_download: 'Finished downloads older than your retention window.',
   metadata_gap: 'Missing genres, years or IDs that enrichment can fill in.',
   bpm_backfill: 'Tracks missing BPM that Deezer or local analysis can fill in.',
   duplicate_tracks: 'The same track stored more than once.',
+  native_duplicate_releases: 'Choose the surviving release. Provider editions and files stay.',
+  native_duplicate_tracks: 'Review copies. Keep Best preserves protected files.',
   single_album_redundant: 'Singles you also own inside the full album.',
   mbid_mismatch: 'Track MusicBrainz IDs disagree with the tags on disk.',
   album_mbid_mismatch: 'Album MusicBrainz IDs disagree with the tags on disk.',
   album_tag_inconsistency: 'Tracks in one album carrying conflicting album tags.',
+  file_tags_differ: 'Albums whose files say something the Library does not.',
+  artist_merge_made: 'Artist merges SoulSync made by itself. Approve to undo one.',
+  artist_merge_doubt: 'Two artists sharing one catalogue id, left for you to decide.',
+  artist_merged_by_mistake: 'One artist whose albums are filed under two names.',
+  compilation_track_origin: 'Greatest hits songs that can go back to their original albums.',
   incomplete_album: 'Albums missing tracks you do not own yet.',
   path_mismatch: 'Files stored outside your file-organization template.',
   missing_lossy_copy: 'Lossless tracks with no lossy copy for portable use.',
@@ -93,6 +113,9 @@ export const FINDING_TYPE_BLURBS: Record<string, string> = {
   unknown_artist: 'Tracks filed under an unidentified or blank artist.',
   acoustid_mismatch: 'The audio fingerprint says this is a different track.',
   quality_upgrade: 'Files below the bitrate or format your profile asks for.',
+  quality_upgrade_review: 'Below the quality target. Applying wishlists and queues the track.',
+  quality_format_not_targeted: 'Formats outside your profile. Review the profile before replacing.',
+  quality_unknown: 'Audio quality could not be measured. Inspect before replacing.',
   missing_discography_track: 'Releases by your artists that are not in the library.',
   library_retag: "Files whose tags are behind the library's metadata.",
   short_preview_track: '30-second preview clips saved in place of full tracks.',
@@ -101,7 +124,7 @@ export const FINDING_TYPE_BLURBS: Record<string, string> = {
   genre_cleanup: 'Genre tags that are junk, duplicated or wrongly cased.',
   comma_artist_split: 'One artist row holding several comma-separated names.',
   suspect_album_tag: 'Tracks probably filed under the wrong album due to bad tags.',
-  fake_lossless: 'FLAC upscaled from a lossy source. Review only.',
+  fake_lossless: 'FLAC upscaled from a lossy source; applying re-downloads it.',
   album_needs_enrichment: 'Albums still waiting on a metadata enrichment pass.',
   album_release_year_mismatch: 'Album and track release years disagree with the original release.',
 };
@@ -257,7 +280,16 @@ export function sortInboxGroups(
 }
 
 /** Which count a group row shows, following the status segmented control. */
-export function groupCountForStatus(group: FindingGroup, status: string): number {
+export function groupCountForStatus(group: FindingGroup, status: string, severity = ''): number {
+  if (severity) {
+    const by = group.severities;
+    // an older payload has no breakdown: fall back to the worst pending row
+    if (!by) {
+      return (group.severity_max || 'info') === severity ? groupCountForStatus(group, status) : 0;
+    }
+    const statuses = status ? [status] : Object.keys(by);
+    return statuses.reduce((n, s) => n + (by[s]?.[severity] || 0), 0);
+  }
   if (status === 'resolved') return group.resolved || 0;
   if (status === 'dismissed') return group.dismissed || 0;
   if (status === 'pending') return group.pending || 0;
@@ -288,8 +320,8 @@ export function visibleGroups(
 ): FindingGroup[] {
   return groups.filter((group) => {
     if (filters.jobId && !(group.job_ids || []).includes(filters.jobId)) return false;
-    if (filters.severity && (group.severity_max || 'info') !== filters.severity) return false;
-    return groupCountForStatus(group, filters.status || '') > 0;
+    // the group has rows of this severity in this status (review 5 R5-L-3)
+    return groupCountForStatus(group, filters.status || '', filters.severity || '') > 0;
   });
 }
 
@@ -309,6 +341,59 @@ export function safeFixablePending(
     if (isSafeType(infoOf(group.finding_type))) total += Math.max(0, group.pending || 0);
   }
   return total;
+}
+
+/** how many types the fix-all-safe question names before it sums the rest */
+const SAFE_PLAN_MAX = 6;
+
+/**
+ * What "Fix all safe" is about to do, for the question it asks first.
+ *
+ * One click can write to tens of thousands of files, so "apply the default
+ * fix to 83,619 findings?" is not enough to say yes to. This names each kind
+ * of finding, how many, and what its fix is called, biggest first, and says
+ * in plain words what a tag fix writes.
+ */
+export function fixAllSafePlan(
+  groups: readonly FindingGroup[],
+  infoOf: (findingType: string) => FindingTypeInfo | undefined,
+  video = false,
+): { total: number; message: string; confirmText: string } {
+  const rows = groups
+    .map((group) => ({ group, info: infoOf(group.finding_type) }))
+    .filter(({ group, info }) => isSafeType(info) && (group.pending || 0) > 0)
+    .sort((a, b) => (b.group.pending || 0) - (a.group.pending || 0));
+  const total = rows.reduce((sum, { group }) => sum + (group.pending || 0), 0);
+  const line = ({ group, info }: (typeof rows)[number]) =>
+    `${(group.pending || 0).toLocaleString()}  ${info?.label || group.finding_type.replace(/_/g, ' ')}${
+      info?.verb ? ` (${info.verb})` : ''
+    }`;
+  const shown = rows.slice(0, SAFE_PLAN_MAX);
+  const rest = rows.slice(SAFE_PLAN_MAX);
+  const lines = shown.map(line);
+  if (rest.length) {
+    const restTotal = rest.reduce((sum, { group }) => sum + (group.pending || 0), 0);
+    lines.push(
+      `${restTotal.toLocaleString()}  in ${rest.length} more type${rest.length === 1 ? '' : 's'}`,
+    );
+  }
+  const retag = rows.some(({ group }) => group.finding_type === 'library_retag');
+  const paragraphs = [
+    `This applies the default fix to ${total.toLocaleString()} finding${total === 1 ? '' : 's'}:`,
+    lines.join('\n'),
+    video
+      ? "These only change SoulSync's own data. Nothing on disk is touched and nothing is downloaded."
+      : 'These only write tags and library data. No file is moved or deleted, and any finding that would do that is left alone.',
+    retag
+      ? "Library Re-tag writes into each file's tags: only the fields that finding names (genre and year included), and a cover where the file has none."
+      : '',
+    'It runs in the background and you can stop it at any time.',
+  ];
+  return {
+    total,
+    message: paragraphs.filter(Boolean).join('\n\n'),
+    confirmText: `Fix ${total.toLocaleString()}`,
+  };
 }
 
 // ── History sparkline ────────────────────────────────────────────────────────

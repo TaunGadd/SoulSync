@@ -8,7 +8,7 @@
  * blueprint the music side uses.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import type { VdlCardActions } from './vdl-list';
 
@@ -18,17 +18,32 @@ import { AdlClientsTab } from './adl-clients';
 import { useReportActive } from './dl-header';
 import { VdlHeader } from './vdl-header';
 import { VdlHistoryModal } from './vdl-history';
-import { VdlList } from './vdl-list';
+import { VdlList, useVdlCanImport } from './vdl-list';
 import { VdlReviewPane, useVdlReview } from './vdl-review';
 
 const toast = (message: string, type: string) => window.showToast?.(message, type);
 
 export function VideoDownloadsView() {
   const dl = useVideoDownloads();
+  // blocking writes the household's blocklist: admin only, like one row's block
+  const canBlockAll = useVdlCanImport();
   // the Music | Video switch shows this side's live count
   useReportActive('video', dl.counts.active);
   const review = useVdlReview();
   const [historyOpen, setHistoryOpen] = useState(false);
+  // #2029: only one video library's downloads; offered once two show up
+  const [library, setLibrary] = useState('');
+  const libraryNames = useMemo(
+    () =>
+      Array.from(
+        new Set(dl.downloads.map((d) => d.video_library_name).filter((n): n is string => !!n)),
+      ).sort(),
+    [dl.downloads],
+  );
+  const shownLibrary = libraryNames.includes(library) ? library : '';
+  const listed = shownLibrary
+    ? dl.downloads.filter((d) => d.video_library_name === shownLibrary)
+    : dl.downloads;
   const [historyCount, setHistoryCount] = useState<number | null>(null);
 
   const refreshHistoryCount = useCallback(async () => {
@@ -52,6 +67,7 @@ export function VideoDownloadsView() {
     onCancel: (id) => void dl.cancelOne(id),
     onRetry: (id) => void dl.retryOne(id),
     onBlock: (d) => void dl.blockOne(d),
+    onRemove: (id) => void dl.removeOne(id),
     onToggle: dl.toggleExpanded,
   };
 
@@ -66,7 +82,7 @@ export function VideoDownloadsView() {
   );
 
   return (
-    <div className="adl-layout" data-vdl-root>
+    <div className="pgf-page adl-layout" data-vdl-root>
       <div className="adl-main">
         <div className="adl-container">
           <VdlHeader
@@ -84,7 +100,11 @@ export function VideoDownloadsView() {
             onOpenHistory={() => setHistoryOpen(true)}
             onCancelAll={() => void dl.cancelAll()}
             onRetryAll={() => void dl.retryAllFailed()}
+            blockableFailedCount={canBlockAll ? dl.blockableFailedCount : 0}
+            onBlockRetryAll={() => void dl.blockAndRetryAllFailed()}
             onClearFinished={() => void dl.clearFinished()}
+            onClearFailed={() => void dl.clearFailed()}
+            onClearEverything={() => void dl.clearEverything()}
             retryAllPending={dl.retryAllPending}
           />
 
@@ -93,18 +113,37 @@ export function VideoDownloadsView() {
           ) : dl.view === 'review' ? (
             <VdlReviewPane review={review} onChanged={() => void review.loadReview()} />
           ) : (
-            <VdlList
-              downloads={dl.downloads}
-              filter={dl.filter}
-              loaded={dl.loaded}
-              expanded={dl.expanded}
-              collapsedGroups={dl.collapsedGroups}
-              metaFor={dl.metaFor}
-              ensureMeta={dl.ensureMeta}
-              onToggleGroup={dl.toggleGroup}
-              cardActions={cardActions}
-              onCancelGroup={onCancelGroup}
-            />
+            <>
+              {libraryNames.length > 1 ? (
+                <label className="vdl-library-filter">
+                  Library{' '}
+                  <select
+                    aria-label="Show one library's downloads"
+                    value={shownLibrary}
+                    onChange={(event) => setLibrary(event.target.value)}
+                  >
+                    <option value="">All</option>
+                    {libraryNames.map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              <VdlList
+                downloads={listed}
+                filter={dl.filter}
+                loaded={dl.loaded}
+                expanded={dl.expanded}
+                collapsedGroups={dl.collapsedGroups}
+                metaFor={dl.metaFor}
+                ensureMeta={dl.ensureMeta}
+                onToggleGroup={dl.toggleGroup}
+                cardActions={cardActions}
+                onCancelGroup={onCancelGroup}
+              />
+            </>
           )}
 
           <VdlHistoryModal

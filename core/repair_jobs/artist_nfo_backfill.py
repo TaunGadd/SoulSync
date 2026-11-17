@@ -2,7 +2,7 @@
 
 Companion to the automatic import-time ``artist.nfo`` writer
 (``core/library/artist_nfo.py``, gated by ``library.write_artist_nfo``).
-This job backfills the nfo for every artist in the database that has a
+This job backfills the nfo for every Library-v2 album artist that has a
 MusicBrainz artist ID but no ``artist.nfo`` on disk yet — the "repair job
 or button to backfill existing folders" from the feature request.
 
@@ -14,6 +14,7 @@ the user may have corrected it by hand (same guarantee as the import path).
 """
 
 import os
+from contextlib import closing
 
 from core.library.artist_nfo import ensure_artist_nfo_for_track
 from core.library.path_resolver import resolve_library_file_path
@@ -70,6 +71,11 @@ class ArtistNfoBackfillJob(RepairJob):
             if context.update_progress:
                 context.update_progress(i + 1, total)
             result.scanned += 1
+            # #2046: a reviewed artist's folder gets no new file from a job
+            from core.library2 import locks
+            if locks.blocks('artist', artist_id, 'files', 'Artist NFO backfill'):
+                result.skipped += 1
+                continue
 
             try:
                 resolved = resolve_library_file_path(
@@ -112,25 +118,36 @@ class ArtistNfoBackfillJob(RepairJob):
         return result
 
     def _candidates(self, context: JobContext):
-        """(artist_id, name, musicbrainz_id, one file_path) for artists that
-        have an MBID. One representative track each — the nfo writer reads the
-        actual tags from the file, so the name always matches the folder."""
+        """(artist_id, name, musicbrainz_id, one file path) for album artists
+        that have an MBID. One representative file each — the nfo writer reads
+        the actual tags from the file, so the name always matches the folder.
+        A run started in one library walks that library's files."""
         if context.db is None:
             return []
+        from core.library2.sql_util import owner_clause
         try:
-            conn = context.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT a.id, a.name, a.musicbrainz_id, MIN(t.file_path)
-                FROM artists a
-                JOIN tracks t ON t.artist_id = a.id
-                WHERE a.musicbrainz_id IS NOT NULL
-                  AND TRIM(a.musicbrainz_id) != ''
-                  AND t.file_path IS NOT NULL
-                  AND TRIM(t.file_path) != ''
-                GROUP BY a.id, a.name, a.musicbrainz_id
-            """)
-            return cursor.fetchall()
+            with closing(context.db._get_connection()) as conn:
+                # an alias row (another spelling, merged under a canonical
+                # artist) still has its own folder. 3.6.1 gave every artist
+                # row one; skipping aliases left those folders without. the
+                # alias's name is what its folder carries, the mbid comes
+                # from the canonical artist when the alias has none
+                return conn.execute(f"""
+                    SELECT a.id, a.name, mbid, MIN(f.path)
+                    FROM (SELECT a.id, a.name,
+                                 COALESCE(NULLIF(TRIM(a.musicbrainz_id), ''),
+                                          NULLIF(TRIM(c.musicbrainz_id), '')) AS mbid
+                            FROM lib2_artists a
+                            LEFT JOIN lib2_artists c ON c.id = a.canonical_artist_id) a
+                    JOIN lib2_albums al ON al.primary_artist_id = a.id
+                    JOIN lib2_tracks t ON t.album_id = al.id
+                    JOIN lib2_track_files f ON f.track_id = t.id
+                    WHERE a.mbid IS NOT NULL
+                      AND f.path IS NOT NULL AND TRIM(f.path) != ''
+                      AND COALESCE(f.file_state, 'active') = 'active'
+                      {owner_clause(column="f.owner_profile_id")}
+                    GROUP BY a.id, a.name, a.mbid
+                """).fetchall()
         except Exception as exc:  # noqa: BLE001 — old schema etc.
             logger.debug("Artist NFO backfill candidates unavailable: %s", exc)
             return []

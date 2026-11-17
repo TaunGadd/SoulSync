@@ -1733,7 +1733,7 @@ async function navigateToMirroredPlaylist(playlistRef, source = 'spotify') {
     if (typeof navigateToPage === 'function') {
         navigateToPage('sync');
     }
-    const mirroredBtn = document.querySelector('.sync-tab-button[data-tab="mirrored"]');
+    const mirroredBtn = document.querySelector('.pl-collection[data-tab="mirrored"]');
     if (mirroredBtn) {
         mirroredBtn.click();
     }
@@ -1764,6 +1764,33 @@ async function navigateToMirroredPlaylist(playlistRef, source = 'spotify') {
 /** a download process whose run is over: its modal is results, not work */
 function _isFinishedDownloadProcess(process) {
     return Boolean(process) && (process.status === 'complete' || process.status === 'cancelled');
+}
+
+// #2022: a release opened from an artist's page starts on the artist's Quality
+// Profile (library track/album, the watchlist rules, the library artist), the
+// same one Download Discography queues it on. still only a preselect: the
+// picker is right there. any failure leaves the old default.
+async function hydrateArtistAlbumQualityProfile(virtualPlaylistId, artist, album) {
+    let preselectId = null;
+    try {
+        if (artist && artist.id) {
+            const params = new URLSearchParams({ name: artist.name || '' });
+            const source = artist.source || (album && album.source) || '';
+            if (source) params.set('source', source);
+            if (album && album.id) params.set('album_id', String(album.id));
+            const res = await fetch(
+                `/api/artist/${encodeURIComponent(String(artist.id))}/quality-profile?${params}`);
+            const data = await res.json();
+            if (data && data.success && data.quality_profile_id != null) {
+                preselectId = data.quality_profile_id;
+            }
+        }
+    } catch (e) {
+        console.debug('Could not load the artist Quality Profile:', e);
+    }
+    return preselectId != null
+        ? setDownloadModalQualityProfile(virtualPlaylistId, preselectId)
+        : hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
 }
 
 async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlistName, spotifyTracks, album, artist, showLoadingOverlayParam = true, contextType = 'artist_album') {
@@ -1915,14 +1942,17 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
 
     applyProgressiveTrackRendering(virtualPlaylistId, spotifyTracks.length);
     // Fill the Quality Profile selector once the markup is in the DOM. Preselects
-    // the mirror's persisted assignment for a playlist, the default otherwise
-    // (P1-01); on failure it renders disabled rather than showing a value the
-    // server never accepted (P2-05).
-    void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
+    // the mirror's persisted assignment for a playlist, the artist's own profile
+    // for an artist's release (#2022), the default otherwise (P1-01); on failure
+    // it renders disabled rather than showing a value the server never accepted
+    // (P2-05).
+    if (contextType === 'artist_album') {
+        void hydrateArtistAlbumQualityProfile(virtualPlaylistId, artist, album);
+    } else {
+        void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
+    }
     modal.style.display = 'flex';
     hideLoadingOverlay();
-    // owned/missing per track straight away, not after Begin Analysis
-    if (typeof previewModalOwnership === 'function') void previewModalOwnership(virtualPlaylistId);
 
     console.log(`✅ Successfully opened download missing tracks modal for: ${playlistName}`);
 }
@@ -1979,8 +2009,10 @@ function updateArtistDownloadsSection() {
     }
     downloadsUpdateTimeout = setTimeout(() => {
         showArtistDownloadsSection();
-        showLibraryDownloadsSection();
         showBeatportDownloadsSection();
+        // the Library page's bubbles follow live too, as in 3.6.1 (the
+        // React page only drew them once, on mount)
+        showLibraryDownloadsSection();
         updateDashboardDownloads();
     }, 300); // 300ms debounce
 }
@@ -2490,7 +2522,7 @@ async function openSearchDownloadModal(artistName) {
                     // Update avatar
                     const avatarContainer = modal.querySelector('.artist-download-modal-hero-avatar');
                     if (avatarContainer) {
-                        avatarContainer.innerHTML = `<img src="${data.image_url}" alt="${artistBubbleData.artist.name}" class="artist-download-modal-hero-image" loading="lazy">`;
+                        avatarContainer.innerHTML = `<img src="${escapeHtml(data.image_url)}" alt="${escapeHtml(artistBubbleData.artist.name)}" class="artist-download-modal-hero-image" loading="lazy">`;
                     }
 
                     // Update artist object in memory
@@ -4002,7 +4034,7 @@ async function fetchAndUpdateServiceStatus() {
         updateSidebarServiceStatus('soulseek', data.soulseek);
 
         // Update downloads nav badge
-        if (data.active_downloads !== undefined) _updateDlNavBadge(data.active_downloads);
+        if (data.active_downloads !== undefined) _updateDlNavBadge(data.active_downloads, data.quarantined);
 
         // Hide sync buttons (not the page) for standalone mode
         const isSoulsyncStandalone2 = data.media_server?.type === 'soulsync';
@@ -4244,6 +4276,7 @@ async function loadSimilarArtists(artistName) {
         const decoder = new TextDecoder();
         let buffer = '';
         let artistCount = 0;
+        let finished = false;
 
         // Read the stream
         while (true) {
@@ -4268,8 +4301,13 @@ async function loadSimilarArtists(artistName) {
                 try {
                     const jsonData = JSON.parse(message.substring(6)); // Remove 'data: ' prefix
 
+                    // an error event used to be thrown inside this parse
+                    // try, swallowed as a parse error, and the section sat
+                    // on "Finding similar artists..." for good. it ends the
+                    // search like an empty answer does
                     if (jsonData.error) {
-                        throw new Error(jsonData.error);
+                        console.warn('Similar artists:', jsonData.error);
+                        continue;
                     }
 
                     if (jsonData.artist) {
@@ -4288,6 +4326,7 @@ async function loadSimilarArtists(artistName) {
                     }
 
                     if (jsonData.complete) {
+                        finished = true;
                         if (signal?.aborted) return;
                         console.log(`🎉 Streaming complete: ${jsonData.total} artists`);
 
@@ -4307,6 +4346,20 @@ async function loadSimilarArtists(artistName) {
                 } catch (parseError) {
                     console.error('❌ Error parsing stream message:', parseError);
                 }
+            }
+        }
+
+        // a stream that ended with no artists and no "complete" (an error, a
+        // dropped connection) still takes the spinner down
+        if (!finished && !signal?.aborted) {
+            loadingEl.classList.add('hidden');
+            if (artistCount === 0) {
+                container.innerHTML = `
+                    <div style="width: 100%; text-align: center; padding: 40px 20px; color: rgba(255, 255, 255, 0.5);">
+                        <div style="font-size: 18px; margin-bottom: 8px;">🎵</div>
+                        <div style="font-size: 14px;">No similar artists found</div>
+                    </div>
+                `;
             }
         }
 
@@ -4332,7 +4385,7 @@ async function loadSimilarArtists(artistName) {
         container.innerHTML = `
             <div style="width: 100%; text-align: center; padding: 40px 20px; color: rgba(239, 68, 68, 0.7);">
                 <div style="font-size: 18px; margin-bottom: 8px;">⚠️</div>
-                <div style="font-size: 14px;">${error.message}</div>
+                <div style="font-size: 14px;">${escapeHtml(error.message)}</div>
             </div>
         `;
     } finally {

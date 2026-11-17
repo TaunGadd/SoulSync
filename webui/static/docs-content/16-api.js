@@ -37,7 +37,7 @@ The \`Authorization: Bearer <key>\` header is preferred — a key in the query s
 
 **Key metadata.** Each stored key records a \`label\`, a \`scope\`, a visible \`key_prefix\` (\`sk_\` plus the first 8 characters of the raw key), \`created_at\`, and \`last_used_at\`. \`last_used_at\` is refreshed on every authenticated request (persisted to disk at most once every 15 minutes per key, so heavy polling does not rewrite the config file constantly).
 
-**Rate limiting.** The whole \`/api/v1\` blueprint is limited to 60 requests per minute per client IP (Flask-Limiter, keyed on remote address). Exceeding it returns \`429\` with code \`RATE_LIMITED\`.
+**Rate limiting.** The whole \`/api/v1\` blueprint is rate-limited (Flask-Limiter). A request with a valid API key gets 600 requests per minute, counted per key. A request with no key or an invalid key gets 60 per minute per client IP — a bogus key never earns the bigger bucket. Exceeding the limit returns \`429\` with code \`RATE_LIMITED\`.
 
 **Response envelope.** Every response — success or failure — uses the same shape:
 
@@ -372,8 +372,8 @@ curl -H "Authorization: Bearer sk_..." http://localhost:8008/api/v1/system/stats
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is populated only on paginated
-> endpoints (noted per endpoint); elsewhere it is \`null\`. Rate limit: 60
-> requests/minute per IP (\`429\`, code \`RATE_LIMITED\`).
+> endpoints (noted per endpoint); elsewhere it is \`null\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
 
 ## Endpoint reference
 
@@ -1018,7 +1018,7 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\` or \`?page=\` — they take their
 parameters in the JSON body as documented below.
 
@@ -1200,7 +1200,7 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\`. \`GET /downloads\` paginates with
 \`limit\`/\`offset\`, not \`page\`.
 
@@ -1457,8 +1457,9 @@ not apply.
 
 Cross-cutting facts:
 
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/playlists\`
 
@@ -1667,8 +1668,9 @@ Cross-cutting parameters on these endpoints:
   non-numeric values fall back to 1 (\`api/helpers.py:parse_profile_id\`).
 - **Field selection:** \`?fields=artist_name,source\` trims each returned artist
   object to the named fields (\`api/helpers.py:parse_fields\`).
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/watchlist\`
 
@@ -1822,7 +1824,8 @@ body are touched** (\`api/watchlist.py:update_watchlist_filters\`).
 | include_albums | boolean | no | unchanged | Watch full albums. |
 | include_eps | boolean | no | unchanged | Watch EPs. |
 | include_singles | boolean | no | unchanged | Watch singles. |
-| include_live | boolean | no | unchanged | Watch live releases. |
+| include_live | boolean | no | unchanged | Watch live albums. |
+| include_live_tracks | boolean | no | unchanged | Watch live versions on other releases. Follows include_live until set once. |
 | include_remixes | boolean | no | unchanged | Watch remixes. |
 | include_acoustic | boolean | no | unchanged | Watch acoustic releases. |
 | include_compilations | boolean | no | unchanged | Watch compilations. |
@@ -1939,8 +1942,9 @@ Cross-cutting parameters on these endpoints:
 - **Pagination:** \`?page=\` (default 1, minimum 1) and \`?limit=\` (default 50,
   minimum 1, maximum 200). Non-numeric values fall back to the defaults
   (\`api/helpers.py:parse_pagination\`).
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/wishlist\`
 
@@ -2144,7 +2148,7 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\`.
 
 This is the inbound music-request flow used by external sources (Discord
@@ -2301,7 +2305,7 @@ curl http://localhost:8008/api/v1/request/3fa85f64-5717-4562-b3fc-2c963f66afa6 \
             body: `
 # Discover API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 The five \`GET\` endpoints that read per-profile discovery state (\`/discover/pool\`, \`/discover/similar-artists\`, \`/discover/recent-releases\`, \`/discover/pool/metadata\`, \`/discover/bubbles\`, \`/discover/bubbles/<snapshot_type>\`) are profile-scoped: send an \`X-Profile-Id\` header or \`?profile_id=\` query parameter (defaults to profile 1 when omitted).
 
@@ -2635,8 +2639,8 @@ curl -H "Authorization: Bearer sk_..." \\
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is \`null\` on all profile endpoints
-> (none are paginated). Rate limit: 60 requests/minute per IP (\`429\`, code
-> \`RATE_LIMITED\`).
+> (none are paginated). Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
 
 ## Endpoint reference
 
@@ -3067,22 +3071,24 @@ curl -X PATCH http://localhost:8008/api/v1/settings \\
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is \`null\` on all retag endpoints
-> (none are paginated). Rate limit: 60 requests/minute per IP (\`429\`, code
-> \`RATE_LIMITED\`).
+> (none are paginated). Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
 
 ## Endpoint reference
 
 Retag groups collect files whose metadata needs rewriting — the batches behind
 library-wide tag fixes. The API is read-and-delete only: inspect the groups,
 review what a group caught, delete it when its fixes are done, or clear
-everything at once. Groups themselves are created by the retag worker, not by
-this API.
+everything at once. Groups come from the Library Re-tag job: a group is an
+album with pending Re-tag findings (its \`id\` is the album's id), a track is one
+of those findings (its \`id\` is the finding's id), and deleting a group
+dismisses its findings.
 
 ### The retag group object
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`id\` | int | Group ID |
+| \`id\` | int | Group ID (the album's id) |
 | \`group_type\` | string | Group kind, e.g. \`"album"\` (default) |
 | \`artist_name\` | string | Artist the group belongs to |
 | \`album_name\` | string | Album the group belongs to |
@@ -3098,7 +3104,7 @@ this API.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`id\` | int | Track row ID |
+| \`id\` | int | Track ID (the Re-tag finding's id) |
 | \`group_id\` | int | Owning group ID |
 | \`track_number\` | int \\| null | Track number within the disc |
 | \`disc_number\` | int | Disc number (default \`1\`) |
@@ -3107,7 +3113,7 @@ this API.
 | \`file_format\` | string \\| null | Audio container/codec, e.g. \`"flac"\` |
 | \`spotify_track_id\` | string \\| null | Spotify track ID, when known |
 | \`itunes_track_id\` | string \\| null | iTunes track ID, when known |
-| \`created_at\` | string | When the track row was created |
+| \`created_at\` | string | When the Re-tag finding was raised |
 
 Note: \`?fields=\` trimming and \`?page=\`/\`?limit=\` pagination are **not**
 supported on any retag endpoint.
@@ -3230,7 +3236,9 @@ curl -H "Authorization: Bearer $API_KEY" \\
 
 ### \`DELETE /api/v1/retag/groups/{group_id}\`
 
-Delete one retag group and all of its tracks. **There is no undo.**
+Dismiss one retag group: every pending Re-tag finding of that album. The files
+are not touched; the next Re-tag scan raises a finding again for a file that
+still disagrees with the catalogue.
 
 **Path parameters**
 
@@ -3253,6 +3261,7 @@ Delete one retag group and all of its tracks. **There is no undo.**
 
 | Status | Code | Meaning |
 |--------|------|---------|
+| 404 | \`NOT_FOUND\` | The album has no pending Re-tag findings |
 | 500 | \`RETAG_ERROR\` | Database failure |
 
 **Example**
@@ -3262,26 +3271,13 @@ curl -X DELETE -H "Authorization: Bearer $API_KEY" \\
   http://localhost:8008/api/v1/retag/groups/7
 \`\`\`
 
-**Notes**
-
-- The underlying delete does not check that the group exists first: deleting
-  a nonexistent \`group_id\` still answers \`200\` with the confirmation message.
-  (The \`404\` branch in the route is unreachable with the current database
-  code, which returns success unconditionally.)
-
 ---
 
 ### \`DELETE /api/v1/retag/groups\`
 
-Delete **all** retag groups and their tracks at once. **There is no undo.**
+Dismiss **every** pending Re-tag finding at once.
 
-> [!WARNING]
-> This endpoint is currently broken: it always answers \`500 RETAG_ERROR\`
-> because \`api/retag.py\` calls \`db.clear_all_retag_groups()\`, which does not
-> exist (the database method is \`delete_all_retag_groups()\`). The contract
-> below is the intended behavior once that is fixed.
-
-**Response** — intended \`200\` with the number of groups cleared:
+**Response** — \`200\` with the number of groups (albums) cleared:
 
 \`\`\`json
 {
@@ -3330,9 +3326,9 @@ key):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`groups\` | int | Total retag groups (\`COUNT(*)\` on \`retag_groups\`) |
-| \`tracks\` | int | Total retag tracks (\`COUNT(*)\` on \`retag_tracks\`) |
-| \`artists\` | int | Distinct artists (\`COUNT(DISTINCT artist_name)\` on \`retag_groups\`) |
+| \`groups\` | int | Albums with a pending Re-tag finding |
+| \`tracks\` | int | Pending Re-tag findings (one per track) |
+| \`artists\` | int | Distinct artists across those albums |
 
 **Errors**
 
@@ -3355,7 +3351,7 @@ curl -H "Authorization: Bearer $API_KEY" \\
             body: `
 # Cache API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 These endpoints are diagnostic: inspect what SoulSync has cached from MusicBrainz lookups and discovery-provider matching. They are **read-only** — all four are \`GET\` and none of them clear, purge, or otherwise modify the caches. They are not profile-scoped.
 
@@ -3556,7 +3552,7 @@ curl -H "Authorization: Bearer sk_..." \\
             body: `
 # ListenBrainz API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 These endpoints read the ListenBrainz playlists SoulSync has imported or generated. They are not profile-scoped. \`playlist_id\` on the detail endpoint accepts either the internal integer ID or the MusicBrainz playlist MBID.
 
@@ -3695,7 +3691,7 @@ curl -H "Authorization: Bearer sk_..." \\
             body: `
 # MetaSync Export API — draft documentation
 
-Base: \`/api/v1\`. Requires an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). Responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. Requires an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). Responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 MetaSync is a peer-to-peer metadata network that runs as a SoulSync sidecar. This endpoint is how it reads SoulSync's library: a **read-only**, cursor-paged walk of resolved metadata (artists, albums, tracks). It is not profile-scoped.
 
@@ -3819,8 +3815,8 @@ curl -H "Authorization: Bearer sk_..." \\
 
 All endpoints live under \`/api/v1\` and require an API key, sent as an
 \`Authorization: Bearer sk_...\` header or as the \`?api_key=\` query parameter.
-An API key acts with **admin rights**. Rate limit: 60 requests/minute per IP
-(\`429\` with code \`RATE_LIMITED\`).
+An API key acts with **admin rights**. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+the key is missing or invalid (\`429\` with code \`RATE_LIMITED\`).
 
 ## How the video surface works
 
@@ -4744,6 +4740,7 @@ curl -X POST -H "Authorization: Bearer $API_KEY" \\
 | POST | \`/api/automations/{automation_id}/toggle\` | Enable/disable one automation | session |
 | POST | \`/api/automations/{automation_id}/run\` | Run an automation right now | session (profile-scoped) |
 | GET | \`/api/automations/progress\` | Live progress of running automations | session |
+| GET | \`/api/automations/activity\` | The last 24 hours by automation and the last 7 days by local day. \`?side=video\` for the video side. Returns \`{recent, days, totals}\` | session |
 | GET | \`/api/automations/{automation_id}/history\` | Run history — \`?limit=50&offset=0\` | session |
 | GET | \`/api/scripts\` | Scripts available to the run-script action | session |
 | GET | \`/api/automations/blocks\` | Trigger/action/notification block catalog | session |

@@ -307,6 +307,20 @@ class VideoLibraryScanner:
                 removed_s = (self.db.prune_missing("shows", server, seen_shows)
                              if do_prune and seen_shows else 0)
 
+            # Profiles linked to their own Plex account get their own watch state
+            # (#1941): the scan above read the server account's. Same libraries,
+            # same window: an incremental reads what was viewed since the last
+            # scan, anything else reads it all.
+            if server == "plex":
+                self._set(phase="reading members' watch state")
+                try:
+                    from core.video.member_watch import sync_member_watch_state
+                    sync_member_watch_state(self.db, source,
+                                            since=since if incremental else None,
+                                            media_type=media_type)
+                except Exception:   # noqa: BLE001 - never fails the scan itself
+                    logger.exception("video scan: member watch state pass failed")
+
             # Record the scan baseline (its START time, so a change made mid-scan is
             # caught next run) — the next incremental deltas from here. Only when the
             # whole library was read (all media types), so a movie-only scan can't
@@ -317,6 +331,13 @@ class VideoLibraryScanner:
                 except Exception:
                     logger.debug("video scan: could not persist last-scan baseline", exc_info=True)
 
+            # which video library (#2029) each title's files sit in, by folder
+            try:
+                from core.video.libraries import attribute_files
+                attribute_files(self.db)
+            except Exception:   # noqa: BLE001 - never fails the scan itself
+                logger.exception("video scan: library attribution failed")
+
             self._set(state="done", phase="complete", finished_at=time.time(),
                       movies=movies, shows=shows, episodes=episodes, percent=100,
                       removed=removed_m + removed_s)
@@ -326,6 +347,15 @@ class VideoLibraryScanner:
             logger.exception("Video library scan failed")
             self._set(state="error", phase="failed", error=str(e))
         finally:
+            # the library manager's summed-up rows describe the library the
+            # scan just changed underneath them
+            try:
+                from core.video import library_manager
+                # the old rows keep answering while each side is summed again
+                # in the background: the open page never waits on a cold build
+                library_manager.expire()
+            except Exception:   # noqa: BLE001 - a stale page is not a failed scan
+                logger.debug("library manager not told about the scan", exc_info=True)
             if paused:
                 self._resume_after_scan()
 

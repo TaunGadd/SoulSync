@@ -34,7 +34,7 @@ describe('the page shell', () => {
     });
     const root = view.container.firstElementChild!;
     expect(root.id).toBe('dashboard-page');
-    expect(root.className).toBe('page-shell dashboard-container');
+    expect(root.className).toBe('page-shell dashboard-container dash-room');
 
     // the hero: greeting + library on the left, the orb stage on the right
     const hero = root.firstElementChild!;
@@ -49,11 +49,30 @@ describe('the page shell', () => {
       Array.from(root.querySelectorAll(`${sel} > [data-card]`)).map((card) =>
         card.getAttribute('data-card'),
       );
-    expect(cards('.dash-main')).toEqual(['active-downloads', 'listen']);
-    expect(cards('.dash-side')).toEqual(['sync', 'automations']);
-    // watchlist + wishlist are rail tiles, keeping the tour's ids
-    expect(root.querySelector('.dash-side #watchlist-button')).not.toBeNull();
-    expect(root.querySelector('.dash-side #wishlist-button')).not.toBeNull();
+    // what you came to play is the first thing under the hero
+    expect(cards('.room-top')).toEqual(['active-downloads', 'listen']);
+    // the system is a board, not a side column
+    expect(cards('.room-board')).toEqual(['sync', 'automations']);
+    expect(root.querySelector('.dash-side')).toBeNull();
+    expect(root.querySelector('.dash-layout')).toBeNull();
+    // the order down the page: hero, the mixes, what just arrived, the
+    // system, what you played, then the switches. the wrap is what the board
+    // measures itself against
+    expect(
+      Array.from(root.children)
+        .map((child) => child.className)
+        .filter((name) => name.startsWith('room-') || name === 'dash-footer'),
+    ).toEqual([
+      'room-top',
+      'room-shelves',
+      'room-board-wrap',
+      'room-shelves room-shelves--last',
+      'dash-footer',
+    ]);
+    expect(root.querySelector('.room-board-wrap > .room-board')).not.toBeNull();
+    // watchlist + wishlist are tiles on the board, keeping the tour's ids
+    expect(root.querySelector('.room-board #watchlist-button')).not.toBeNull();
+    expect(root.querySelector('.room-board #wishlist-button')).not.toBeNull();
     // Boulder's quick switches: their own footer, not inside a card
     expect(root.querySelector('.dash-footer .dash-quick-settings')).not.toBeNull();
     expect(root.querySelector('[data-card="automations"] .dash-quick-settings')).toBeNull();
@@ -71,5 +90,21 @@ describe('the page shell', () => {
       render(<DashboardPage />);
     });
     expect(setPage).toHaveBeenCalledWith('dashboard');
+  });
+
+  it('leaves out the cards of what the profile switched off (#1909)', async () => {
+    const off = new Set(['playlists', 'automations']);
+    window.SoulSyncFeatures = { isOn: (id: string) => !off.has(id) } as never;
+    let view!: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<DashboardPage />);
+    });
+    delete window.SoulSyncFeatures;
+    const board = Array.from(view.container.querySelectorAll('.room-board > [data-card]')).map(
+      (card) => card.getAttribute('data-card'),
+    );
+    expect(board).toEqual([]);
+    // watchlist and wishlist are the core, they stay
+    expect(view.container.querySelector('.room-board #watchlist-button')).not.toBeNull();
   });
 });

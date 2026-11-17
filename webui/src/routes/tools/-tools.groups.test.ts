@@ -20,6 +20,7 @@ import {
   healthBand,
   healthBandLabel,
   libraryHealth,
+  fixAllSafePlan,
   safeFixablePending,
   severityRank,
   severityWeight,
@@ -228,6 +229,34 @@ describe('visibleGroups', () => {
     ).toEqual(['dead_file']);
   });
 
+  // review 5 R5-L-3: the payload's per-status severity counts, not the worst
+  // pending row, decide what a severity filter shows
+  it('finds resolved errors and pending warnings under an error', () => {
+    const real = [
+      group({
+        finding_type: 'corrupt_audio',
+        resolved: 5,
+        total: 5,
+        severities: { resolved: { error: 5 } },
+      }),
+      group({
+        finding_type: 'metadata_gap',
+        pending: 301,
+        total: 301,
+        severity_max: 'error',
+        severities: { pending: { warning: 300, error: 1 } },
+      }),
+    ];
+    const types = (f: { status?: string; severity?: string }) =>
+      visibleGroups(real, f).map((g) => g.finding_type);
+    expect(types({ status: 'resolved', severity: 'error' })).toEqual(['corrupt_audio']);
+    expect(types({ status: 'resolved', severity: 'info' })).toEqual([]);
+    expect(types({ status: 'pending', severity: 'warning' })).toEqual(['metadata_gap']);
+    expect(types({ status: '', severity: 'error' })).toEqual(['corrupt_audio', 'metadata_gap']);
+    expect(groupCountForStatus(real[1], 'pending', 'warning')).toBe(300);
+    expect(groupCountForStatus(real[1], '', 'error')).toBe(1);
+  });
+
   it('an empty status means every status, using the total', () => {
     expect(visibleGroups(groups, {}).map((g) => g.finding_type)).toEqual([
       'orphan_file',
@@ -246,11 +275,88 @@ describe('groupCountForStatus', () => {
   });
 });
 
+describe('fixAllSafePlan', () => {
+  const catalog = new Map([
+    ['library_retag', info({ type: 'library_retag', label: 'Library Re-tag', verb: 'Apply Tags' })],
+    [
+      'missing_lyrics',
+      info({ type: 'missing_lyrics', label: 'Missing Lyrics', verb: 'Apply Lyrics' }),
+    ],
+    ['orphan_file', info({ type: 'orphan_file', label: 'Orphan Files', destructive: true })],
+    ['quality_upgrade', info({ type: 'quality_upgrade', label: 'Upgrades', acquires: true })],
+    ['album_needs_enrichment', info({ type: 'album_needs_enrichment', fixable: false })],
+  ]);
+  const lookup = (type: string) => catalog.get(type);
+  const mixed = [
+    group({ finding_type: 'missing_lyrics', pending: 48 }),
+    group({ finding_type: 'library_retag', pending: 83177 }),
+    group({ finding_type: 'orphan_file', pending: 37 }),
+    group({ finding_type: 'quality_upgrade', pending: 9 }),
+    group({ finding_type: 'album_needs_enrichment', pending: 4 }),
+  ];
+
+  it('names every kind it will fix, biggest first, with the count and the fix', () => {
+    const plan = fixAllSafePlan(mixed, lookup);
+    expect(plan.total).toBe(83225);
+    expect(plan.confirmText).toBe('Fix 83,225');
+    expect(plan.message).toContain('default fix to 83,225 findings:');
+    expect(plan.message).toContain(
+      '83,177  Library Re-tag (Apply Tags)\n48  Missing Lyrics (Apply Lyrics)',
+    );
+  });
+
+  it('leaves out what the run leaves alone', () => {
+    const { message } = fixAllSafePlan(mixed, lookup);
+    // touches files, starts downloads, has no fix
+    expect(message).not.toContain('Orphan Files');
+    expect(message).not.toContain('Upgrades');
+    expect(message).not.toContain('enrichment');
+  });
+
+  it('says what a tag fix writes into the file, only when there is one', () => {
+    expect(fixAllSafePlan(mixed, lookup).message).toContain(
+      "Library Re-tag writes into each file's tags",
+    );
+    const lyricsOnly = fixAllSafePlan(
+      [group({ finding_type: 'missing_lyrics', pending: 1 })],
+      lookup,
+    );
+    expect(lyricsOnly.message).not.toContain('Re-tag');
+    expect(lyricsOnly.message).toContain('default fix to 1 finding:');
+  });
+
+  it('sums the long tail past six types', () => {
+    const many = Array.from({ length: 8 }, (_, index) => `safe_${index}`);
+    const names = new Map(many.map((type) => [type, info({ type, label: type })]));
+    const plan = fixAllSafePlan(
+      many.map((type, index) => group({ finding_type: type, pending: 10 - index })),
+      (type) => names.get(type),
+    );
+    expect(plan.message).toContain('safe_5');
+    expect(plan.message).not.toContain('safe_6');
+    // 4 + 3 left over
+    expect(plan.message).toContain('7  in 2 more types');
+    expect(plan.total).toBe(52);
+  });
+
+  it('speaks for the video side in its own terms', () => {
+    const plan = fixAllSafePlan(
+      [group({ finding_type: 'missing_lyrics', pending: 2 })],
+      lookup,
+      true,
+    );
+    expect(plan.message).toContain('Nothing on disk is touched and nothing is downloaded.');
+  });
+});
+
 describe('safeFixablePending', () => {
   const catalog = new Map([
     ['missing_cover_art', info({ type: 'missing_cover_art', destructive: false })],
     ['orphan_file', info({ type: 'orphan_file', destructive: true })],
-    ['fake_lossless', info({ type: 'fake_lossless', fixable: false, destructive: false })],
+    [
+      'album_needs_enrichment',
+      info({ type: 'album_needs_enrichment', fixable: false, destructive: false }),
+    ],
   ]);
   const lookup = (type: string) => catalog.get(type);
 
@@ -261,7 +367,7 @@ describe('safeFixablePending', () => {
         group({ finding_type: 'orphan_file', pending: 20 }),
         // Unfixable: counting it is how a button comes to report
         // "Fixed 0 of 1,204".
-        group({ finding_type: 'fake_lossless', pending: 5 }),
+        group({ finding_type: 'album_needs_enrichment', pending: 5 }),
         // Unknown to the catalog — no evidence it is safe.
         group({ finding_type: 'brand_new_type', pending: 99 }),
       ],
@@ -301,6 +407,9 @@ describe('the blurbs', () => {
     'unknown_artist',
     'acoustid_mismatch',
     'quality_upgrade',
+    'quality_upgrade_review',
+    'quality_format_not_targeted',
+    'quality_unknown',
     'missing_discography_track',
     'library_retag',
     'short_preview_track',

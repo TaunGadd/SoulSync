@@ -10,6 +10,8 @@ registerDocsSection({
             body: `
 SoulSync needs credentials for the services it queries for metadata and enrichment. The Settings search finds any setting by name — handy when you're not sure which tab it lives under.
 
+Settings save themselves a moment after you change them. The status at the top right says **All changes saved**, **Save now** while a change is waiting (click it to save straight away), or **Retry save** if a save failed. Rather save by hand? Turn off **Save settings as I change them** under System, Saving. Changes then wait for the save button, and leaving Settings without saving drops them.
+
 ## Service list
 
 - **Spotify** — Client ID, Client Secret, and Redirect URI (from the Spotify Developer Dashboard). Powers metadata, discovery, and playlist sync. Redirect URIs must be **HTTPS** for anything that isn't a loopback address (NAS, Docker, remote host) — see [Connecting services](#gs-connecting).
@@ -78,6 +80,12 @@ No media server at all: SoulSync itself is the player and library manager. Impor
 | **Usenet** | Search via Prowlarr indexers through your usenet client |
 | **Hybrid** | Drag sources into a priority chain — SoulSync works down the list and uses the first source that returns a match |
 
+For **Usenet**, SoulSync downloads each NZB from Prowlarr itself and hands SABnzbd or NZBGet the file, the way Sonarr does. Their queue shows the release name straight away, never a "Trying to fetch NZB" entry or the Prowlarr link with your api key, and they don't need to reach Prowlarr. If the NZB can't be fetched, nothing is sent to the client and the grab fails with the reason (for example the indexer's HTTP error).
+
+**A shared qBittorrent.** If your qBittorrent is set to add torrents stopped, or to stop them once the metadata is in, everything SoulSync adds sits there and never downloads. Turn on **Start the torrents SoulSync adds** in the torrent client section and SoulSync's torrents start anyway, while what other apps add keeps your qBittorrent setting. It is off by default and only applies to qBittorrent.
+
+**Pacing indexer searches.** Prowlarr passes every search straight to your indexers, so SoulSync spaces them out: 2 seconds between searches and at most 20 a minute by default, one budget for music and video together. Both are in the Prowlarr section as **Seconds between searches** and **Searches per minute, at most**. Raise the first if a tracker answers 429 Too Many Requests or Prowlarr marks an indexer unhealthy; a tracker that asks for 11 seconds between requests wants 12 or more. 0 turns either one off. A manual search waits its turn behind background searches.
+
 The chain editor lives on the Downloads tab: drag sources from **Available** into your **Download chain**. One source in the chain means "that source only"; two or more means hybrid. Any source can be configured on the Sources tab first — it doesn't need to be in the chain yet.
 
 ## Paths
@@ -98,7 +106,7 @@ Every folder on the Folders card is checked as you type, with one line under it:
 - **Inside your download folder** (or the other way round): keep downloads and libraries side by side, not nested, or half-finished files get scanned.
 - **Not on a mapped volume** (Docker): files there live inside the container and are lost when it's recreated.
 
-The Video tab adds optional **4K libraries** (see [Video: 4K libraries](#vid-sources)) and, in Docker, the compose volume lines for every folder you've set, ready to copy.
+The Video tab adds optional **4K libraries** and **More libraries** for your own movie and TV libraries (see [Video: 4K libraries](#vid-sources)) and, in Docker, the compose volume lines for every folder you've set, ready to copy.
 
 ## Behavior
 
@@ -127,6 +135,8 @@ These live on other tabs, not Downloads:
 
 - **Path templates** — customize how artists, albums, and tracks are named and nested (e.g. \`$albumartist/$album/$track - $title\`). Variables use \`$name\` syntax: \`$albumartist\`, \`$artist\`, \`$album\`, \`$track\`, \`$title\`, \`$year\`, \`$discnum\`, \`$explicit\` (\`[E]\` on explicit tracks), \`$contentrating\` (\`[E]\` or \`[C]\`), \`$albumartistinfo\` / \`$albumartistcomposite\` / \`$albumartistclash\` (MusicBrainz's note, country or genre, to keep same-named artists apart), and more
 - **Live preview** — under each template is the path it makes for an example release, updated as you type and before you save. Switch the example between **Standard**, **Explicit**, **Multi-disc** and **Shared artist name** to see the content rating badges, the disc folder and the artist notes come out. It runs through the same code a real download does, so what it shows is what you get
+- **Singles with several tracks**: a release your source calls a single can hold more than one track. On a customized Single Path Template each one keeps its own \`$track\` and \`$disc\`.
+- **Explicit and clean versions** (Filtering): **Prefer explicit versions when matching** ranks explicit files above clean ones and never skips anything. **Never download clean versions** goes further: a file marked Clean, Censored, Edited or Radio Edit is not picked at all unless the track is that cut itself, and the track waits on your Wishlist until a real one turns up.
 - **Multi-disc labels** — the **Multi-Disc Folder Label** setting controls the subfolder added automatically on multi-disc albums; put a disc variable in your template instead to take over
 - **Lookalike characters** — Windows doesn't allow \`: ? / \\ " * | < >\` in names, so by default they become \`_\` (\`AC_DC\`). Turn on **Keep symbols in names with lookalike characters** and they become lookalikes that work on every system instead (\`AC∕DC\`, \`What's Going On？\`), and a trailing dot is kept (\`DAMN․\`). New downloads use it right away; run Reorganize to rename what's already in your library
 - **Detect multi-artist compilations** — file soundtracks and compilations under Various Artists instead of whichever contributor happened to be first
@@ -150,7 +160,17 @@ Quality profiles define which formats are acceptable for downloads, and when a f
 
 ![Quality profiles](dl-quality-profiles.jpg)
 
-Quality profiles are checked during downloads and auto-import, and by the **Quality Upgrade Finder** repair job, which finds files that fall below your standards and proposes replacements.
+Quality profiles are checked during downloads and auto-import. The Library evaluates monitored tracks against their upgrade cutoff and sends the ones with no file to the Wishlist through **Watchlist & Wishlist Reconcile**.
+
+**Automatic upgrades.** A file below its profile (a 128 kbps fallback under a 320 kbps target, say) is asked for again by the same job, with a memory so it cannot loop:
+
+- **A few at a time.** *Upgrades per run* on the job (default 5, hourly) is how many tracks are asked for each run; 0 turns automatic upgrades off. The rest wait their turn.
+- **A growing wait.** A track that found nothing better is not asked for again for *Upgrade retry days* (default 7), then twice that, up to 90 days. A new file starts the count over.
+- **A short stay.** An upgrade search that found nothing in 12 hours leaves the Wishlist until its next turn.
+- **Only a better copy is downloaded.** A candidate whose quality is known and no better than your file is skipped, and so is the streaming source that just delivered that file, which can only deliver it again. Whatever does arrive is measured against the profile before it replaces anything.
+- **A file that cannot be measured is left alone**, since nothing can be shown to be better than it.
+
+**Enhance Quality** asks for chosen tracks right away, without the wait. The **Quality Profile Audit** repair job flags library files below their profile for review; the old Quality Upgrade Finder is retired.
 `
         },
         {

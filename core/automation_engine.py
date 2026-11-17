@@ -567,6 +567,11 @@ class AutomationEngine:
         self._timers = {}       # automation_id → threading.Timer
         self._lock = threading.Lock()
         self._running = False
+        # iss32-M02: set while a Library-v2 bootstrap migration holds SQLite's
+        # only writer. Scheduled slots are skipped the same way the master
+        # pause skips them — the schedule stays alive, so nothing has to be
+        # restarted and no catch-up burst follows.
+        self._migration_paused = False
 
         # Action handlers registered by web_server.py (avoids circular imports)
         # Format: {type: {'handler': fn(config)->dict, 'guard': fn()->bool or None}}
@@ -649,6 +654,19 @@ class AutomationEngine:
         if raw is None or str(raw).strip() == '':
             return self.MASTER_DEFAULTS.get(side, True)
         return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def feature_paused(self, auto) -> str | None:
+        """#1909: an admin paused a part every profile hid (podcasts,
+        audiobooks). the reason string, or None when it may run. live read,
+        so a profile turning the part back on resumes it on the next slot."""
+        try:
+            from core import ui_features
+            feature = ui_features.feature_for_automation(auto)
+            if feature and ui_features.background_paused(self.db, feature):
+                return f'{feature} is hidden for everyone and paused'
+        except Exception as e:  # noqa: BLE001 - a failed check never stops a job
+            logger.debug("feature pause check failed: %s", e)
+        return None
 
     def set_master_enabled(self, side: str, enabled: bool) -> bool:
         """Persist one side's master state to the engine DB. False on bad side."""
@@ -1040,6 +1058,22 @@ class AutomationEngine:
         self._rebuild_event_cache()
         logger.info(f"AutomationEngine started — {scheduled} scheduled, {event_count} event-based")
 
+    def pause_for_migration(self):
+        """Skip scheduled slots while a Library-v2 migration holds the writer."""
+        if not self._migration_paused:
+            self._migration_paused = True
+            logger.info("AutomationEngine paused — Library migration in progress")
+
+    def resume_after_migration(self):
+        """Undo :meth:`pause_for_migration`. Idempotent."""
+        if self._migration_paused:
+            self._migration_paused = False
+            logger.info("AutomationEngine resumed — Library migration finished")
+
+    @property
+    def migration_paused(self):
+        return self._migration_paused
+
     def stop(self):
         """Cancel all timers on shutdown."""
         self._running = False
@@ -1116,7 +1150,8 @@ class AutomationEngine:
                     # Direct-effect callers honor the per-side master pause too —
                     # otherwise a paused side's effects would still fire through
                     # the code paths that never route via _run_event_automation.
-                    return self.master_enabled(self.automation_side(auto))
+                    return (self.master_enabled(self.automation_side(auto))
+                            and self.feature_paused(auto) is None)
             return False
         except Exception as e:
             logger.debug(f"is_event_action_enabled({event_type}, {action_type}) failed: {e}")
@@ -1249,6 +1284,10 @@ class AutomationEngine:
         side = self.automation_side(auto)
         if not self.master_enabled(side):
             logger.info(f"Event automation '{auto.get('name')}' skipped — {side} automations are paused")
+            return
+        paused = self.feature_paused(auto)
+        if paused:
+            logger.info(f"Event automation '{auto.get('name')}' skipped — {paused}")
             return
 
         action_type = auto.get('action_type')
@@ -1403,6 +1442,22 @@ class AutomationEngine:
                 logger.info(f"Automation '{auto.get('name')}' skipped — {side} automations are paused")
                 self._finish_run(auto, automation_id,
                                  {'status': 'skipped', 'reason': f'{side} automations are paused'},
+                                 error=None)
+                return
+            paused = self.feature_paused(auto)
+            if paused:
+                logger.info(f"Automation '{auto.get('name')}' skipped — {paused}")
+                self._finish_run(auto, automation_id,
+                                 {'status': 'skipped', 'reason': paused},
+                                 error=None)
+                return
+            # iss32-M02: same treatment while the catalogue migration owns the
+            # writer. Running here would only produce "database is locked" and
+            # a failed run in the history.
+            if self._migration_paused:
+                logger.info(f"Automation '{auto.get('name')}' skipped — Library migration in progress")
+                self._finish_run(auto, automation_id,
+                                 {'status': 'skipped', 'reason': 'Library migration in progress'},
                                  error=None)
                 return
 

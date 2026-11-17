@@ -54,11 +54,15 @@ window.syncAcoustidRequireVerifiedVisibility = syncAcoustidRequireVerifiedVisibi
 // the parent filter is off. Called on settings load + the parent's onchange.
 function syncPreferExplicitState() {
     const parent = document.getElementById('allow-explicit');
-    const child = document.getElementById('prefer-explicit');
-    if (!parent || !child) return;
-    child.disabled = !parent.checked;
-    const label = child.closest('.checkbox-label');
-    if (label) label.style.opacity = parent.checked ? '' : '0.45';
+    if (!parent) return;
+    // #2081: "Never download clean versions" hangs off the same parent
+    for (const id of ['prefer-explicit', 'exclude-clean']) {
+        const child = document.getElementById(id);
+        if (!child) continue;
+        child.disabled = !parent.checked;
+        const label = child.closest('.checkbox-label');
+        if (label) label.style.opacity = parent.checked ? '' : '0.45';
+    }
 }
 window.syncPreferExplicitState = syncPreferExplicitState;
 
@@ -147,13 +151,64 @@ function debouncedAutoSaveSettings(event) {
     // user is trying to read. Never auto-save while the Logs tab is active.
     if (document.querySelector('.stg-tab.active')?.dataset.tab === 'logs') return;
     if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
+    // autosave switched off in System: the change waits for the save button.
+    // the switch itself always saves, or turning it back on would need a click
+    if (window._settingsAutosaveOff === true && event?.target?.id !== 'settings-autosave-enabled') {
+        settingsAutoSaveTimer = null;
+        setSettingsSaveState('pending');
+        return;
+    }
     settingsAutoSaveTimer = setTimeout(() => saveSettings(true), 2000);
+    setSettingsSaveState('pending');
+}
+
+// the autosave switch (System tab). flips the flag right away so the very
+// next change already follows it
+function handleSettingsAutosaveToggle(event) {
+    window._settingsAutosaveOff = event.target.checked === false;
 }
 
 function handleManualSaveClick() {
     if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
     if (qualityProfileAutoSaveTimer) clearTimeout(qualityProfileAutoSaveTimer);
     saveSettings(false);
+}
+
+// settings save themselves (#1909). the old Save Settings button and an
+// "auto-saved" toast after every keystroke told two stories, and the tour
+// still said nothing applied until you clicked. the button is now the one
+// quiet status, and still saves right away when clicked (the video side
+// hangs its own saves on that click).
+const SETTINGS_SAVE_LABELS = {
+    idle: 'All changes saved',
+    pending: 'Save now',
+    saving: 'Saving…',
+    saved: 'Saved',
+    error: 'Retry save',
+};
+let _settingsSavedTimer = null;
+
+function setSettingsSaveState(state) {
+    const btn = document.getElementById('save-settings');
+    if (!btn || !SETTINGS_SAVE_LABELS[state]) return;
+    if (_settingsSavedTimer) { clearTimeout(_settingsSavedTimer); _settingsSavedTimer = null; }
+    btn.dataset.state = state;
+    const label = btn.querySelector('span');
+    const manual = window._settingsAutosaveOff === true;
+    if (label) {
+        label.textContent = manual && state === 'pending'
+            ? 'Save changes' : SETTINGS_SAVE_LABELS[state];
+    }
+    if (manual) {
+        btn.title = state === 'pending' ? 'Autosave is off. Click to save your changes.' : '';
+    } else {
+        btn.title = state === 'idle' || state === 'saved'
+            ? 'Settings save as you go. Click to save again now.'
+            : '';
+    }
+    if (state === 'saved') {
+        _settingsSavedTimer = setTimeout(() => setSettingsSaveState('idle'), 2000);
+    }
 }
 
 function syncMetadataSourceSelection(source) {
@@ -458,6 +513,8 @@ function initializeSettings() {
         settingsPage.querySelectorAll('input[type="checkbox"], select').forEach(input => {
             input.addEventListener('change', debouncedAutoSaveSettings);
         });
+        document.getElementById('settings-autosave-enabled')
+            ?.addEventListener('change', handleSettingsAutosaveToggle);
     }
 
     const metadataSourceSelect = document.getElementById('metadata-fallback-source');
@@ -541,7 +598,7 @@ function validateFileOrganizationTemplates() {
 
     // Valid variables for each template type
     const validVars = {
-        album: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality', '$disambiguation', '$label', '$explicit', '$contentrating', '$contentratingfull', '$albumartistdisambiguation', '$albumartistcountry', '$albumartistgenre', '$albumartistinfo', '$albumartistcomposite', '$albumartistclash', '$artistdisambiguation', '$artistcountry', '$artistgenre', '$artistinfo', '$artistcomposite', '$artistclash'],
+        album: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$disc', '$discnum', '$discalways', '$discnumalways', '$cdnum', '$year', '$quality', '$disambiguation', '$label', '$explicit', '$contentrating', '$contentratingfull', '$albumartistdisambiguation', '$albumartistcountry', '$albumartistgenre', '$albumartistinfo', '$albumartistcomposite', '$albumartistclash', '$artistdisambiguation', '$artistcountry', '$artistgenre', '$artistinfo', '$artistcomposite', '$artistclash'],
         single: ['$artist', '$albumartist', '$artistletter', '$albumartistletter', '$album', '$albumtype', '$atypes', '$title', '$track', '$year', '$quality', '$explicit', '$contentrating', '$contentratingfull', '$albumartistdisambiguation', '$albumartistcountry', '$albumartistgenre', '$albumartistinfo', '$albumartistcomposite', '$albumartistclash', '$artistdisambiguation', '$artistcountry', '$artistgenre', '$artistinfo', '$artistcomposite', '$artistclash'],
         playlist: ['$artist', '$artistletter', '$playlist', '$title', '$year', '$quality'],
         video: ['$artist', '$artistletter', '$title', '$year'],
@@ -751,6 +808,7 @@ const INVERT_SERVICE_MARKS = new Set(['tidal', 'qobuz', 'discogs', 'tvdb']);
 const SERVICE_GLYPHS = {
     omdb: '\u2605',             // star - ratings, as on the dashboard
     fanart: '\u{1F3A8}',        // palette - artwork
+    'artist-fanart': '\u{1F3A8}', // the same source, for artist artwork
     opensubtitles: '\u{1F4AC}', // speech bubble - subtitles
     trakt: '\u2605',            // star - audience rating
     nokey: '\u{1F4FA}',         // tv - community data (TVmaze)
@@ -765,8 +823,8 @@ const SERVICE_GROUPS = {
           ids: ['musicbrainz', 'spotify', 'itunes', 'deezer', 'discogs', 'tidal', 'qobuz', 'hydrabase'] },
         { label: 'Scrobbling', hint: 'listening history and recommendations',
           ids: ['lastfm', 'listenbrainz'] },
-        { label: 'Extras', hint: 'lyrics, concerts, fingerprint checks and cover art',
-          ids: ['genius', 'concerts', 'acoustid', 'pollinations'] },
+        { label: 'Extras', hint: 'lyrics, concerts, fingerprint checks, cover art and artist artwork',
+          ids: ['genius', 'concerts', 'acoustid', 'pollinations', 'artist-fanart'] },
     ],
     video: [
         { label: 'Metadata', hint: 'movies, shows and episodes',
@@ -1211,6 +1269,7 @@ function switchSettingsTab(tab) {
     // the same one-shot probe fill the dots in.
     if (tab === 'sources') {
         try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
+        try { _loadVideoChainForTiles(); } catch (e) { /* tiles are cosmetic */ }
         if (typeof autoTestSourcesOnce === 'function') autoTestSourcesOnce();
     }
     // Initialize live log viewer when switching to Logs tab
@@ -1690,16 +1749,6 @@ async function _stgRefreshAfterSave() {
         if (expandedServices.length > 0) {
             _stgVerifyServices(expandedServices, { force: true });
         }
-        const btn = document.getElementById('save-settings');
-        if (btn) {
-            const origHTML = btn.innerHTML;
-            btn.classList.add('is-saved');
-            btn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg><span>Saved</span>';
-            setTimeout(() => {
-                btn.classList.remove('is-saved');
-                btn.innerHTML = origHTML;
-            }, 2000);
-        }
     } catch (e) {
         console.warn('[Settings Status] Post-save refresh failed:', e);
     }
@@ -1839,6 +1888,9 @@ const DLCHAIN_KINDS = {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(patch),
             });
+            // the Sources tiles show the video chain too (#2026)
+            _videoChainOrder = order.slice();
+            try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
         },
     },
     audiobooks: {
@@ -2056,6 +2108,10 @@ async function _dlchainLoad() {
     try {
         const state = await spec.read();
         _dlchainOrder = (state && Array.isArray(state.order)) ? state.order.slice() : [];
+        if (_dlchainKind === 'video') {
+            _videoChainOrder = _dlchainOrder.slice();
+            try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
+        }
     } catch (e) {
         _dlchainOrder = [];
     }
@@ -2336,12 +2392,49 @@ function toggleSourceCard(header) {
 }
 window.toggleSourceCard = toggleSourceCard;
 
+// The video chain lives in video.db behind its own endpoint, so it is cached
+// here for the tiles and refreshed when the Sources tab opens or the video
+// chain is edited. null means not read yet.
+let _videoChainOrder = null;
+
+async function _loadVideoChainForTiles() {
+    try {
+        const state = await DLCHAIN_KINDS.video.read();
+        _videoChainOrder = (state && Array.isArray(state.order)) ? state.order.slice() : [];
+    } catch (e) {
+        // leave the last known order; a failed read must not empty the tiles
+    }
+    try { buildSourceTiles(); } catch (e) { /* tiles are cosmetic */ }
+}
+window.loadVideoChainForTiles = _loadVideoChainForTiles;
+
+// Every download chain a source can sit in. A source in any of them is in use.
+function _srcAllChains() {
+    const music = (typeof getHybridOrder === 'function' ? getHybridOrder() : []) || [];
+    let books = [];
+    try { books = _audiobookActiveSources(); } catch (e) { /* no audiobook settings on this page */ }
+    return [
+        { label: 'Music', order: music },
+        { label: 'Video', order: _videoChainOrder || [] },
+        { label: 'Audiobooks', order: books },
+    ];
+}
+
+function _srcChainUses(id, chains) {
+    const uses = [];
+    for (const c of chains) {
+        const i = c.order.indexOf(id);
+        if (i !== -1) uses.push({ label: c.label, pos: i + 1 });
+    }
+    return uses;
+}
+
 // One tile per source: logo, name under it, and the state that matters at a
 // glance. Rendered from HYBRID_SOURCES so the tiles and the chain rows on the
 // Downloads tab cannot disagree about a name or a logo.
-function _srcTileMarkup(src, order) {
-    const pos = order.indexOf(src.id);
-    const inChain = pos !== -1;
+function _srcTileMarkup(src, chains) {
+    const uses = _srcChainUses(src.id, chains);
+    const inChain = uses.length > 0;
     const state = (_hybridSourceStatus && _hybridSourceStatus[src.id]) || 'unknown';
     const unready = _hybridSourceUnready && _hybridSourceUnready[src.id];
     const said = _ssLastTestMessage[src.id];
@@ -2364,8 +2457,10 @@ function _srcTileMarkup(src, order) {
         : (unready || state === 'warn')
         ? '<span class="src-tile-chip src-tile-chip--warn">needs setup</span>'
         : inChain
-            ? `<span class="src-tile-chip src-tile-chip--on">#${pos + 1}</span>`
-            : '<span class="src-tile-chip">not in chain</span>';
+            ? `<span class="src-tile-chips">${uses.map(u =>
+                `<span class="src-tile-chip src-tile-chip--on" title="${escapeHtml(u.label)} chain, tried ${u.pos === 1 ? 'first' : '#' + u.pos}">`
+                + `${escapeHtml(u.label)} #${u.pos}</span>`).join('')}</span>`
+            : '<span class="src-tile-chip">not in a chain</span>';
     return `<button type="button" class="src-tile${inChain ? ' is-active' : ''}" `
          + `data-source-id="${src.id}" onclick="openSourceModal('${src.id}')" `
          + `title="Configure ${escapeHtml(src.name)}">`
@@ -2383,7 +2478,7 @@ function _srcTileMarkup(src, order) {
 function buildSourceTiles() {
     const grid = document.getElementById('source-tile-grid');
     if (!grid) return;
-    const order = (typeof getHybridOrder === 'function' ? getHybridOrder() : []) || [];
+    const chains = _srcAllChains();
 
     // Only sources that own a config panel get a tile. No side filtering: this
     // tab is shared and shows the same thing on both sides.
@@ -2395,7 +2490,7 @@ function buildSourceTiles() {
           + `<span class="src-group-label">${label}</span>`
           + `<span class="src-group-count">${list.length}</span>`
           + `<span class="src-group-hint">${hint}</span></div>`
-          + `<div class="src-tile-row">${list.map(src => _srcTileMarkup(src, order)).join('')}</div></div>`
+          + `<div class="src-tile-row">${list.map(src => _srcTileMarkup(src, chains)).join('')}</div></div>`
         : '';
 
     // Indexers are their own kind of thing: not a source you pick, but the
@@ -2405,13 +2500,20 @@ function buildSourceTiles() {
     const indexers = configurable.filter(isIndexer);
     const sources = configurable.filter(src => !isIndexer(src));
 
+    // in use means in ANY chain, music, video or audiobooks (#2026: usenet
+    // driving every video download read "not in chain" because only the music
+    // chain was looked at). music order first, then video, then audiobooks.
+    const rank = (src) => {
+        const u = _srcChainUses(src.id, chains)[0];
+        return u ? chains.findIndex(c => c.label === u.label) * 1000 + u.pos : Infinity;
+    };
     const inChain = sources
-        .filter(src => order.includes(src.id))
-        .sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
-    const available = sources.filter(src => !order.includes(src.id));
+        .filter(src => _srcChainUses(src.id, chains).length)
+        .sort((a, b) => rank(a) - rank(b));
+    const available = sources.filter(src => !_srcChainUses(src.id, chains).length);
 
     grid.innerHTML =
-        section('In your chain', 'tried in this order', inChain) +
+        section('In use', 'the chains each source is in, and where it is tried', inChain) +
         section('Available', 'configure now, add to the chain when you want it', available) +
         section('Indexers', 'searched by torrent and usenet', indexers);
 }
@@ -2718,6 +2820,12 @@ async function testAllSources(opts = {}) {
     // torrent but whose music never does saw a grey torrent tile forever,
     // because only the music chain got probed.
     for (const id of _audiobookActiveSources()) sources.add(id);
+    // and the video chain (#2026): usenet carrying every video download kept a
+    // grey dot because nothing ever tested it.
+    if (_videoChainOrder === null) await _loadVideoChainForTiles();
+    for (const id of (_videoChainOrder || [])) {
+        if (HYBRID_SOURCE_PROBE[id]) sources.add(id);
+    }
 
     // Torrent/Usenet downloads go through Prowlarr — its connection must be
     // established first or those source tests fail. Probe Prowlarr up front.
@@ -3241,6 +3349,15 @@ async function loadSettingsData() {
         loadNavidromePlaylistLogin();
         loadMediaServerNames();
 
+        // Populate Music Assistant settings
+        const maUrl = document.getElementById('music_assistant-url');
+        const maToken = document.getElementById('music_assistant-token');
+        if (maUrl) maUrl.value = settings.music_assistant?.base_url || '';
+        if (maToken) maToken.value = settings.music_assistant?.token || '';
+        const maFolder = document.getElementById('music_assistant-source-folder');
+        if (maFolder) maFolder.value = settings.music_assistant?.source_folder || '';
+        if (maUrl && maUrl.value && maToken && maToken.value) loadMusicAssistantSources(true);
+
         // Set active server and toggle visibility
         const activeServer = settings.active_media_server || 'plex';
         // Remember the persisted music server so a save from the VIDEO side keeps
@@ -3316,6 +3433,9 @@ async function loadSettingsData() {
         document.getElementById('genius-access-token').value = settings.genius?.access_token || '';
         const _pollinationsKey = document.getElementById('pollinations-api-key');
         if (_pollinationsKey) _pollinationsKey.value = settings.pollinations?.api_key || '';
+        // the music card's own id: the video side's fanart.tv card owns 'fanart-api-key'
+        const _fanartKey = document.getElementById('artist-fanart-api-key');
+        if (_fanartKey) _fanartKey.value = settings.fanart?.api_key || '';
 
         // Populate iTunes settings
         document.getElementById('itunes-country').value = settings.itunes?.country || 'US';
@@ -3429,6 +3549,11 @@ async function loadSettingsData() {
         if (_prowUrl) _prowUrl.value = settings.prowlarr?.url || '';
         if (_prowKey) _prowKey.value = settings.prowlarr?.api_key || '';
         if (_prowIds) _prowIds.value = settings.prowlarr?.indexer_ids || '';
+        // #2061: the pacing knobs. ?? not ||: 0 is a real choice (off)
+        const _prowGap = document.getElementById('prowlarr-search-min-gap');
+        const _prowCap = document.getElementById('prowlarr-max-searches-per-minute');
+        if (_prowGap) _prowGap.value = settings.prowlarr?.search_min_gap_seconds ?? 2;
+        if (_prowCap) _prowCap.value = settings.prowlarr?.max_searches_per_minute ?? 20;
         const _tcType = document.getElementById('torrent-client-type');
         const _tcUrl = document.getElementById('torrent-client-url');
         const _tcUser = document.getElementById('torrent-client-username');
@@ -3441,6 +3566,9 @@ async function loadSettingsData() {
         if (_tcPass) _tcPass.value = settings.torrent_client?.password || '';
         if (_tcCat) _tcCat.value = settings.torrent_client?.category || 'soulsync';
         if (_tcPath) _tcPath.value = settings.torrent_client?.save_path || '';
+        // #2087: start what SoulSync adds even when qBittorrent adds torrents stopped
+        const _tcStart = document.getElementById('torrent-client-start-torrents');
+        if (_tcStart) _tcStart.checked = settings.torrent_client?.start_torrents === true;
         // Seeding goals (torrent grabs) — off (0) by default, mirrors the video side.
         const _tcRatio = document.getElementById('music-seed-ratio');
         const _tcHours = document.getElementById('music-seed-hours');
@@ -3478,6 +3606,8 @@ async function loadSettingsData() {
         if (_ucUser) _ucUser.value = settings.usenet_client?.username || '';
         if (_ucPass) _ucPass.value = settings.usenet_client?.password || '';
         if (_ucCat) _ucCat.value = settings.usenet_client?.category || 'soulsync';
+        const _ucRemove = document.getElementById('music-usenet-remove-completed');
+        if (_ucRemove) _ucRemove.value = settings.usenet_client?.remove_completed || 'off';
         const _ucDlPath = document.getElementById('usenet-download-path');
         if (_ucDlPath) _ucDlPath.value = settings.download_source?.usenet_download_path || '';
         if (typeof updateUsenetClientUI === 'function') updateUsenetClientUI();
@@ -3763,9 +3893,14 @@ async function loadSettingsData() {
         const _nfoEl = document.getElementById('write-artist-nfo');
         if (_nfoEl) _nfoEl.checked = settings.library?.write_artist_nfo === true;
 
+        // Library v2: re-download files deleted outside SoulSync (default on)
+        const _redlEl = document.getElementById('redownload-externally-deleted');
+        if (_redlEl) _redlEl.checked = settings.library?.redownload_externally_deleted !== false;
+
         // Populate Content Filter settings
         document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
         document.getElementById('prefer-explicit').checked = settings.content_filter?.prefer_explicit === true;
+        document.getElementById('exclude-clean').checked = settings.content_filter?.exclude_clean === true;
         syncPreferExplicitState();
 
         // Prefer a version (off = ''), lives under soulseek with the other match settings
@@ -3872,6 +4007,16 @@ async function loadSettingsData() {
         const maxPerfCheckbox = document.getElementById('max-performance-enabled');
         if (maxPerfCheckbox) maxPerfCheckbox.checked = maxPerf;
         applyMaxPerformance(maxPerf);
+
+        // autosave switch, on unless switched off. the form was just reloaded,
+        // so an unsaved mark left over from a manual-save visit is stale
+        const autosaveOn = settings.ui_appearance?.settings_autosave !== false;
+        const autosaveCheckbox = document.getElementById('settings-autosave-enabled');
+        if (autosaveCheckbox) autosaveCheckbox.checked = autosaveOn;
+        window._settingsAutosaveOff = !autosaveOn;
+        if (document.getElementById('save-settings')?.dataset.state === 'pending' && !settingsAutoSaveTimer) {
+            setSettingsSaveState('idle');
+        }
 
         // Populate Logging information
         const logLevelSelect = document.getElementById('log-level-select');
@@ -4380,7 +4525,7 @@ async function clearPlexConfiguration() {
 // The media server names, in UI order. Refreshed from GET /api/media-servers
 // (the per-server descriptor) when the settings page loads; this list is
 // what the page knew before the endpoint existed and stays the fallback.
-let _mediaServerNames = ['plex', 'jellyfin', 'navidrome', 'soulsync'];
+let _mediaServerNames = ['plex', 'jellyfin', 'navidrome', 'music_assistant', 'soulsync'];
 
 async function loadMediaServerNames() {
     try {
@@ -4536,6 +4681,12 @@ function debouncedSaveQualityProfile() {
     if (window._suppressSettingsAutoSave) return;
     if (window._settingsLoadFailed) return;
     if (qualityProfileAutoSaveTimer) clearTimeout(qualityProfileAutoSaveTimer);
+    // autosave off: the save button writes the profile on screen with the rest
+    if (window._settingsAutosaveOff === true) {
+        qualityProfileAutoSaveTimer = null;
+        setSettingsSaveState('pending');
+        return;
+    }
     // Capture both target and values now. If the user switches profiles before
     // the debounce expires, the pending write still belongs to the profile
     // that was on screen when the edit happened instead of overwriting the
@@ -4607,7 +4758,7 @@ function populateQualityProfileUI(profile) {
     if (upgradePolicySelect) {
         upgradePolicySelect.value = ['until_cutoff', 'until_top'].includes(profile.upgrade_policy)
             ? 'until_cutoff'
-            : 'acceptable';
+            : profile.upgrade_policy === 'acceptable' ? 'acceptable' : 'none';
     }
     renderUpgradeCutoffOptions(profile.upgrade_cutoff_index);
 
@@ -4641,7 +4792,7 @@ function renderUpgradeCutoffOptions(selectedIndex = null) {
 }
 
 function onUpgradePolicyChange() {
-    const policy = document.getElementById('quality-upgrade-policy')?.value || 'acceptable';
+    const policy = document.getElementById('quality-upgrade-policy')?.value || 'none';
     const cutoffGroup = document.getElementById('quality-upgrade-cutoff-group');
     if (cutoffGroup) cutoffGroup.style.display = policy === 'until_cutoff' ? '' : 'none';
     renderUpgradeCutoffOptions();
@@ -4847,6 +4998,8 @@ async function applyQualityPreset(presetName) {
                 ...preset,
                 search_mode: uiState.search_mode,
                 rank_candidates_by_quality: uiState.rank_candidates_by_quality,
+                upgrade_policy: uiState.upgrade_policy,
+                upgrade_cutoff_index: uiState.upgrade_cutoff_index,
                 release_import_mode: uiState.release_import_mode,
             };
             currentQualityProfile = merged;
@@ -4951,7 +5104,9 @@ function collectQualityProfileFromUI() {
         search_mode: document.getElementById('quality-search-mode')?.value === 'best_quality' ? 'best_quality' : 'priority',
         rank_candidates_by_quality: document.getElementById('quality-rank-candidates')?.checked ?? false,
         release_import_mode: document.getElementById('quality-release-import-mode')?.value === 'album_tracks' ? 'album_tracks' : 'requested_tracks',
-        upgrade_policy: document.getElementById('quality-upgrade-policy')?.value === 'until_cutoff' ? 'until_cutoff' : 'acceptable',
+        upgrade_policy: ['none', 'acceptable', 'until_cutoff'].includes(
+            document.getElementById('quality-upgrade-policy')?.value)
+            ? document.getElementById('quality-upgrade-policy').value : 'none',
         upgrade_cutoff_index: parseInt(document.getElementById('quality-upgrade-cutoff')?.value || '0', 10) || 0,
         ranked_targets,
     };
@@ -5081,10 +5236,14 @@ function qpProfileSummary(profile) {
             ? `retain ${codec} only (acquisition remembered)`
             : `lossless + ${codec} companion`);
     }
-    if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
+    if (profile.upgrade_policy === 'acceptable') {
+        parts.push('upgrade until any accepted target');
+    } else if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
         const cutoffIndex = Math.min(Math.max(parseInt(profile.upgrade_cutoff_index || '0', 10) || 0, 0), Math.max(targets.length - 1, 0));
         const cutoff = targets[cutoffIndex]?.label || 'top target';
         parts.push(`upgrade until ${cutoff}`);
+    } else {
+        parts.push('upgrades off');
     }
     return parts.join(' · ');
 }
@@ -6786,6 +6945,12 @@ async function saveSettings(quiet = false) {
             api_key: document.getElementById('jellyfin-api-key').value,
             api_timeout: parseInt(document.getElementById('jellyfin-timeout').value) || 30
         },
+        music_assistant: {
+            base_url: _cfgStr('music_assistant-url', { trim: true }),
+            token: _cfgStr('music_assistant-token', { trim: true }),
+            source_instance: _cfgStr('music_assistant-source'),
+            source_folder: _cfgStr('music_assistant-source-folder', { trim: true })
+        },
         navidrome: {
             base_url: document.getElementById('navidrome-url').value,
             username: document.getElementById('navidrome-username').value,
@@ -6836,6 +7001,11 @@ async function saveSettings(quiet = false) {
             scrobble_enabled: document.getElementById('lastfm-scrobble-enabled').checked,
             embed_tags: document.getElementById('embed-lastfm').checked,
             tags: _collectServiceTags('lastfm')
+        },
+        fanart: {
+            // _cfgStr: undefined when the field is absent, so a save there
+            // doesn't wipe the stored key
+            api_key: _cfgStr('artist-fanart-api-key', { trim: true }),
         },
         pollinations: {
             // _cfgStr: undefined when the field is absent (video side), so a
@@ -6942,6 +7112,8 @@ async function saveSettings(quiet = false) {
             url: _cfgStr('prowlarr-url'),
             api_key: _cfgStr('prowlarr-api-key'),
             indexer_ids: _cfgStr('prowlarr-indexer-ids'),
+            search_min_gap_seconds: _cfgFloat('prowlarr-search-min-gap', 2),
+            max_searches_per_minute: _cfgInt('prowlarr-max-searches-per-minute', 20),
         },
         torrent_client: {
             type: _cfgStr('torrent-client-type', { fallback: 'qbittorrent' }),
@@ -6950,6 +7122,7 @@ async function saveSettings(quiet = false) {
             password: _cfgStr('torrent-client-password'),
             category: _cfgStr('torrent-client-category', { fallback: 'soulsync' }),
             save_path: _cfgStr('torrent-client-save-path'),
+            start_torrents: !!(document.getElementById('torrent-client-start-torrents') || {}).checked,
             seed_ratio_goal: _cfgFloat('music-seed-ratio', 0),
             seed_time_goal_hours: _cfgInt('music-seed-hours', 0),
             seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
@@ -6962,6 +7135,7 @@ async function saveSettings(quiet = false) {
             username: _cfgStr('usenet-client-username'),
             password: _cfgStr('usenet-client-password'),
             category: _cfgStr('usenet-client-category', { fallback: 'soulsync' }),
+            remove_completed: _cfgStr('music-usenet-remove-completed', { fallback: 'off' }),
         },
         soundcloud_download: {
             // No knobs yet — anonymous-only. Keeping the key present so
@@ -7048,7 +7222,8 @@ async function saveSettings(quiet = false) {
         },
         content_filter: {
             allow_explicit: document.getElementById('allow-explicit').checked,
-            prefer_explicit: document.getElementById('prefer-explicit').checked
+            prefer_explicit: document.getElementById('prefer-explicit').checked,
+            exclude_clean: document.getElementById('exclude-clean').checked
         },
         genre_whitelist: {
             enabled: document.getElementById('genre-whitelist-enabled').checked,
@@ -7073,7 +7248,8 @@ async function saveSettings(quiet = false) {
             audiobooks_path: _cfgStr('audiobooks-path', { fallback: './audiobooks' }),
             audiobooks_additional_paths: collectAudiobookExtraPaths(),
             reorganize_preserve_casing: _cfgBool('reorganize-preserve-casing'),
-            write_artist_nfo: _cfgBool('write-artist-nfo')
+            write_artist_nfo: _cfgBool('write-artist-nfo'),
+            redownload_externally_deleted: _cfgBool('redownload-externally-deleted')
         },
         podcasts: {
             download_path: _cfgStr('podcasts-path', { fallback: './podcasts' }),
@@ -7199,7 +7375,8 @@ async function saveSettings(quiet = false) {
             particles_enabled: window._particlesEnabled !== false,
             worker_orbs_enabled: window._workerOrbsEnabled !== false,
             reduce_effects: window._reduceEffectsActive === true,
-            max_performance: window._maxPerfActive === true
+            max_performance: window._maxPerfActive === true,
+            settings_autosave: _cfgBool('settings-autosave-enabled') !== false
         },
         youtube: {
             cookies_browser: document.getElementById('youtube-cookies-browser').value,
@@ -7287,6 +7464,7 @@ async function saveSettings(quiet = false) {
 
     try {
         if (!quiet) showLoadingOverlay('Saving settings...');
+        setSettingsSaveState('saving');
 
         // Save main settings
         const response = await fetch(API.settings, {
@@ -7329,22 +7507,27 @@ async function saveSettings(quiet = false) {
         }
 
         if (result.success && qualityProfileSaved && lookbackSaved) {
-            showToast(quiet ? 'Settings auto-saved' : 'Settings saved successfully', 'success');
+            // the button says Saved, a toast on every keystroke was noise
+            setSettingsSaveState('saved');
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else if (result.success && qualityProfileSaved && !lookbackSaved) {
+            setSettingsSaveState('saved');
             showToast('Settings saved, but discovery lookback period failed to save', 'warning');
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else if (result.success && !qualityProfileSaved) {
+            setSettingsSaveState('saved');
             showToast('Settings saved, but quality profile failed to save', 'warning');
             _forceServiceStatusRefresh();
             _stgRefreshAfterSave();
         } else {
+            setSettingsSaveState('error');
             showToast(`Failed to save settings: ${result.error}`, 'error', 'set-services');
         }
     } catch (error) {
         console.error('Error saving settings:', error);
+        setSettingsSaveState('error');
         showToast('Failed to save settings', 'error', 'set-services');
     } finally {
         if (!quiet) hideLoadingOverlay();
@@ -7699,6 +7882,69 @@ async function autoDetectJellyfin() {
         showToast('Failed to auto-detect Jellyfin server', 'error');
     } finally {
         hideLoadingOverlay();
+    }
+}
+
+async function autoDetectMusicAssistant() {
+    try {
+        const response = await fetch('/api/detect-media-server', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_type: 'music_assistant' })
+        });
+        const result = await response.json();
+        if (result.success && result.found_url) {
+            document.getElementById('music_assistant-url').value = result.found_url;
+            showToast(`Music Assistant found at ${result.found_url}`, 'success');
+        } else {
+            showToast(result.error || 'No Music Assistant server found', 'error');
+        }
+    } catch (e) {
+        showToast('Auto-detect failed: ' + e.message, 'error');
+    }
+}
+
+async function loadMusicAssistantSources(quiet = false) {
+    const container = document.getElementById('music_assistant-source-selector-container');
+    const selector = document.getElementById('music_assistant-source');
+    if (!container || !selector) return;
+    try {
+        const response = await fetch('/api/music-assistant/sources');
+        const result = await response.json();
+        if (!result.success) {
+            container.style.display = 'none';
+            if (!quiet) showToast(result.error || 'Could not load Music Assistant sources', 'error');
+            return;
+        }
+        selector.innerHTML = '';
+        for (const s of result.sources || []) {
+            const opt = document.createElement('option');
+            opt.value = s.key;
+            opt.textContent = `${s.title} (${s.domain})`;
+            if (s.key === result.selected) opt.selected = true;
+            selector.appendChild(opt);
+        }
+        container.style.display = (result.sources || []).length ? '' : 'none';
+        if (!quiet && !(result.sources || []).length) showToast('Music Assistant has no Local files or SMB source', 'warning');
+    } catch (e) {
+        container.style.display = 'none';
+        if (!quiet) showToast('Could not load Music Assistant sources: ' + e.message, 'error');
+    }
+}
+
+async function selectMusicAssistantSource() {
+    const selector = document.getElementById('music_assistant-source');
+    if (!selector || !selector.value) return;
+    try {
+        const response = await fetch('/api/music-assistant/select-source', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ instance_id: selector.value })
+        });
+        const result = await response.json();
+        showToast(result.success ? `Music source set to ${selector.selectedOptions[0]?.textContent || selector.value}` : (result.error || 'Could not set the source'), result.success ? 'success' : 'error');
+    } catch (e) {
+        showToast('Could not set the source: ' + e.message, 'error');
     }
 }
 
@@ -8189,7 +8435,7 @@ async function loadProwlarrIndexers() {
         const resp = await fetch('/api/prowlarr/indexers');
         const data = await resp.json();
         if (!data.success) {
-            listEl.innerHTML = `<em style="color:#f44336;">${data.error || 'Prowlarr not configured.'}</em>`;
+            listEl.innerHTML = `<em style="color:#f44336;">${escapeHtml(data.error || 'Prowlarr not configured.')}</em>`;
             return;
         }
         if (!data.indexers || data.indexers.length === 0) {
@@ -8211,7 +8457,7 @@ async function loadProwlarrIndexers() {
         }).join('');
         listEl.innerHTML = rows;
     } catch (e) {
-        listEl.innerHTML = `<em style="color:#f44336;">Failed to load indexers: ${e.message}</em>`;
+        listEl.innerHTML = `<em style="color:#f44336;">Failed to load indexers: ${escapeHtml(e.message)}</em>`;
     }
 }
 
@@ -9383,7 +9629,16 @@ async function loadImageCacheStatus() {
         if (!data.success) return;
         const entries = document.getElementById('imgcache-entries');
         const size = document.getElementById('imgcache-size');
-        if (entries) entries.textContent = (data.entries || 0).toLocaleString();
+        if (entries) {
+            // A "pending" row is a registered URL nothing ever loaded. When it
+            // dominates the count, the URLs being handed out are changing
+            // between renders (a media-server auth salt used to rotate on every
+            // call), and the entry count alone hides that completely.
+            const pending = data.pending || 0;
+            entries.textContent = pending
+                ? `${(data.entries || 0).toLocaleString()} (${pending.toLocaleString()} pending)`
+                : (data.entries || 0).toLocaleString();
+        }
         if (size) {
             size.textContent = data.max_bytes
                 ? `${_imgCacheBytes(data.bytes)} of ${_imgCacheBytes(data.max_bytes)}`
@@ -9827,6 +10082,31 @@ async function refreshMetaSyncStatus() {
             if (p.last_exchange_error) line += ' — last error: ' + _msEscape(p.last_exchange_error);
             lines.push(line);
         });
+        // Step 3: is this install actually counted? A node starts in dry
+        // run and sends nothing; an older node doesn't report dry_run at all
+        const nodeUrl = document.getElementById('metasync-node-url')?.value.trim() || '';
+        const openNode = /^https?:\/\//i.test(nodeUrl)
+            ? ' <a href="' + _msEscape(nodeUrl) + '" target="_blank" rel="noopener noreferrer">Open MetaSync</a>'
+            : '';
+        if (s.dry_run === true && pools.length) {
+            const u = s.unsent_report;
+            lines.push(u && u.week
+                ? 'Step 3: dry run is on. Your report for ' + _msEscape(u.week) + ' is ready (' +
+                  _msEscape(u.signal_count) + ' anonymous album signals) and nothing was sent, so this install ' +
+                  'isn\'t counted yet. Check it and press Start sending in MetaSync.' + openNode
+                : 'Step 3: dry run is on, so MetaSync builds your weekly report but sends nothing yet.' + openNode);
+        } else if (s.dry_run === false && pools.length) {
+            lines.push('Step 3: sending. One anonymous report a week, nothing else.');
+        }
+        const net = s.network;
+        if (net && Number.isInteger(net.installs) && Number.isInteger(net.publish_threshold)) {
+            lines.push('The network: ' + net.installs + ' install' + (net.installs === 1 ? '' : 's') +
+                ' reported ' + _msEscape(net.week || 'last week') + '. ' +
+                (net.installs < net.publish_threshold
+                    ? 'Charts from the network start at ' + net.publish_threshold +
+                      ' installs per album; until then they fill from ListenBrainz.'
+                    : 'An album charts once ' + net.publish_threshold + ' installs report it in a week.'));
+        }
         if (s.pairing_status === 'pending') lines.push('A pairing request is waiting for approval in the MetaSync dashboard.');
         _msDetail(lines.join('<br>'));
     } catch (e) {

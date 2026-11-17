@@ -1,13 +1,15 @@
-**SoulSync 3.6.1 is out** :musical_note:
+**SoulSync 3.6.6 is out** :musical_note:
 
-The video side moves onto the new React pages. The video dashboard now matches the music one, the calendar says where every episode stands, video tools shares the Tools page, and movie and show pages read like a streaming app with a new Your library tab for every copy you own. Fix match sticks, and you can mark one episode or season watched.
+The video library is now a full library manager. The Library page shows your movies and shows as posters, as a sortable table of titles, or as a table of the files themselves, with filters for what needs a look and for what the files are. You can act on a selection or on everything a filter matches: rename with a preview, move to another drive or library, set a quality profile, look for upgrades, fetch subtitles and more. Every rename, move and delete is recorded and can be undone, and a padlock keeps automation away from a title you have finished curating.
 
-Optional 4K libraries: a separate Movies 4K and TV 4K folder, off until you turn one on, filled by quality profiles set to save to 4K. And every folder in Settings now checks itself as you type: free space, write access, nested folders and unmapped Docker volumes. Audiobooks can read extra folders on other drives too.
+Movie and show pages now manage their own seasons, episodes and files: rename, renumber and delete with a preview, stop hunting single episodes, and undo any change from the page. Pages also keep themselves current, checking your media server, the metadata provider and ratings in the background when they have gone stale.
 
-Playlists: every source tab imports into SoulSync and lands you on the playlist, you can keep your own editable copy instead of a mirror (#1913), and Download missing can retry unidentified tracks first (#1912).
+It is fast. On a large library the Files view went from several seconds a page to instant.
 
-The Library page gets a Songs tab with filters, sorts, copies side by side and bulk actions (#1906), and match search takes a pasted link or ID (#1901). Daily mixes are rebuilt on what you actually play together, and interactive search lets you listen before you pick (#1911).
+Server Activity now shows album and book covers for music and audiobooks (thanks SeadogsBooty, #2089), and its drawer no longer sits under the floating buttons (#2090).
 
-Sign in with OIDC only, plus OIDC fixes and video naming fixes (thanks @PapaBearDoes). Navidrome scans finish on time and the hourly update stops missing albums (#1899), idle CPU is down (#1905), the lyrics filler stops repeating LRCLib lookups (#1902), and staged downloads no longer look missing to the watchlist (thanks @SimpleSimonLA). Plus a lot of fixes.
+Thanks to onnwee for two contributions: cam releases are caught however they are spelled (#2088), and a new setting starts SoulSync's torrents on a qBittorrent that adds them stopped (#2087).
+
+Also: live albums and live tracks are separate rules (#2082), original release and clean version filters (#2080, #2081), Albums You're Missing no longer lists albums you own (#2083), dead file rows can be removed (thanks wolf39us, #2086), Discogs artist images download again (thanks Ktzenjammer, #2079), anime numbered as one long season is handled (thanks Thibs), one shared page frame across the app, a security pass, MetaSync pairing now gives the node a read-only key (#2099), and a lighter sidebar and player on phones.
 
 Full notes on GitHub.

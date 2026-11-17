@@ -157,12 +157,32 @@ def apply_art_to_album_files(
     """
     result = {"embedded": 0, "failed": 0, "skipped": 0, "cover_written": False,
               "read_only_fs": False}
+    from core.metadata.common import get_config_manager
+    config = get_config_manager()
     symbols = get_mutagen_symbols()
     paths = [p for p in (file_paths or []) if p]
     if not symbols:
         return result
+    # #2046: a reviewed album with its artwork locked takes no cover from a
+    # job, in the files or beside them
+    try:
+        from core.library2 import locks
+        open_paths = [p for p in paths if not locks.blocks_file(p, "artwork", "Cover art")]
+    except Exception as exc:  # noqa: BLE001 - a lock check never fails an apply
+        logger.debug("lock check skipped: %s", exc)
+        open_paths = paths
+    if len(open_paths) != len(paths):
+        result["skipped"] += len(paths) - len(open_paths)
+        result["locked"] = len(paths) - len(open_paths)
+        paths = open_paths
+        if not paths:
+            return result
 
     for fp in paths:
+        if not config.get('metadata_enhancement.embed_album_art', True):
+            result['skipped'] += 1
+            result['embedding_off'] = True
+            continue
         if not os.path.isfile(fp):
             result["skipped"] += 1
             continue
@@ -206,7 +226,7 @@ def apply_art_to_album_files(
     if not target_dir and paths:
         cand = os.path.dirname(paths[0])
         target_dir = cand if os.path.isdir(cand) else None
-    if target_dir and not folder_has_cover_sidecar(target_dir):
+    if target_dir and config.get('metadata_enhancement.cover_art_download', True) and not folder_has_cover_sidecar(target_dir):
         # Prefer the album's OWN embedded art for the cover.jpg sidecar: it's
         # always present once the files are arted (we may have just embedded it),
         # needs no API call, and the sidecar matches the files exactly

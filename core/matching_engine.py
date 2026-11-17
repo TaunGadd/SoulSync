@@ -386,9 +386,9 @@ class MusicMatchingEngine:
 
         return standard_ratio
     
-    def duration_similarity(self, duration1: int, duration2: int) -> float:
+    def duration_similarity(self, duration1: Optional[int], duration2: Optional[int]) -> float:
         """Calculates similarity score based on track duration (in ms)."""
-        if duration1 == 0 or duration2 == 0:
+        if not duration1 or not duration2:
             return 0.5 # Neutral score if a duration is missing
         
         # Allow a 5-second tolerance (5000 ms)
@@ -399,8 +399,8 @@ class MusicMatchingEngine:
         return max(0, 1.0 - diff_ratio * 5)
 
     def score_track_match(self, source_title: str, source_artists: List[str],
-                          source_duration_ms: int, candidate_title: str,
-                          candidate_artists: List[str], candidate_duration_ms: int) -> Tuple[float, str]:
+                          source_duration_ms: Optional[int], candidate_title: str,
+                          candidate_artists: List[str], candidate_duration_ms: Optional[int]) -> Tuple[float, str]:
         """Generic track matching — same logic as calculate_match_confidence but type-agnostic.
 
         Works for any two tracks regardless of source (Spotify, iTunes, YouTube, Tidal, etc.).
@@ -409,6 +409,11 @@ class MusicMatchingEngine:
 
         Returns (confidence, match_type) tuple.
         """
+        # Catalogue rows and provider responses may omit the runtime. Use the
+        # existing unknown-duration sentinel before comparisons or arithmetic.
+        source_duration_ms = source_duration_ms or 0
+        candidate_duration_ms = candidate_duration_ms or 0
+
         # --- Artist Scoring ---
         source_artists_cleaned = [self.clean_artist(a) for a in source_artists if a]
 
@@ -1451,6 +1456,14 @@ class MusicMatchingEngine:
                 # Reject: Soulseek has instrumental but Spotify wants original
                 return 0.0, 'rejected_version_mismatch'
 
+        elif version_type in ('clean', 'radio') and not _wanted_on_purpose:
+            # #2081 "Never download clean versions": prefer-explicit only
+            # ranks, so a clean or radio edit still won when it was the best
+            # file on offer. with this on it is not a match at all, unless the
+            # wanted track is that cut itself ("Song (Radio Edit)").
+            if self._exclude_clean_enabled() and _wanted_version != version_type:
+                return 0.0, 'rejected_version_mismatch'
+
         # Apply version penalty (for matching versions, slight penalty for quality differences)
         if version_type != 'original':
             effective_penalty = penalty * 0.5  # Reduced penalty since it's a match
@@ -1589,6 +1602,18 @@ class MusicMatchingEngine:
             except Exception:
                 continue
         return matches
+
+    @staticmethod
+    def _exclude_clean_enabled() -> bool:
+        """The 'Never download clean versions' sub-setting (#2081). Like its
+        sibling it only means something while explicit content is allowed:
+        with explicit blocked, the clean cut is the one that is wanted.
+        Never raises (config trouble = feature off)."""
+        try:
+            return bool(config_manager.get('content_filter.exclude_clean', False)) and \
+                bool(config_manager.get('content_filter.allow_explicit', True))
+        except Exception:
+            return False
 
     @staticmethod
     def _prefer_explicit_enabled() -> bool:

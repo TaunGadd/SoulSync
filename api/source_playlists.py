@@ -2609,6 +2609,29 @@ def get_deezer_editorial_playlists():
         return jsonify({"success": True, "playlists": [], "count": 0, "error": str(e)})
 
 
+@bp.route('/api/search/browse/deezer', methods=['GET'])
+def get_search_browse_deezer():
+    """What's charting on Deezer for one search-page browse tile (#1984).
+
+    core/search/deezer_browse.py shipped with its tests and the page's fetch,
+    but no route, so every tile 404'd and quietly read the cache (review 5
+    R5-X1-3). ?tile= is the page's tile id. answers {available: false} when
+    the tile has no Deezer genre, the client is off, or Deezer is down: the
+    page then keeps its cache. public endpoints, never a token.
+    """
+    tile = (request.args.get('tile') or '').strip()
+    try:
+        from core.search.deezer_browse import browse_tile
+        client = _get_deezer_client()
+        result = browse_tile(client, tile) if client is not None and tile else None
+    except Exception as e:
+        logger.warning(f"Deezer browse tile {tile!r} unavailable: {e}")
+        result = None
+    if result is None:
+        return jsonify({"available": False, "tile": tile})
+    return jsonify({**result, "available": True, "tile": tile})
+
+
 @bp.route('/api/discover/deezer/genres', methods=['GET'])
 def get_deezer_editorial_genres():
     """The genre chips the editorial shelf offers."""
@@ -4149,6 +4172,7 @@ def cancel_itunes_link_sync(url_hash):
 @bp.route('/api/beatport/discovery/unmatch', methods=['POST'])
 @bp.route('/api/listenbrainz/discovery/unmatch', methods=['POST'])
 @bp.route('/api/qobuz/discovery/unmatch', methods=['POST'])
+@bp.route('/api/ytmusic/discovery/unmatch', methods=['POST'])
 def unmatch_discovery_track():
     """Remove a discovery match — sets track back to Not Found"""
     try:
@@ -4178,6 +4202,10 @@ def unmatch_discovery_track():
             state = listenbrainz_playlist_states.get(identifier)
         elif '/qobuz/' in path:
             state = qobuz_discovery_states.get(identifier)
+        elif '/ytmusic/' in path:
+            # YT Music keeps its own states; posted to the YouTube route it
+            # looked in youtube_playlist_states and always answered 404
+            state = ytmusic_discovery_states.get(identifier)
 
         if not state:
             return jsonify({'success': False, 'error': 'Discovery state not found'}), 404
@@ -5429,7 +5457,7 @@ def _run_sync_task(
     sync_mode=None,
     skip_wishlist_add=False,
     organize_by_playlist=False,
-    user_initiated=False,
+    user_initiated=None,
     is_request_list=False,
     auto_remove_fulfilled=False,
     **kwargs,

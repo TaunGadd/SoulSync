@@ -331,6 +331,7 @@ export function SearchResults({
         onOpen={() => onTrackClick(track)}
         onPlay={() => onTrackPlay(track, libraryRow)}
         playlistTrack={playlistTrackOf(track)}
+        sources={track.sources}
       />
     );
   };
@@ -348,6 +349,7 @@ export function SearchResults({
         onOpen={() => onAlbumClick(album)}
         actionLabel={`${acquireVerb()} ${album.name ?? 'album'}`}
         onAction={() => onAlbumClick(album)}
+        sources={album.sources}
       />
     );
   };
@@ -396,7 +398,11 @@ export function SearchResults({
               image={artistImages[String(artist.id ?? '')] || artistImage(artist)}
               href={onArtistHref(artist, inLibrary)}
               inLibrary={inLibrary}
-              artistId={artist.id}
+              // iss29-B04c: a lib2-native row's id is not resolvable by the
+              // provider image endpoint — withholding it keeps the
+              // placeholder instead of another artist's face.
+              artistId={artist.image_is_native ? undefined : artist.id}
+              sources={inLibrary ? undefined : artist.sources}
             />
           )}
         />

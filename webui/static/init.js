@@ -137,6 +137,8 @@ function applyWorkerOrbsSetting(enabled) {
             window.workerOrbs.setPage('_disabled');
         }
     }
+    // the video orbs read the same flag and decide for themselves
+    if (window.videoWorkerOrbs) window.videoWorkerOrbs.refresh();
 }
 
 function initAccentColorListeners() {
@@ -287,6 +289,7 @@ function applyMaxPerformance(enabled) {
             window.workerOrbs.setPage(activeId);
         }
     }
+    if (window.videoWorkerOrbs) window.videoWorkerOrbs.refresh();
     _syncMaxPerfDependentToggles(enabled);
 }
 
@@ -571,6 +574,9 @@ const PF_BOOT_PATH = (window.SoulSyncURL?.strip(window.location.pathname) ?? win
 const LEGACY_PROFILE_PAGE_ALIASES = {
     downloads: 'search',
     artists: 'search',
+    // Library v2 became the Library; anything still naming the old route id
+    // resolves to the same permission rather than to an unknown page.
+    'library-v2': 'library',
 };
 
 function normalizeProfilePageId(pageId) {
@@ -2119,6 +2125,13 @@ function updateProfileIndicator() {
     });
     document.body.classList.toggle('video-admin', !!currentProfile.is_admin);
 
+    // what this profile chose to see (#1909). goes on top of the permission
+    // filter above: the cached answer right away, the server's when it lands
+    if (window.SoulSyncFeatures) {
+        window.SoulSyncFeatures.apply();
+        window.SoulSyncFeatures.load();
+    }
+
     // Toggle download capability
     if (canDownload()) {
         document.body.classList.remove('downloads-disabled');
@@ -2166,6 +2179,9 @@ const SHARED_VIDEO_VIEWS = {
     calendar: { media: ['video'], videoPage: 'video-calendar' },
     // /dashboard?media=video is the video dashboard
     dashboard: { media: ['video'], videoPage: 'video-dashboard' },
+    // /automations?media=video is the video side's automations. admins only,
+    // like the sidebar entry: it runs and switches off jobs for everyone
+    automations: { media: ['video'], videoPage: 'video-automations', adminOnly: true },
 };
 
 function isPageAccessAllowed(pageId, search) {
@@ -2176,6 +2192,7 @@ function isPageAccessAllowed(pageId, search) {
     }
     if (!view || view.media.indexOf(media) === -1) return isPageAllowed(pageId);
     if (profileAllowedSides() === 'music') return false;
+    if (view.adminOnly) return !currentProfile || !!currentProfile.is_admin || currentProfile.id === 1;
     return isPageAllowed(view.videoPage);
 }
 
@@ -2404,7 +2421,10 @@ async function loadProfileManageList() {
     _pfManageState = {
         profiles, loginMode,
         librarySupported: data.own_library_supported !== false,
+        libraryAvailable: data.own_library_available !== false,
         libraryHint: data.own_library_root_hint || '',
+        // why it is off on this server (#2031: navidrome before 0.58)
+        libraryReason: data.own_library_unsupported_reason || '',
     };
 
     list.innerHTML = '';
@@ -3214,6 +3234,8 @@ async function openProfileEditor({ mode = 'create', profile = null } = {}) {
     const p = profile || {};
     const loginMode = _pfManageState ? _pfManageState.loginMode : profileLoginMode;
     const librarySupported = _pfManageState ? _pfManageState.librarySupported : true;
+    const libraryAvailable = _pfManageState ? _pfManageState.libraryAvailable !== false : true;
+    const libraryReason = _pfManageState ? _pfManageState.libraryReason || '' : '';
     const libraryHint = _pfManageState
         ? _pfManageState.libraryHint.replace('<name>', (p.name || 'profile').toLowerCase().replace(/[^a-z0-9]+/g, '-'))
         : '';
@@ -3554,15 +3576,20 @@ async function openProfileEditor({ mode = 'create', profile = null } = {}) {
             folderInput.addEventListener('input', () => { st.library_root = folderInput.value; });
             const folderBox = pfEl('div', { class: 'pf-group-extra' }, [
                 folderInput,
-                pfEl('p', { class: 'pf-help', text: 'Docker: mount this folder in docker-compose.yml. Then add it as a second music library on Plex or Jellyfin and pick that library under their account.' }),
+                pfEl('p', { class: 'pf-help', text: 'Docker: mount this folder in docker-compose.yml. Then add it as a second music library on Plex, Jellyfin or Navidrome (0.58+, give their Navidrome user only that library) and pick that library under their account.' }),
             ]);
             const inactive = !librarySupported;
+            // parked beats unsupported in the message: the server can be the
+            // right one and the feature still be off, and a control that
+            // cannot succeed has to say so rather than fail on save
+            const parked = !libraryAvailable;
             const ownSwitch = pfSwitch({
                 title: 'Own library',
-                desc: inactive ? 'Needs Plex or Jellyfin. With Navidrome or standalone their downloads go to the shared folder.'
+                desc: parked ? 'Not available in this build yet.'
+                    : inactive ? `${libraryReason || 'Needs Plex, Jellyfin or Navidrome 0.58+.'} Until then their downloads go to the shared folder.`
                     : 'Their downloads go to their own folder and their own server library.',
                 checked: st.library_mode === 'own',
-                disabled: inactive && st.library_mode !== 'own',
+                disabled: parked || (inactive && st.library_mode !== 'own'),
                 onChange: (on) => { st.library_mode = on ? 'own' : 'shared'; folderBox.style.display = on ? '' : 'none'; },
             });
             folderBox.style.display = st.library_mode === 'own' ? '' : 'none';
@@ -4260,7 +4287,12 @@ function initializeNavigation() {
 
 const _DEEPLINK_VALID_PAGES = new Set([
     'dashboard', 'sync', 'search', 'discover', 'automations',
-    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    // iss29-B07: '/library-v2' is a live alias that redirects to '/library'
+    // (query string preserved). It was missing here, so this fallback resolved
+    // a bookmark to it as 'dashboard'. React usually wins the race and the
+    // right page appears anyway — which is exactly what makes the gap easy to
+    // miss and unreliable to depend on.
+    'library', 'library-v2', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
     'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
     'hydrabase', 'tools', 'chat', 'podcasts', 'audiobooks', 'requests',
     'sample-studio', 'calendar'
@@ -4278,6 +4310,9 @@ function _getPageFromPath() {
     if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
     // Context-dependent pages fall back to a sensible parent
     if (basePage === 'playlist-explorer') return 'library';
+    // The alias and its target are the same page as far as the shell chrome
+    // is concerned (iss29-B07).
+    if (basePage === 'library-v2') return 'library';
     return basePage;
 }
 

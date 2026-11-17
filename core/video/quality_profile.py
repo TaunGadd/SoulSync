@@ -19,7 +19,11 @@ The model (rich-curated — Radarr-competitive without a full custom-formats eng
       ``prefer_audio`` (any|surround|lossless|atmos), ``prefer_repack`` (bool).
   - ``audio_language_mode`` (off|prefer|require) + ``audio_languages`` : dubbed /
                         MULTI releases. require is a real filter, prefer ranks.
-  - ``min_size_gb`` / ``max_size_gb`` : size guard per item (0 = no limit).
+  - ``max_movie_gb`` / ``max_episode_gb`` : size guard per item (0 = no limit).
+  - ``preferred_movie_gb`` / ``preferred_episode_gb`` : a tie-break, closer to
+                        it ranks higher (0 = off).
+  - ranking order (core/video/release_rank): tier on this ladder + the soft
+                        preferences, then custom formats, then tie-breaks.
   - ``library``     : main|4k. 4k files new titles on this profile in the optional
                         4K library (Settings → Folders), when that one is switched on.
 
@@ -31,7 +35,7 @@ This module is isolated — it imports nothing from the music side.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 # The quality ladder, ordered best→worst. ``key`` = ``<source>-<resolution>`` (plus
 # the two resolution-less SD tiers). This is the default ranking the UI renders.
@@ -105,6 +109,10 @@ def default_profile() -> dict:
         "library": "main",
         "max_movie_gb": 0,      # per-item size guard, split by runtime (0 = no limit)
         "max_episode_gb": 0,
+        # preferred size (#2033): a tie-break only, closer ranks higher among
+        # releases that tie on quality and custom formats. 0 = off
+        "preferred_movie_gb": 0,
+        "preferred_episode_gb": 0,
         "format_scores": {},    # custom-format score overrides (P3): {format_id: score}
         "min_format_score": 0,  # hard floor on the summed format score (0 = off)
         # Torrent health floor, the *arr apps' "minimum seeders". A swarm with no
@@ -126,6 +134,19 @@ def _coerce_int(value: Any, default: int) -> int:
 
 def _clamp_size(value: Any) -> int:
     return min(MAX_SIZE_CAP_GB, max(0, _coerce_int(value, 0)))
+
+
+def _clamp_preferred(value: Any, cap: int) -> float:
+    try:
+        gb = round(float(value), 1)
+    except (TypeError, ValueError):
+        return 0
+    if gb != gb or gb <= 0:          # nan / off
+        return 0
+    gb = min(float(MAX_SIZE_CAP_GB), gb)
+    if cap:
+        gb = min(float(cap), gb)
+    return int(gb) if gb == int(gb) else gb
 
 
 def normalize_tiers(value: Any) -> list:
@@ -187,6 +208,11 @@ def normalize(raw: Any) -> dict:
 
     d["max_movie_gb"] = _clamp_size(raw.get("max_movie_gb"))
     d["max_episode_gb"] = _clamp_size(raw.get("max_episode_gb"))
+    # preferred size, in tenths of a GB (episodes live under 1 GB). never above
+    # the hard cap, a target past it could never be grabbed
+    for pref, cap in (("preferred_movie_gb", "max_movie_gb"),
+                      ("preferred_episode_gb", "max_episode_gb")):
+        d[pref] = _clamp_preferred(raw.get(pref), d[cap])
 
     # Custom formats (P3): per-profile score overrides {format_id: score} and
     # an optional hard floor on the summed format score (0 = off).
@@ -254,17 +280,80 @@ def _profile_from_row(row: Any) -> dict:
         return default_profile()
 
 
-def profile_by_id(db, profile_id: Any) -> dict:
+# The profile a title of each kind gets when nothing else assigns one (instead
+# of the classic Default): "Movie 720p/1080p" for movies, "TV 720p/1080p" for
+# shows. Unset (or a deleted profile) is the Default, exactly as before.
+_KIND_DEFAULT_SETTINGS = {"movie": "quality_default_profile_movie",
+                          "show": "quality_default_profile_show"}
+
+
+def title_kind(kind: Any) -> Optional[str]:
+    """'movie' or 'show' for anything naming one (episode/season/series/tv
+    are a show's), else None."""
+    k = str(kind or "").strip().lower()
+    if k == "movie":
+        return "movie"
+    if k in ("show", "tv", "episode", "season", "series"):
+        return "show"
+    return None
+
+
+def kind_default_id(db, kind: Any) -> Optional[int]:
+    """The named profile set as this kind's default, or None (the Default).
+    A setting naming a deleted profile reads as unset."""
+    k = title_kind(kind)
+    if not k:
+        return None
+    try:
+        pid = int(db.get_setting(_KIND_DEFAULT_SETTINGS[k]) or 0)
+    except Exception:  # noqa: BLE001 - an unreadable setting is no default, never a failed search
+        return None
+    if pid <= DEFAULT_PROFILE_ID:
+        return None
+    try:
+        return pid if db.get_named_quality_profile(pid) else None
+    except Exception:  # noqa: BLE001 - an unreadable default is the Default
+        return None
+
+
+def kind_defaults(db) -> dict:
+    """{'movie': id, 'show': id}; 0 means the Default."""
+    return {k: kind_default_id(db, k) or DEFAULT_PROFILE_ID for k in _KIND_DEFAULT_SETTINGS}
+
+
+def set_kind_default(db, kind: Any, profile_id: Any) -> dict:
+    """Set (or with 0/None clear) a kind's default profile. Returns kind_defaults."""
+    k = title_kind(kind)
+    if not k:
+        raise ValueError("kind must be movie or show")
+    try:
+        pid = int(profile_id or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("profile_id must be a number") from exc
+    if pid > DEFAULT_PROFILE_ID and not db.get_named_quality_profile(pid):
+        raise ValueError("no such quality profile")
+    db.set_setting(_KIND_DEFAULT_SETTINGS[k], str(max(pid, DEFAULT_PROFILE_ID)))
+    return kind_defaults(db)
+
+
+def profile_by_id(db, profile_id: Any, kind: Any = None) -> dict:
     """The profile a title resolved to — Default for None/0/unknown ids, so a
-    deleted profile degrades safely instead of wedging acquisition."""
+    deleted profile degrades safely instead of wedging acquisition. With
+    ``kind``, a title with no profile of its own gets that kind's default."""
     try:
         pid = int(profile_id)
     except (TypeError, ValueError):
-        return load(db)
-    if pid <= DEFAULT_PROFILE_ID:
-        return load(db)
-    row = db.get_named_quality_profile(pid)
-    return _profile_from_row(row) if row else load(db)
+        pid = DEFAULT_PROFILE_ID
+    if pid > DEFAULT_PROFILE_ID:
+        row = db.get_named_quality_profile(pid)
+        if row:
+            return _profile_from_row(row)
+    fallback = kind_default_id(db, kind) if kind is not None else None
+    if fallback:
+        row = db.get_named_quality_profile(fallback)
+        if row:
+            return _profile_from_row(row)
+    return load(db)
 
 
 def save_named(db, profile_id: Any, name: str, raw: Any) -> dict:
@@ -299,10 +388,32 @@ def load_for_item(db, item: Any) -> dict:
     """The profile for a drain/RSS/manual-search item dict — honors the
     ``quality_profile_id`` the wishlist queries annotate (COALESCEd from the
     wishlist row and the library row), else Default."""
-    pid = None
+    pid = kind = None
     if isinstance(item, dict):
         pid = item.get("quality_profile_id")
-    return profile_by_id(db, pid)
+        kind = item.get("kind")
+        if not pid:
+            # no profile of its own: its video library's default (#2029)
+            pid = library_profile_for_item(db, item)
+    return profile_by_id(db, pid, kind=kind)
+
+
+def library_profile_for_item(db, item: Any) -> Optional[int]:
+    """The default quality profile of the video library a wished item files
+    into (#2029), or None. Reads the drain / RSS item shape (tmdb_id for a
+    movie, show_tmdb_id for an episode) and a copy's video_library_id."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        from core.video.libraries import default_profile_for
+        is_movie = item.get("show_tmdb_id") is None and str(item.get("kind") or "movie") == "movie"
+        return default_profile_for(
+            db, "movie" if is_movie else "show",
+            tmdb_id=item.get("tmdb_id") if is_movie else item.get("show_tmdb_id"),
+            explicit_id=item.get("video_library_id"),
+            title=item.get("title") if is_movie else (item.get("show_title") or item.get("title")))
+    except Exception:   # noqa: BLE001 - no library default: the defaults as before
+        return None
 
 
 __all__ = [
@@ -310,4 +421,5 @@ __all__ = [
     "MAX_SIZE_CAP_GB", "MAX_MIN_SEEDERS", "DEFAULT_PROFILE_ID", "default_profile", "normalize",
     "normalize_tiers", "load", "save", "list_profiles", "profile_by_id",
     "save_named", "delete_named", "load_for_item",
+    "title_kind", "kind_default_id", "kind_defaults", "set_kind_default",
 ]

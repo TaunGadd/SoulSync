@@ -106,12 +106,12 @@ const HELPER_CONTENT = {
         tips: [
             'Filter by status: Active, Queued, Completed, Failed',
             'Badge on the nav button shows active download count from any page',
-            'Clear Completed button removes finished items from the list'
+            'The ⋯ menu clears finished rows, failed rows, or everything (only Clear everything also empties the Review queue); a failed row\'s ⋯ has Remove from list'
         ]
     },
-    '.nav-button[data-page="playlist-explorer"]': {
+    '.pl-explorer-btn': {
         title: 'Playlist Explorer',
-        description: 'Visual exploration tool for playlists. Browse album art grids or full discographies from any playlist source. Select tracks to add to wishlist or download directly.',
+        description: 'Opens the Playlist Explorer, a visual exploration tool for playlists. Browse album art grids or full discographies from any playlist source. Select tracks to add to wishlist or download directly.',
         tips: [
             'Toggle between Albums view and Full Discog view',
             'Select multiple tracks across albums for batch operations',
@@ -626,11 +626,11 @@ const HELPER_CONTENT = {
 
     '[id^="add-to-wishlist-btn"]': {
         title: 'Add to Wishlist',
-        description: 'Adds all missing tracks from this batch to your Wishlist for later download. Useful when you want to queue tracks but not download them right now.',
+        description: 'Adds the selected tracks to your Wishlist for later download. Useful when you want to queue tracks but not download them right now. The scheduled wishlist run picks them up.',
         tips: [
-            'Only missing tracks are added (already-owned tracks are skipped)',
-            'Tracks appear in the Wishlist modal under the appropriate category',
-            'The Wishlist auto-processes on a schedule via the Automations system'
+            'The Library Status column shows what you already have as soon as the dialog opens',
+            'Wishlisted tracks appear in the Wishlist and under Wanted in the Library',
+            'Begin Analysis downloads once without wishlisting, with Force Download and Skip AcoustID'
         ]
     },
     '.download-control-btn.primary': {
@@ -681,13 +681,13 @@ const HELPER_CONTENT = {
         tips: ['Supports CSV, TSV, M3U/M3U8, and plain text (one track per line)', 'M3U/M3U8 is read automatically (artist, title, duration from #EXTINF)', 'Column mapping for CSV/TSV files', 'Creates a mirrored playlist for persistent state'],
         docsId: 'sync-import-file'
     },
-    '.sync-tab-button[data-tab="mirrored"]': {
+    '.pl-collection[data-tab="mirrored"]': {
         title: 'Mirrored Playlists',
         description: 'All imported playlists from every source, saved persistently. Shows identification status, download progress, and allows re-syncing.',
         tips: ['Every parsed playlist is automatically mirrored here', 'Cards show live state: Discovering, Discovered, Syncing, Complete', 'Re-parsing the same URL updates the existing mirror'],
         docsId: 'sync-mirrored'
     },
-    '.sync-tab-button[data-tab="server"]': {
+    '.pl-collection[data-tab="server"]': {
         title: 'Server Playlists',
         description: 'View and manage playlists from your connected media server (Plex, Jellyfin, or Navidrome). Compare server-side playlists with source playlists to find differences.',
         tips: [
@@ -708,7 +708,11 @@ const HELPER_CONTENT = {
         description: 'View a log of all sync operations — playlist syncs, album downloads, and wishlist processing. Shows timestamps, track counts, and completion status.',
         docsId: 'sync-history'
     },
-    '.sync-header': {
+    '.pl-tools-btn': {
+        title: 'More tools',
+        description: 'Bulk scheduling, match review, the Wing It pool, linking a track by hand, activity and download origins.',
+    },
+    '.pl-header': {
         title: 'Playlist Sync',
         description: 'Import and sync playlists from multiple sources. Select playlists, match tracks to your library, and download what\'s missing.',
         docsId: 'sync-overview'
@@ -1201,6 +1205,20 @@ const HELPER_CONTENT = {
         description: 'All your automations — system and custom. Each card shows the trigger → action → then flow, run status, and controls.',
         docsId: 'auto-overview'
     },
+    '.automx-new-btn': {
+        title: 'New Automation',
+        description: 'Open the visual builder to create a new automation. Choose a trigger (WHEN), an action (DO), and optional notifications (THEN).',
+        docsId: 'auto-builder'
+    },
+    '.automx-master': {
+        title: 'Automations Master Switch',
+        description: 'Pauses every scheduled and event run on this side. Each automation keeps its own switch, and Run now still works while paused.',
+        docsId: 'auto-overview'
+    },
+    '.automx-search': {
+        title: 'Search Automations',
+        description: 'Filter the list by name, trigger or action.',
+    },
     '.auto-new-btn': {
         title: 'New Automation',
         description: 'Open the visual builder to create a new automation. Choose a trigger (WHEN), an action (DO), and optional notifications (THEN).',
@@ -1372,10 +1390,6 @@ const HELPER_CONTENT = {
     '#library-search-input': {
         title: 'Search Library',
         description: 'Search your library by artist name. Results filter in real-time as you type.',
-    },
-    '#watchlist-filter': {
-        title: 'Watchlist Filter',
-        description: 'Filter artists by watchlist status: All shows everyone, Watched shows only artists you follow, Unwatched shows artists not on your watchlist.',
     },
     '#alphabet-selector': {
         title: 'Alphabet Jump',
@@ -1574,7 +1588,7 @@ const HELPER_CONTENT = {
         description: 'Manually sync listening data from your media server. Pulls the latest play history, scrobbles, and library changes.',
     },
     '#stats-overview': {
-        title: 'Overview Cards',
+        title: 'The numbers',
         description: 'Key metrics at a glance: Total Plays, Listening Time, unique Artists, Albums, and Tracks played in the selected time range.',
     },
     '#stats-timeline-chart': {
@@ -1582,8 +1596,8 @@ const HELPER_CONTENT = {
         description: 'Chart showing your listening activity over time. Each bar represents plays in that time period. Helps visualize listening patterns and trends.',
     },
     '#stats-genre-chart': {
-        title: 'Genre Breakdown',
-        description: 'Pie/donut chart showing the genre distribution of your listening. Based on genre tags from your library\'s metadata enrichment.',
+        title: 'Most played genres',
+        description: 'The genres you played most in this range, under the bars comparing what you own with what you play. Based on genre tags from your library\'s metadata enrichment.',
     },
     '#stats-recent-plays': {
         title: 'Recently Played',
@@ -1898,8 +1912,8 @@ const HELPER_CONTENT = {
 
     // Save Button
     '.save-settings': {
-        title: 'Save Settings',
-        description: 'Save all settings changes. Some changes take effect immediately; others require a restart.',
+        title: 'Saved as you go',
+        description: 'Settings save themselves a moment after you change them. Click to save right away. A few changes need a restart to take effect. Prefer to save by hand? Turn autosave off under System, Saving.',
     },
 
     // ─── DASHBOARD: ENRICHMENT SERVICES ────────────────────────────
@@ -2011,7 +2025,7 @@ const HELPER_CONTENT = {
     },
     '#adl-actions': {
         title: 'History and Actions',
-        description: 'History opens every download SoulSync has done. The ⋯ menu holds Clear finished (tidies the list, never deletes files), Retry failed on the video side, and Cancel all.',
+        description: 'History opens every download SoulSync has done. The ⋯ menu holds Clear finished (tidies the list, never deletes files; on the video side it takes completed rows only), Retry failed, Clear failed and Clear everything on the video side (import failures stay for Manual import), and Cancel all. On the video side the ⋯ on a failed row also has Remove from list.',
     },
 
     // ─── PLAYLIST EXPLORER PAGE ──────────────────────────────────────
@@ -2329,18 +2343,12 @@ const HELPER_TOURS = {
         icon: '🔄',
         steps: [
             // Header
-            { page: 'sync', selector: '.sync-header', title: 'Playlist Sync', description: 'Import playlists from any streaming service, match tracks to your download sources, and sync them to your media server. Everything happens from this page.' },
-            { page: 'sync', selector: '.sync-history-btn', title: 'Sync History', description: 'View a log of all past sync operations — when they ran, how many tracks matched, and which ones failed. Useful for tracking down missing tracks.' },
+            { page: 'sync', selector: '.pl-header', title: 'Playlist Sync', description: 'Import playlists from any streaming service, match tracks to your download sources, and sync them to your media server. Everything happens from this page.' },
+            { page: 'sync', selector: '.pl-tools-btn', title: 'More tools', description: 'Bulk scheduling, match review, the Wing It pool, linking a track by hand, activity and download origins. Each one says what it is for.' },
 
-            // Source tabs (left to right)
-            { page: 'sync', selector: '.sync-tab-button[data-tab="spotify"]', title: 'Spotify Playlists', description: 'If Spotify is connected, click "Refresh" to load all your playlists. Select ones you want, then hit Start Sync in the sidebar.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="spotify-public"]', title: 'Spotify Link', description: 'Don\'t have a Spotify account? Paste any public Spotify playlist or album URL here to import it without authentication.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="tidal"]', title: 'Tidal Playlists', description: 'Same as Spotify — connect Tidal in Settings, refresh to load your playlists, then sync.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="deezer"]', title: 'Deezer', description: 'Paste a Deezer playlist URL to import. No account needed — just the public URL.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="youtube"]', title: 'YouTube Music', description: 'Paste a YouTube Music playlist URL. The parser extracts track titles and artists, then matches them against your metadata source.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="beatport"]', title: 'Beatport', description: 'For electronic music — paste a Beatport playlist URL to import DJ sets and charts.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="import-file"]', title: 'File Import', description: 'Import a playlist from a local file — M3U, CSV, or plain text. Map columns to track/artist/album fields.' },
-            { page: 'sync', selector: '.sync-tab-button[data-tab="mirrored"]', title: 'Mirrored Playlists', description: 'Every imported playlist is saved here permanently. Re-sync anytime to catch new additions, check match status, or view the Match Review for unmatched tracks.' },
+            // Add (every source opens from it) and the library
+            { page: 'sync', selector: '.pl-add-btn', title: 'Add a playlist', description: 'Paste a link from Spotify, Apple Music, Deezer or YouTube, or open one of your sources: Spotify, Tidal, Qobuz, Deezer, YouTube Music, ListenBrainz, Last.fm, SoulSync Discovery, Beatport, or a file. What you import lands in Mirrored.' },
+            { page: 'sync', selector: '.pl-collection[data-tab="mirrored"]', title: 'Mirrored Playlists', description: 'Every imported playlist is saved here permanently. Re-sync anytime to catch new additions, check match status, or view the Match Review for unmatched tracks.' },
 
         ]
     },
@@ -2351,17 +2359,20 @@ const HELPER_TOURS = {
         description: 'Create automated workflows with triggers and actions.',
         icon: '🤖',
         steps: [
-            // List view (visible on load)
-            { page: 'automations', selector: '#automations-list-view', title: 'Automations Overview', description: 'All your automations live here, organized into System (built-in), Custom groups, and My Automations. Each card shows its WHEN trigger, DO action, and THEN notifications.' },
-            { page: 'automations', selector: '#automations-stats', title: 'Stats Bar', description: 'Quick counts of total automations, how many are active, paused, and custom. Also shows system automations running background tasks like enrichment and watchlist scanning.' },
-            { page: 'automations', selector: '.auto-new-btn', title: 'Create New Automation', description: 'Opens the visual builder. Choose a trigger (WHEN), an action (DO), and optional notifications (THEN). Triggers include schedules, events (download complete, new release), and signals from other automations.' },
+            // the page is React (webui/src/routes/automations): these anchor to
+            // what it renders. the old #automations-list-view / .auto-new-btn
+            // anchors pointed at markup that no longer exists.
+            { page: 'automations', selector: '.automx-pills', title: 'Four Places', description: 'Overview shows the next 24 hours, what is up next, what needs attention and what ran last. All automations is every one of them in sections. Activity is the last day and week of runs. Guides holds ready-made pipelines and recipes.' },
+            { page: 'automations', selector: '.automx-head-sub', title: 'At a Glance', description: 'How many automations are on, how many are off, when the next one runs, and how many need attention.' },
+            { page: 'automations', selector: '.automx-master', title: 'The Master Switch', description: 'Pauses every scheduled and event run on this side at once. Each automation keeps its own switch, and Run now still works while paused.' },
+            { page: 'automations', selector: '.automx-new-btn', title: 'Create New Automation', description: 'Opens the visual builder. Choose a trigger (WHEN), an action (DO), and optional notifications (THEN). Triggers include schedules, events (download complete, new release), and signals from other automations.' },
 
             // Builder (describe since it requires clicking)
-            { page: 'automations', selector: '.auto-new-btn', title: 'The Builder', description: 'The builder has a sidebar with draggable blocks and a canvas. Drag a WHEN block (e.g., "Every 6 hours"), a DO block (e.g., "Run Watchlist Scan"), and optionally a THEN block (e.g., "Send Discord notification").' },
-            { page: 'automations', selector: '.auto-new-btn', title: 'Signals & Chains', description: 'Advanced: automations can fire "signals" that trigger other automations, creating chains. Example: Watchlist scan → fires "new_release" signal → Download automation picks it up. Max chain depth is 5.' },
+            { page: 'automations', selector: '.automx-new-btn', title: 'The Builder', description: 'The builder has a sidebar with draggable blocks and a canvas. Drag a WHEN block (e.g., "Every 6 hours"), a DO block (e.g., "Run Watchlist Scan"), and optionally a THEN block (e.g., "Send Discord notification").' },
+            { page: 'automations', selector: '.automx-new-btn', title: 'Signals & Chains', description: 'Advanced: automations can fire "signals" that trigger other automations, creating chains. Example: Watchlist scan → fires "new_release" signal → Download automation picks it up. Max chain depth is 5.' },
 
-            // Hub section
-            { page: 'automations', selector: '#auto-section-hub', title: 'Automation Hub', description: 'Pre-built templates, pipeline recipes, quick-start guides, and reference docs. Browse Pipelines for ready-made multi-step workflows, or check Recipes for common automation patterns. Great starting point! 🎉' },
+            // the Guides pill (the hub lives behind it)
+            { page: 'automations', selector: '.automx-pills', title: 'Guides', description: 'The Guides pill holds pre-built pipelines, single recipes, quick-start guides and reference docs. Browse Pipelines for ready-made multi-step workflows, or Singles for common patterns. Great starting point! 🎉' },
         ]
     },
     'library': {
@@ -2374,8 +2385,7 @@ const HELPER_TOURS = {
 
             // Controls
             { page: 'library', selector: '#library-search-input', title: 'Search Artists', description: 'Type to filter your library by artist name. Results update instantly as you type.' },
-            { page: 'library', selector: '#watchlist-filter', title: 'Watchlist Filter', description: 'Filter by watchlist status: All, Watched (artists you follow for new releases), or Unwatched. The "Watch All Unwatched" button adds every remaining artist to your watchlist in one click.' },
-            { page: 'library', selector: '#alphabet-selector', title: 'Alphabet Jump', description: 'Click any letter to jump directly to artists starting with that letter. Great for navigating large libraries.' },
+            { page: 'library', selector: '#library-view-toggle', title: 'Library View', description: 'Switch between the visual card grid and the detailed table view.' },
 
             // Grid
             { page: 'library', selector: '#library-artists-grid', title: 'Artist Grid', description: 'Your artists as cards with photos, track counts, and service badges (Spotify, MusicBrainz, etc.). Click any card to open their artist detail page with full discography.' },
@@ -2429,7 +2439,7 @@ const HELPER_TOURS = {
 
             // Charts (left column)
             { page: 'stats', selector: '#stats-timeline-chart', title: 'Listening Activity', description: 'A timeline chart showing your listening pattern over time. Spot trends — are you listening more on weekends? Did you binge a new album last week?' },
-            { page: 'stats', selector: '#stats-genre-chart', title: 'Genre Breakdown', description: 'Pie chart showing which genres you listen to most. The legend shows exact percentages. Useful for understanding your taste profile.' },
+            { page: 'stats', selector: '#stats-genre-chart', title: 'Most played genres', description: 'The genres you listen to most, with exact percentages, under the bars comparing what you own with what you play.' },
             { page: 'stats', selector: '#stats-recent-plays', title: 'Recently Played', description: 'A live feed of your most recent plays with timestamps, artist, and album info.' },
 
             // Rankings (right column)
@@ -2486,7 +2496,7 @@ const HELPER_TOURS = {
             { page: 'settings', selector: '.stg-tab[data-tab="advanced"]', title: 'Advanced Tab', description: 'Power-user settings, logging configuration, and system-level options. Most users won\'t need to touch this.' },
 
             // Save
-            { page: 'settings', selector: '.save-button', title: 'Save Settings', description: 'Don\'t forget to save! Changes aren\'t applied until you click this button. Some settings (like download source changes) take effect immediately after saving. 🎉' },
+            { page: 'settings', selector: '.save-button', title: 'Saved as you go', description: 'Settings save themselves a moment after you change them. This shows when they\'re saved, and clicking it saves right away.' },
         ]
     },
     'issues-tour': {
@@ -3403,7 +3413,7 @@ function _guessPageFromSelector(selector) {
         'discover':    ['discover-', 'spotify-library', 'recent-releases', 'seasonal', 'release-radar', 'discovery-weekly', 'build-playlist', 'listenbrainz', 'decade-tabs', 'genre-tabs', 'daily-mixes', 'personalized-'],
         'artists':     ['artists-search', 'artists-hero', 'artist-detail', 'similar-artists'],
         'automations': ['automations-', 'auto-', 'builder-'],
-        'library':     ['library-', 'alphabet-selector', 'watchlist-filter'],
+        'library':     ['library-', 'alphabet-selector'],
         // '#stats-' not 'stats-': the bare prefix also matched
         // #listening-stats-enabled, which is a Settings control, so its helper
         // search result navigated to the Stats page and found nothing.
@@ -3447,21 +3457,27 @@ function closeHelperSearch() {
 // release time and add a real `date:` line at the top of the version block.
 const WHATS_NEW = {
     // Keep the current release and one brief Earlier versions summary.
-    '3.6.1': [
-        { date: 'October 2026 · 3.6.1' },
-        { title: 'Video dashboard, calendar and tools', desc: 'The video dashboard now matches the music one, with your library\'s size, the worker orbs, next up, continue watching and a this week rail. The calendar has week, agenda and month views where every episode says where it stands, and video tools is the same Tools page as music, with clearer findings.', page: 'dashboard' },
-        { title: 'Detail pages and Your library', desc: 'Movie and show pages read like a streaming app: one main action, everything else in More, specials no longer count as missing. A new Your library tab lists every copy you own with its quality, folder and subtitles, and renames, deletes and fixes the match from there. Fix match sticks, and you can mark one episode or season watched.' },
-        { title: 'Optional 4K libraries', desc: 'Turn on a separate Movies 4K or TV 4K folder in Settings > Folders > Video, then set a quality profile to save to the 4K library. New grabs of those titles land there, and titles you already have stay put.', page: 'settings' },
-        { title: 'Folders that check themselves', desc: 'Every folder in Settings > Folders shows a line as you type: free space, will be created, can\'t write here, a Windows path in Docker, a folder nested in your downloads, or a Docker folder on no mapped volume. Video folders lock like the music ones, and audiobooks can read extra folders on other drives.', page: 'settings' },
-        { title: 'Playlists import into SoulSync', desc: 'Every source tab imports a playlist into SoulSync and lands you on it. Keep your own editable copy instead of a mirror (#1913), and Download missing can retry unidentified tracks first (#1912). A mirror checks your library when you open it (#1910).', page: 'sync' },
-        { title: 'Songs tab', desc: 'The Library page has a Songs tab: play from any song, shuffle, like, filter duplicates, lossless and could be better, sort by artist, album or newest, compare copies side by side, and act on many at once (#1906).', page: 'library' },
-        { title: 'Paste a link to match', desc: 'The match search takes a Spotify, Apple, Discogs, Tidal, Qobuz, Amazon, AudioDB, JioSaavn, Last.fm or Bandcamp link or ID and shows that exact one. Fixing an artist\'s match also updates your watchlist (#1901).', page: 'library' },
-        { title: 'Daily mixes rebuilt', desc: 'Daily mixes now group what you play in the same sittings instead of any shared genre, with no repeats and a new mix each day.', page: 'discover' },
-        { title: 'Listen before you pick', desc: 'Interactive search shows the song, gives every streamable hit a play button, and shows the length you wanted (#1911).', page: 'downloads' },
-        { title: 'Sign in with OIDC only', desc: 'An optional login mode where your OIDC provider is the only way in, plus OIDC fixes behind proxies and URL bases (thanks @PapaBearDoes) (#1839).', page: 'settings' },
-        { title: 'Navidrome and performance', desc: 'Navidrome scans finish when Navidrome says so (#1899), the hourly update stops missing albums, and the listening poll is gentle. Idle CPU is down (#1905), and the lyrics filler stops repeating LRCLib lookups (#1902).' },
-        { title: 'Fixes', desc: 'Staged downloads no longer look missing to the watchlist, a shared theme song no longer counts as missing (thanks @SimpleSimonLA), playlist downloads stop getting tagged Unknown Album, album completeness stops wishlisting other artists, and video renames keep their quality tag and folder (thanks @PapaBearDoes).' },
-        { title: 'Earlier versions', desc: '3.6.0 added MetaSync charts, sign in with OIDC, simpler settings, watchlist and wishlist pages, and new naming tokens.' },
+    '3.6.6': [
+        { date: 'November 2026 · 3.6.6' },
+        { title: 'A video library manager', desc: 'The video Library page shows your movies and shows as posters, as a sortable table of titles with the columns you pick, or as a table of the files themselves. Filter by what needs a look and by what the files are, and save any set as a view.' },
+        { title: 'Bulk operations', desc: 'Act on a selection or on everything a filter matches: rename with a preview, move to another drive or library, quality profile, look for upgrades, get missing, subtitles, identify again, and delete with a preview.' },
+        { title: 'History, undo and the padlock', desc: 'Every rename, move, delete and re-file made by hand is listed and one click puts it back. Lock a title once it is the way you want it, and maintenance, mass rename and automatic upgrades leave it alone.' },
+        { title: 'Manage a title from its own page', desc: 'A movie or show page carries the padlock, file history and move. A season has Rename files, Renumber episodes and Delete files, each with a preview. Tick episodes to act on several, stop hunting one from its menu, and undo any change from the foot of the page.' },
+        { title: 'Pages that keep themselves current', desc: 'Opening a movie or show asks your media server, the metadata provider and the ratings again when each has gone stale, in the background, and redraws only if something moved. Refresh asks all three now.' },
+        { title: 'A library on many drives', desc: 'Move lists each library with every drive it sits on and the free space on each. Pick another drive of the same library, or another library.' },
+        { title: 'A fast Library page', desc: 'Lists, filter counts and the Files view are answered from memory. On a large library the Files view went from several seconds a page to instant, and the cards rise and fade in like the music library’s.' },
+        { title: 'Server Activity', desc: 'Music and audiobooks show the album or book cover, not the artist or author picture (thanks SeadogsBooty, #2089), and the drawer covers the floating buttons while it is open (#2090).' },
+        { title: 'Start SoulSync’s torrents', desc: 'A new switch in the torrent client settings for a qBittorrent that adds torrents stopped, or stops them once the metadata is in. SoulSync’s torrents start anyway (thanks onnwee, #2087).', page: 'settings' },
+        { title: 'Cam releases', desc: 'CAMRip, HDCAMRip, HDTSRip, TSRip, telecine and pre-DVD rips are all read as cam, however they are spelled (thanks onnwee, #2088).' },
+        { title: 'Bootlegs, edits and unofficial remixes', desc: 'Turn on Find uncatalogued tracks in a playlist’s Settings and the tracks no catalog has are searched for by the playlist’s own artist and title on every sync. A file is only taken when its name says it is that exact version, and it is tagged from the playlist (thanks CptSamFalcon, #2097).' },
+        { title: 'One server playlist per mirror', desc: 'On Jellyfin and Plex a sync rewrites the server playlist in place and follows it by id, so a refused delete or a second playlist with the same name no longer leaves a stale twin (#2098). Music usenet grabs use the category you set (#2096), and bulk fixing orphan files is fast (#2095, thanks Randomname653).' },
+        { title: 'Leftover track rows', desc: 'A rip tagged “Album - Song” left a row behind under that name once it was retagged, so the album showed more tracks than it has. Those rows fold into the real song after a scan (thanks Ktzenjammer, #2094).' },
+        { title: 'Watchlist rules', desc: 'Live albums and live tracks are two rules (#2082), the original release is the standard edition (#2080), clean copies can be left out (#2081), and a release you pick yourself is never kept out by what it is.', page: 'watchlist' },
+        { title: 'Library fixes', desc: 'Albums You’re Missing no longer lists albums you own (#2083), a dead file’s row has a Remove button (thanks wolf39us, #2086), file tag values can be released (#2084), and a moved file is no longer listed or downloaded twice.', page: 'library' },
+        { title: 'One page frame', desc: 'Search, Discover, Playlists, Watchlist, Tools, Requests, Downloads, Import, Wishlist, Stats, Audiobooks and Podcasts share one width, header, pill row and section heading.' },
+        { title: 'Lighter on a phone', desc: 'The sidebar sky stops drawing while the menu is closed and draws less on a phone, the sidebar visualizer no longer runs where it is hidden, and Now Playing fits the real screen height.' },
+        { title: 'Security and upkeep', desc: 'Keys, tokens and passwords are blanked out of every log line, names are escaped before they reach the page, and more management routes check the profile asking. Discogs artist images download again (thanks Ktzenjammer, #2079), and anime numbered as one long season is handled (thanks Thibs).' },
+        { title: 'Earlier versions', desc: '3.6.5 rebuilt both dashboards and the bell, redid Tools, Automations and Stats, added the review lock and made artist merges undoable. 3.6.4 brought your own video libraries. 3.6.2 brought the new Library, built by @nick2000713.' },
     ],
 };
 
@@ -3491,24 +3507,24 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: '3.6.1: the video side on React, 4K libraries and folders that check themselves',
-        description: 'The video dashboard, calendar, tools and detail pages move onto the new pages, with a Your library tab on every movie and show. Also optional 4K libraries, live folder checks in Settings, a playlist flow where every source imports into SoulSync, a Songs tab and rebuilt daily mixes.',
+        title: '3.6.6: the video library manager',
+        description: 'The video Library page becomes a manager with tables, bulk operations, history with undo and a padlock. Movie and show pages manage their own seasons, episodes and files and keep themselves current. Plus one page frame everywhere, a security pass and a lighter app on phones.',
         features: [
-            'Video dashboard in the music dashboard\'s layout, a calendar where every episode says where it stands, and video tools on the shared Tools page with clearer findings (#1882).',
-            'Detail pages that read like a streaming app, a Your library tab for every copy you own, a fix match that sticks, and watched marks for one episode or season.',
-            'Optional Movies 4K and TV 4K folders, filled by quality profiles set to save to 4K. Titles you already have stay put.',
-            'Every folder in Settings checks itself as you type: free space, write access, nesting and unmapped Docker volumes. Video folders lock like the music ones, and audiobooks can read extra folders on other drives.',
-            'Every playlist source imports into SoulSync, keep your own copy (#1913), retry then download (#1912), and mirrors that check your library when opened (#1910).',
-            'A Songs tab on the Library page (#1906), paste a link or ID to match (#1901), daily mixes rebuilt on what you play together, and listen before you pick in interactive search (#1911).',
-            'Sign in with OIDC only and OIDC fixes, plus video naming and rename fixes (thanks @PapaBearDoes) (#1839).',
-            'Navidrome scans finish on time (#1899), the hourly update stops missing albums, idle CPU is down (#1905) and the lyrics filler stops repeating lookups (#1902).',
-            'Staged downloads no longer look missing to the watchlist and shared theme songs stop re-downloading (thanks @SimpleSimonLA), plus fixes for Unknown Album tags, album completeness and the sidebar icons.',
+            'The video Library as posters, a table of titles or a table of files, with filters that manage and saved views.',
+            'Bulk operations with previews: rename, move to another drive or library, quality profile, upgrades, subtitles, identify again and delete.',
+            'History with undo for every rename, move and delete, and a padlock that keeps automation off a finished title.',
+            'Movie and show pages manage their own files: rename, renumber and delete by season or by ticked episodes, stop hunting one episode, and undo from the page.',
+            'Pages keep themselves current, asking your media server, the metadata provider and the ratings again when each has gone stale.',
+            'A fast Library page: the Files view went from several seconds a page to instant on a large library.',
+            'Server Activity shows album and book covers and no longer sits under the floating buttons (thanks SeadogsBooty, #2089, #2090).',
+            'Start SoulSync’s torrents on a qBittorrent that adds them stopped, and cam releases caught however they are spelled (thanks onnwee, #2087, #2088).',
+            'Live albums and live tracks as two rules, original release and clean version filters (#2080, #2081, #2082), and Albums You’re Missing fixed (#2083).',
+            'One page frame across the app, a security pass on logs and management routes, and a lighter sidebar and player on phones.',
         ],
-        usage_note: 'Turn on 4K libraries in Settings > Folders > Video, then pick Save to: 4K library on a quality profile.',
     },
     {
-        title: 'Earlier in 3.6.0',
-        description: 'MetaSync charts, sign in with OIDC, anime by library, simpler settings, watchlist and wishlist pages, new naming tokens with a live preview, and generated playlist covers.',
+        title: 'Earlier in 3.6.5',
+        description: 'Both dashboards rebuilt, the notification bell, Tools, Automations and Stats redone, video pages as one page, a review lock, artist merges that are recorded and can be undone, and a new install that no longer trips on a library upgrade.',
         features: [],
     },
 ];
@@ -3868,7 +3884,10 @@ document.addEventListener('DOMContentLoaded', () => {
         // First-launch welcome prompt
         const hasSetup = localStorage.getItem('soulsync_setup');
         const hasDismissed = localStorage.getItem('soulsync_setup_welcome_dismissed');
-        if (!hasSetup && !hasDismissed) {
+        // the flag above is per browser, so a set-up install still greeted
+        // every new browser (and every household member) with "new here?".
+        // the server knows whether setup is done, ask it (#1909)
+        const showWelcomeTip = () => {
             const floatBtn = document.getElementById('helper-float-btn');
             if (floatBtn) {
                 floatBtn.classList.add('first-launch-pulse');
@@ -3892,6 +3911,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }, 12000);
             }
+        };
+        if (!hasSetup && !hasDismissed) {
+            fetch('/api/setup/status')
+                .then(r => (r.ok ? r.json() : null))
+                .then(d => { if (d && d.setup_complete === false) showWelcomeTip(); })
+                .catch(() => { /* no answer, no nag */ });
         }
 
         // What's New badge

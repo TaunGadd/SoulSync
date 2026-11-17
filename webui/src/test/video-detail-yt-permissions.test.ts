@@ -44,7 +44,7 @@ function row(
 
 function seasonBar(season: Record<string, unknown>, opts: { canDownload: boolean }): string {
   const preamble = `
-    var data = { kind: 'show', source: 'youtube' };
+    var data = { kind: 'channel', source: 'youtube' };
     var ytFilter = { q: '', state: 'all', duration: 'all' };
     function canDownload() { return ${opts.canDownload ? 'true' : 'false'}; }
     window.VideoGrab = {};

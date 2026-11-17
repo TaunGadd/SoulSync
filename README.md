@@ -58,6 +58,7 @@ Most self-hosted media setups are a relay race: one app wants things, another se
 - **It checks its work.** Downloads are fingerprinted, sanity checked, quality ranked and quarantined when they don't hold up. Nothing lands in your library on faith.
 - **It explains itself.** Stuck wishlist rows show exactly which releases were refused and why. Every download has an audit trail.
 - **It's one app for the whole house.** Music, movies, TV, YouTube, podcasts and audiobooks, with profiles so everyone gets their own taste, playlists and history.
+- **It's only as big as you want it.** Use one part or all of it. **Customize** in the sidebar hides what you don't use, and each profile picks its own.
 
 ## At a glance
 
@@ -98,17 +99,19 @@ Bring a playlist in from anywhere, keep a mirror of it, and keep your media serv
 - **Discovery**: matches each source track to real metadata with live progress. Fix any match by hand (including by MusicBrainz ID), retry the failures, or let **Wing It** make best-effort guesses that you can review later in the **Wing It Pool**.
 - **Sync modes**: *Replace*, *Reconcile* (edit in place, keep the server playlist's image and description) or *Append*.
 - **Schedules**: per playlist, from hourly to weekly, or on a drag-and-drop **Auto-Sync board** with a live pipeline monitor and run history. A scheduled pipeline does refresh → discover → sync → download missing, unattended.
-- **Server playlists**: a side-by-side **compare editor** for Plex / Jellyfin / Navidrome (matched, missing, extra), swap versions, find & add, unmatch a wrong pairing while keeping the track, reorder to match the source, export M3U.
+- **Server playlists**: a side-by-side **compare editor** for Plex / Jellyfin / Navidrome (matched, missing, extra), swap versions, find & add, unmatch a wrong pairing while keeping the track, reorder to match the source, export M3U. A playlist made on the server can be **adopted** into My Playlists to manage it here (smart playlists stay the server's).
 - **Export** any playlist to Spotify, Deezer, ListenBrainz or a JSPF file.
 - **Beatport**: Top 100, Hype 100, top 10 lists and releases, and a full genre browser.
 - **Organize by playlist**: optionally download a playlist into its own folder.
+- **Bootlegs, edits and unofficial remixes**: turn on *Find uncatalogued tracks* in a playlist's Settings and the tracks no catalog has are searched for by the playlist's own artist and title on every sync. A file is only taken when its name says it is that exact version, so the original never stands in for a remix of it, and it is tagged from the playlist.
+- **Rotating playlists**: turn on *Rotating* in a playlist's Settings and a song it downloaded is removed once it leaves the playlist. Anything you played, favourited, rated or still have in another playlist is kept, and removals wait for your approval until you turn dry run off.
 - **Cover art**: *Generate cover art* in any playlist's ⋯ menu (on the card or inside the playlist) paints a cover from its genres, mood and era with [Pollinations](https://pollinations.ai). Preview it with the playlist's name across the top (or without), try another style, keep the one you like; it survives refreshes and syncs to your server. Free with no key (one image every 45s, small Pollinations mark), or add a key in Settings to lift both.
 
 ## Search & downloads
 
 One search box with three modes.
 
-- **Catalog**: search Spotify, Apple Music, Deezer, Discogs, MusicBrainz or Amazon. Results show *In library* and *In wishlist*; albums open a download-missing view, artists and labels open their pages.
+- **Catalog**: search Spotify, Apple Music, Deezer, Discogs, MusicBrainz or Amazon, or **All sources** at once with the same release shown once. Results show *In library* and *In wishlist*; albums open a download-missing view, artists and labels open their pages.
 - **Videos**: official music videos from YouTube, downloaded straight into your library.
 - **Files**: search a download source directly (like classic Soulseek), filter by format and quality, then choose how it comes in:
   - **Download as-is** — untouched, into Transfer.
@@ -128,8 +131,8 @@ One search box with three modes.
 | **YouTube** | yt-dlp, cookies supported |
 | **SoundCloud** | anonymous |
 | **Lidarr** | hand an album to Lidarr's indexers, import only the tracks you need |
-| **Torrent** | Prowlarr search; qBittorrent, Transmission, Deluge or aria2; seeding goals; archive extraction |
-| **Usenet** | Prowlarr search; SABnzbd or NZBGet; remote path mappings |
+| **Torrent** | Prowlarr search; qBittorrent, Transmission, Deluge or aria2; seeding goals; archive extraction; an option to start SoulSync's torrents on a qBittorrent that adds them stopped |
+| **Usenet** | Prowlarr search; SABnzbd or NZBGet, sent the NZB file itself (no Prowlarr link or api key in their queue); remote path mappings |
 
 **Downloads page.** Live batches with speed and ETA, "download this next", a step-by-step detail sheet on every download (found, downloaded, verified, imported), manual search on failed tracks, play straight from finished ones, per-track audit trails (lifecycle, embedded tags, lyrics), a **Review** queue for anything that needs a human, and a **Clients** pane that manages slskd, your torrent client and your usenet client from one place.
 
@@ -162,16 +165,17 @@ A personal front page shaped by your library, your listening and your watchlist.
 - **Library**: every artist, filterable by letter, watch state, and which metadata sources each one is (or isn't) matched to. Export as JSON / CSV / text / M3U.
 - **Songs**: every song you own, searchable by title from any library view. Each one shows its album and file quality so copies are easy to tell apart; play it, add it to a playlist, and (admins) delete it.
 - **Fix a wrong match** by pasting the artist's link or ID from Spotify, Apple Music, Deezer, Discogs, Tidal, Qobuz and more. The watchlist follows the fix.
-- **Artist pages**: full discography with ownership, live completion bars for albums / EPs / singles, top tracks, similar artists, a **music video player**, and **concerts** (Ticketmaster dates and Setlist.fm setlists you can play from your own library).
+- **Artist pages**: full discography with ownership, live records, compilations, soundtracks, remixes and spoken word in sections of their own, live completion bars for albums / EPs / singles, top tracks, similar artists, a **music video player**, and **concerts** (Ticketmaster dates and Setlist.fm setlists you can play from your own library).
   - **Gap-fill** pulls in releases your other metadata sources know about.
-  - **Enhanced view** (admins): inline tag editing, bulk BPM / mood / style edits, write tags to files with a diff preview, ReplayGain, reorganize with a path preview, move an album to another artist, re-identify a track, redownload with source picking, and delete (database only, or files too).
+  - **Enhanced view** (admins): inline tag editing, bulk BPM / mood / style edits, write tags to files with a diff preview, Use File Tags to take the Library's metadata from your files instead (fields, album year, and which album a track is on) and release those values again later, ReplayGain, reorganize with a path preview, move an album to another artist, re-identify a track, redownload with source picking, and delete (database only, or files too).
   - **Fix matches**: change artwork from any source, inspect the database record, and forget wrong matches per source.
+  - **Lock what you have reviewed** (admins): the padlock on an album or artist marks it reviewed and keeps every automated job off it: scans, enrichment, repair jobs, retags, reorganize and upgrades. Switch off any part you still want handled. Missing tracks still download, a missing or damaged file is still reported, and anything you do by hand still works. The sheet shows what the lock kept away and whether a file changed since your review. Filter the library by **Reviewed** / **Not reviewed**.
 - **Label pages**: a label's full catalog with owned / missing filters. Follow a label for new releases or its whole backlog.
 
 ## Watchlist & wishlist
 
-- **Watchlist**: follow artists and labels. SoulSync scans for new releases on a schedule, with per-artist rules (albums, EPs, singles, live, remixes, compilations), lookback windows, scan source and auto-download. The **Artist Inspector** shows linked IDs per provider and recent releases, and a **Blocklist** keeps things you never want.
-- **Wishlist**: everything wanted, retried automatically with progressive backoff. Browse it as a **Nebula** (an orb per artist, grouped by what's stuck: no match found, or downloaded then rejected) or a dense list. Open an artist to see why each track failed in plain words, retry it, or pick a source by hand.
+- **Watchlist**: follow artists and labels. SoulSync scans for new releases on a schedule, with per-artist rules (albums, EPs, singles, live albums, live tracks, remixes, compilations), one edition per album (the original release or the most complete) with clean copies left out, lookback windows, scan source and auto-download. The **Artist Inspector** shows linked IDs per provider and recent releases, and a **Blocklist** keeps things you never want.
+- **Wishlist**: everything wanted, retried automatically with progressive backoff. Browse it as a **Nebula** (an orb per artist, grouped by what's stuck: no match found, or downloaded then rejected) or a dense list. Open an artist to see why each track failed in plain words, retry it, or pick a source by hand. Export it as CSV or JSON (the video wishlist too: everything, movies or TV shows).
 - **Requests**: Overseerr-style for music too — profiles without download rights add to their wishlist like anyone else, and the scheduled run only downloads what an admin approved.
 
 ## Import
@@ -195,6 +199,7 @@ An inbox for everything in your staging folder, with a Picard-style matcher.
 - **Listening stats**: plays, time, top artists / albums / tracks, genres, when you listen, streaks, and how much of what you own you actually play.
 - **Your Year**: a full-screen, Wrapped-style story of your year, ending in a card studio that exports shareable images using your real album art.
 - **Scrobbling** to Last.fm and ListenBrainz from Plex, Jellyfin or Navidrome.
+- **Per-profile**: a profile with its own Plex account, Jellyfin user, ListenBrainz or Last.fm gets its own stats and recommendations, and can scrobble its plays to its own ListenBrainz or Last.fm.
 - **History import** from Last.fm, ListenBrainz and Maloja. Each profile can connect its own account and gets its own stats and recommendations.
 
 ## Player & radio
@@ -226,14 +231,14 @@ A complete video side with its own database, pages and pipeline. Switch sides fr
 
 **Library**
 - Movies, shows and YouTube channels from **Plex** or **Jellyfin**, with incremental, full and deep scans, per-title sync, and a path resolver for mismatched Docker / NAS mounts.
-- **15 enrichment workers**: TMDB, TVDB, OMDb (IMDb, Rotten Tomatoes, Metacritic), fanart.tv, OpenSubtitles, Trakt, TVmaze, AniList, Wikidata, SponsorBlock, DeArrow, Return YouTube Dislike, streaming (where-to-watch), Mediastinger (credits scenes) and awards — plus a background YouTube upload-date enricher.
+- **15 enrichment workers**: TMDB, TVDB, OMDb (IMDb, Rotten Tomatoes, Metacritic), fanart.tv, OpenSubtitles, Trakt, TVmaze, AniList (anime, linked by id through the anime-lists map: romaji and English names in release searches, score, studio, next episode, and the season split for anime TMDB lumps into one season, no TVDB key needed), Wikidata, SponsorBlock, DeArrow, Return YouTube Dislike, streaming (where-to-watch), Mediastinger (credits scenes) and awards — plus a background YouTube upload-date enricher.
 - **Bulk edit & field locks**: edits are written to SoulSync and pushed to your server, and locked fields are never overwritten by enrichment.
 
 **Detail pages**
 - Trailer-backed heroes with one primary action (Play / Resume on your server, else Get) and everything else in one More menu.
 - Every rating, cast and crew, where to watch, collections and acquisition history.
 - Four season views, and season tools: grab, search, wishlist, monitor.
-- A **Your library** tab on every movie and show: each copy you own with its quality, codecs, size, folder and subtitles, whether its name matches your template, and file actions (rename to template, delete to the recycle bin). Shows get every season with counts, size, a resolution mix and a monitored switch, plus the folders a show is split across.
+- A **Your library** tab on every movie and show: each copy you own with its quality, codecs, audio languages, size, folder and subtitles (beside it or inside it), whether its name matches your template, and file actions (rename to template, delete to the recycle bin). Shows get every season with counts, size, a resolution mix and a monitored switch, plus the folders a show is split across.
 - **Fix match** that sticks: re-point a title to the right TMDB entry and scans can't switch it back.
 - Person, studio, channel and playlist pages.
 
@@ -261,12 +266,18 @@ A complete video side with its own database, pages and pipeline. Switch sides fr
   - Prowlarr (structured and text queries, TV query ladder including anime and daily shows) and **RSS sync**.
   - qBittorrent, Transmission, Deluge, SABnzbd, NZBGet and slskd.
   - Seeding goals, **season packs**, and stall detection.
+  - **Failed download handling**: a release SABnzbd or the torrent client fails is blocklisted and the next one your profile ranks is grabbed right away, with a notification only when nothing else could be taken.
 - **Quality profiles**:
   - A 16-tier ladder with upgrade-until-cutoff and Sonarr-style **custom formats**.
-  - Codec, HDR and audio preferences, **audio language** (prefer or require a dubbed / MULTI release), size limits and minimum seeders.
+  - **Per-title profiles**: pick one in Get / Manual search (even before the title is in your library; it keeps it when it lands) or the title's Manage panel, with separate defaults for new movies and new shows.
+  - **Manual search results** can be filtered (conditions on resolution, codec, group, size, age, indexer, format score and more, matched on all or any), sorted, and saved as named filters per profile. A failed grab shows which release replaced it. **Colons in titles** can become " - " instead of being dropped.
+  - Codec, HDR and audio preferences, **audio language** (prefer or require a dubbed / MULTI release), size limits, a **preferred size** tie-break and minimum seeders.
+  - **One ranking everywhere**, Radarr's order: quality tier and profile preferences, then custom formats, then tie-breaks. Manual search, Auto, the wishlist, RSS, upgrades and retries pick the same release, and every search result shows **why it ranks** where it does.
   - **Optional 4K libraries**: a separate Movies 4K and TV 4K folder, off until you switch them on. A profile set to save to the 4K library files new titles there.
+  - **Your own libraries**: add movie and TV libraries (Stand-Up, Documentaries, Kids), each with its own folder. A title files into the library picked for it in Get / Manual search, else the first one whose genre or keyword rules match it, else the default library for its kind. The main and 4K folders are libraries too, so nothing changes until you add one. Each library can have its own default quality profile, and a movie can be wanted in two libraries at once (Movies and Movies 4K) as two copies that never replace each other. A library can search its own sources in its own order (Usenet then Torrent, say) and give its downloads their own client category, and search only the Prowlarr indexers you tick for it. Automatic search and upgrades can be switched off per library, and the Movies / TV list, the wishlist and the Downloads list filter by library.
+  - **Your library's folders**: every folder your Plex / Jellyfin libraries read, Movies or TV, asked from the server. The ones SoulSync already reaches are ticked; tell it where it reaches the rest (checked against a sample of real files) and each becomes a full library folder: files found, renamed to your templates, recycled into that drive's own bin, languages read.
   - A separate YouTube profile.
-- **Import**: sample and wrong-episode rejection, ffprobe checks, templated renames, NFO and artwork sidecars, subtitles, disk-space guards. Plus a **release blocklist** and a **recycle bin**.
+- **Import**: sample and wrong-episode rejection, ffprobe checks, templated renames (with `$audiolangs` / `$sublangs` for `[JA+EN]` style names), NFO and artwork sidecars, subtitles, disk-space guards. Plus a **release blocklist** and a **recycle bin**.
 - **Downloads page**: Downloads / Review / Clients views with live batches, a review queue and download-client management — the same setup as the music side.
 
 **Making it yours**
@@ -277,6 +288,14 @@ A complete video side with its own database, pages and pipeline. Switch sides fr
   - Smart-filter and list collections from TMDB, IMDb, Trakt and MDBList.
   - Presets, seasonal windows, generated artwork, and wishlisting missing members.
 - **Poster Manager** for TMDB posters, including textless ones.
+- **Library manager**: the Library page is your movies and shows three ways (posters, a sortable table of titles with the columns you pick, and a table of the files themselves).
+  - **Filters that manage**: missing, below your quality target, extra copies, unmatched, no subtitles, unmonitored, unwatched, locked, and by resolution, codec, HDR, audio and subtitle language, drive, library, quality profile, genre and year. Save any set as a named **view**.
+  - **Bulk operations** on a selection or on everything a filter matches: rename with a preview, **move to another drive or library** (a library can sit on many drives, and each is offered with its free space), quality profile, look for upgrades, get missing, fetch subtitles, identify again, genres, content rating, series type, collections, and delete with a preview and a typed count.
+  - **An editor for every title**: details with per-field locks, poster, quality profile, series type, and for a show an **Episodes** tab that files a run of episode files under the right season and episode (specials are season 0) and renames them to match.
+  - **History and undo**: every rename, move, delete and re-file made by hand is listed, and one click puts it back, a whole bulk run at once. A deleted file comes back owned while the recycle folder still holds it.
+  - **The padlock**: lock a title once it is the way you want it, and maintenance jobs, mass rename and automatic upgrades leave it and its files alone.
+  - **A page that keeps itself current**: opening a movie or show asks whichever source has gone stale, in the background. Your media server is asked about that one title (files and watch state), the metadata provider for what changed since it was matched (a show that ended or came back, new and renamed episodes, moved air dates, a movie's release date or collection), and the ratings. Each has its own clock, and a title still airing or just released is asked about more often than a settled one. The page redraws in place only if something moved, and **Refresh** asks all three now.
+  - **Manage a title from its own page**: a movie's or show's page carries the padlock, its **file history** with undo, and **Move to another drive or library**. A show's season has **Rename files**, **Renumber episodes** and **Delete files**, each showing what it will do first. Tick episodes (or the whole season) to rename, renumber, delete, look for upgrades, or **stop hunting** them, and stop the hunt for a single episode from its menu. A delete can stop the hunt for the episodes it empties, so a file you threw out is not fetched again. Every change leaves an **Undo** at the foot of the page.
 - **Maintenance jobs**: broken files, duplicates, naming, quality upgrades, watched cleanup and more, on the same Tools page as music (health score, findings inbox, fix-all in the background). Plus backups and mass rename.
 - **Server Activity**: a Tautulli-style live view of streams, history and stats.
 - **Watch Together** in chat: vote on a title and watch together.
@@ -303,11 +322,13 @@ A visual **WHEN → DO → THEN** builder shared by music and video.
   - Import listening history, run maintenance, clean up, back up.
   - Search & download, or run your own scripts.
 - **Then**: Discord, Telegram, Pushbullet, a webhook, a script, or a signal that chains into another automation, with per-step conditions and `{variables}`.
+- **One page to see it working**: the next 24 hours as a timeline, what needs attention (counted over the last day, not just the last run), the playlists that sync themselves, and an Activity view of what every automation did.
 - **Automation Hub**: install ready-made pipelines in one click, such as *Playlist Pipeline (All-in-One)*, *New Music Pipeline*, *Nightly Operations*, *Quality Assurance Pipeline* and *Full Hands-Free Pipeline*.
 
 ## Profiles & access
 
 - **Profiles** with avatars, PINs, a home page, page access, music / video access, and a download permission.
+- **Make SoulSync yours**: every profile picks what shows up, from **Customize** at the bottom of the sidebar (or Settings → Appearance). Start from **Simple** (music, Discover, playlists and import) or **Everything**, then switch single parts on or off: Discover, playlist sync, Explorer, Import, stats, music videos, Sample Studio, podcasts, audiobooks, the video side (or just its Discover and Calendar), chat, automations and tools. Hidden parts leave the sidebar, the dashboard and the tabs that lead to them, but keep working, unless an admin pauses podcast or audiobook jobs once every profile has hidden them. A link to one still opens, with a note that brings it back in one click. First-run setup starts you off with what you said SoulSync is for, and profiles from before ask once, right above the Customize button. Search, library, watchlist, wishlist, downloads and settings never hide.
 - Per-profile watchlists, wishlists, playlists, queues and listening history.
 - Non-admins get a **My Account** panel for their own Spotify, Tidal, ListenBrainz and Last.fm, and their own media-server identity (Plex Home user, Jellyfin / Navidrome login).
 - **Security**:
@@ -315,7 +336,7 @@ A visual **WHEN → DO → THEN** builder shared by music and video.
   - Sign in with Plex or with your own OIDC provider, or **OIDC only**, which turns every other sign-in off. If the provider is ever down, `SOULSYNC_OIDC_ONLY_OVERRIDE=off` and a restart let the admin back in with their password. Setup and troubleshooting: [docs/guides/OIDC.md](docs/guides/OIDC.md).
   - Or trust a forward-auth header from Authelia, Authentik or oauth2-proxy.
   - Reverse-proxy and sub-path aware.
-- **Own library per profile** (Plex / Jellyfin): a profile can have its own folder and server library.
+- **Own library per profile** (Plex / Jellyfin / Navidrome 0.58+): a profile can have its own folder and server library. On Navidrome the profile picks its library under its own Navidrome login; its scans read only that library and its playlists are written as that user.
 - **Content caps** (video): per-profile G / PG / PG-13 / R limits, enforced across the video side.
 
 ## Chat & arcade
@@ -549,7 +570,7 @@ Open `http://localhost:8008`. Setup finds your media server, slskd, Prowlarr and
 | Video | `/media/movies`, `/media/tv`, `/media/youtube` | Optional, for the video side |
 | Video extras | `/media/anime`, `/media/movies-4k`, `/media/tv-4k` | Optional: the anime and 4K libraries, commented out in the compose file |
 
-Useful environment variables: `PUID`, `PGID`, `UMASK`, `TZ`, `SOULSYNC_URL_BASE` (serve under a sub-path, see [docs/REVERSE_PROXY_SUBPATH.md](docs/REVERSE_PROXY_SUBPATH.md)), and `SOULSYNC_LOG_LEVEL`.
+Useful environment variables: `PUID`, `PGID`, `UMASK`, `TZ`, `SOULSYNC_URL_BASE` (serve under a sub-path, see [docs/REVERSE_PROXY_SUBPATH.md](docs/REVERSE_PROXY_SUBPATH.md)), `SOULSYNC_LOG_LEVEL`, and `SOULSYNC_GUNICORN_THREADS` (request threads, default 32; every open browser tab holds one for its websocket).
 
 ### 5. Sign in with OIDC (optional)
 

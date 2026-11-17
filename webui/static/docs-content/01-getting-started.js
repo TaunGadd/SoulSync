@@ -157,13 +157,17 @@ SoulSync uses a **sidebar navigation** layout. The left sidebar holds links to e
 - **Automations** — scheduled tasks and event-driven workflows
 - **Active Downloads** — live download queue with progress, candidates, and retries
 - **Library** — browse and manage your collection, standard or enhanced views
-- **Playlist Explorer** — build and explore playlists from your library
+- **Playlist Explorer** — build and explore playlists from your library (opens from the Playlists page)
 - **Stats** — listening stats and history
 - **Import** — import existing files with album/track matching
 - **Podcasts / Audiobooks** — spoken-word libraries
 - **Tools** — maintenance operations, repair jobs, backups, scanning
 - **Issues / Requests** — library problems to fix; track requests from other profiles
 - **Settings** — services, download preferences, quality profiles, and more
+
+## Show only what you use
+
+That's a lot of pages, and most people use a few. **Customize**, at the bottom of the sidebar, opens **Make SoulSync yours**. Pick **Simple** (music, Discover, playlists and import) or **Everything**, then switch single parts on or off. A part you switch off leaves the sidebar, the dashboard and the tabs that lead to it. It keeps working in the background, and it comes back with the same switch. Each profile picks its own. See [Show Only What You Use](#prof-features).
 
 ## Video side pages
 

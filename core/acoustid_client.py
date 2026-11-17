@@ -23,7 +23,7 @@ import shutil
 import logging
 import logging.handlers
 
-from utils.logging_config import get_logger
+from utils.logging_config import SafeFormatter, app_log_path, get_logger
 from core.settings import config_manager
 
 # fpcalc binary location (downloaded automatically if needed)
@@ -32,14 +32,14 @@ CHROMAPRINT_VERSION = "1.5.1"
 
 _acoustid_logger = logging.getLogger("soulsync.acoustid")
 _acoustid_logger.setLevel(logging.DEBUG)
-_acoustid_log_path = Path(config_manager.get('logging.path', 'logs/app.log')).parent / "acoustid.log"
+_acoustid_log_path = Path(app_log_path(config_manager.get('logging.path', 'logs/app.log'))).parent / "acoustid.log"
 _acoustid_log_path.parent.mkdir(parents=True, exist_ok=True)
 if not _acoustid_logger.handlers:
     _acoustid_file_handler = logging.handlers.RotatingFileHandler(
         _acoustid_log_path, encoding='utf-8', maxBytes=5*1024*1024, backupCount=2
     )
     _acoustid_file_handler.setLevel(logging.DEBUG)
-    _acoustid_file_handler.setFormatter(logging.Formatter(
+    _acoustid_file_handler.setFormatter(SafeFormatter(
         fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
@@ -243,20 +243,14 @@ class AcoustIDClient:
             return self._enabled
         return bool(config_manager.get('acoustid.enabled', False)) if config_manager else False
 
-    def is_available(self) -> Tuple[bool, str]:
-        """
-        Check if AcoustID verification is available and ready.
-
-        Returns:
-            Tuple of (is_available, reason_message)
-        """
+    def _ready(self, require_enabled: bool) -> Tuple[bool, str]:
         if not ACOUSTID_AVAILABLE:
             return False, "pyacoustid library not installed"
 
         if not self.api_key:
             return False, "No AcoustID API key configured"
 
-        if not self.enabled:
+        if require_enabled and not self.enabled:
             return False, "AcoustID verification is disabled"
 
         # Check if chromaprint or fpcalc is available
@@ -264,6 +258,28 @@ class AcoustIDClient:
             return False, "Chromaprint library not installed (install libchromaprint1)"
 
         return True, "AcoustID verification ready"
+
+    def is_available(self) -> Tuple[bool, str]:
+        """
+        Check if AcoustID verification is available and ready.
+
+        This is the answer for anything SoulSync does on its own: checking a
+        new download, the background matcher. It needs the setting on.
+
+        Returns:
+            Tuple of (is_available, reason_message)
+        """
+        return self._ready(require_enabled=True)
+
+    def can_fingerprint(self) -> Tuple[bool, str]:
+        """can this install fingerprint a file and look it up: the library, a
+        key, chromaprint. it doesn't ask whether download verification is on.
+
+        that setting means "check every new download", and it used to gate
+        everything. turning it off also killed the scan and the fingerprint
+        button a person starts by hand, which is exactly what someone who
+        turned it off to check later wants to run (#2042)."""
+        return self._ready(require_enabled=False)
 
     def _check_fingerprint_available(self) -> bool:
         """Check if we can generate fingerprints (chromaprint lib or fpcalc)."""

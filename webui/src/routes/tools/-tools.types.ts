@@ -124,6 +124,16 @@ export interface RepairFinding {
   created_at?: string | null;
   user_action?: string | null;
   last_error?: string | null;
+  /** #2046: its album or artist is reviewed and locked. a bulk fix leaves
+   *  it alone; Fix on the row itself still works */
+  locked?: { entity_type: 'album' | 'artist'; entity_id: number } | null;
+  /** the cover and artist picture to show beside the row, looked up by the
+   *  server from the catalogue when the finding stored none */
+  album_thumb_url?: string | null;
+  artist_thumb_url?: string | null;
+  /** an open re-tag finding: every tag Apply Tags would change, with the
+   *  value in the file beside the one the library holds */
+  preview?: unknown;
   /** Per-finding-type payload. Deliberately unknown — every one of the 20
    *  renderers reads a different set of keys. */
   details?: Record<string, unknown> | null;
@@ -158,6 +168,9 @@ export interface BulkFixStatus {
   /** Findings held back by design (e.g. the album completeness gate),
    *  tallied apart from failures. */
   skipped?: number;
+  /** Re-tag findings whose blank tags were filled while a tag that differs
+   *  was left for a person: still open, and not a failure. */
+  partial?: number;
   /** Tracks the album gate held back across the run, including on
    *  findings that otherwise fixed successfully. */
   other_artist_skipped?: number;
@@ -173,6 +186,15 @@ export type DeadFileFixAction = 'redownload' | 'remove';
 export type AcoustidFixAction = 'retag' | 'relocate' | 'redownload' | 'delete';
 export type QualityFixAction = 'redownload' | 'delete' | 'ignore';
 export type BackfillFixAction = 'add_to_wishlist' | 'dismiss';
+/** `safe` keeps a field the user set by hand, which is the default everywhere
+ *  in Library v2; `overwrite_manual` deliberately hands it back to the
+ *  catalogue. Sent as the finding's `fix_action`, per row or per group.
+ *
+ *  A bulk run only fills blank tags. `replace_differences` is the one answer
+ *  that lets it replace a tag a file already has (RETAG_REPLACE_ACTION in
+ *  core/repair_worker.py); a single finding applied on its own row replaces
+ *  without it, because both values are in front of the person. */
+export type RetagFixAction = 'safe' | 'overwrite_manual' | 'replace_differences';
 
 // ── Cache health ─────────────────────────────────────────────────────────────
 

@@ -133,6 +133,16 @@ def _discover_dial_key():
         return '0.3'
 
 
+def _discover_source_key():
+    """The active metadata source, for shelves drawn from it. without it a
+    source switch kept serving the old source's ids until the warmer's next
+    pass or the 30-minute ttl (review 5 W3-TB-3)."""
+    try:
+        return _get_active_discovery_source()
+    except Exception:
+        return 'unknown'
+
+
 def _discover_rank_key():
     """The two re-ranked artist shelves: the dial, and this profile's more /
     less feedback, so an answer re-ranks that profile's shelf and no other."""
@@ -146,6 +156,15 @@ get_database = None
 config_manager = None
 download_orchestrator = None
 _get_active_discovery_source = None
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
+
 _spotify_client = None
 _tidal_client = None
 _hydrabase_client = None
@@ -709,6 +728,10 @@ def _autostart_popularity_backfill():
     _t.sleep(90)  # let the server finish its own startup work first
     while True:
         try:
+            from core.library2.migration_gate import migration_required
+            if migration_required(get_database()):
+                _t.sleep(30)
+                continue
             _popularity_backfill_tick()
         except Exception as e:
             logger.debug(f"popularity backfill tick skipped: {e}")
@@ -1310,13 +1333,20 @@ def _profile_count(database) -> int:
 
 
 def _artist_thumb(database, name):
+    """Seed image for a legacy BYLT slot, read from the v2 catalogue.
+
+    Upstream reads `artists.thumb_url` here; that table is gone. The key is
+    the folded name rather than LOWER(name) for the reason _catalogue_name_key
+    documents - SQLite's LOWER() is ASCII-only, so a stored "Bjork" spelled
+    with the diacritic never answered its own lookup (iss29-D13).
+    """
     if not name:
         return None
     try:
         with database._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT thumb_url FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1",
-                        (name,))
+            cur.execute("SELECT image_url FROM lib2_artists WHERE name_key = ? LIMIT 1",
+                        (_catalogue_name_key(name),))
             row = cur.fetchone()
             return row[0] if row and row[0] else None
     except Exception as e:
@@ -1343,6 +1373,39 @@ def _bylt_owned_lookup(database, sections):
         return None
 
 
+def _owned_album_keys_for(conn, artist_names):
+    """album_presence_key of every album you own by these artists.
+
+    the shelf only ever drops albums by its 25 top artists, so it asks for
+    those artists' albums and not the whole library's: 70k album keys and an
+    ownership check on each was 3.9s live (Nov 4 2026). names fold in python
+    because sqlite's LOWER only folds ascii, and a listened "Björk" has to
+    meet the library's "BJÖRK" (and a "Bjork"). the key is the one the shelf
+    folds its candidates with, so punctuation and a pressing tag never make
+    an owned album look missing (#2083). ownership is the asker's own library."""
+    from core.library2.sql_util import owned_sql
+    from core.wishlist.presence import album_presence_key, artist_presence_key
+
+    wanted = {artist_presence_key(n) for n in artist_names if n}
+    if not wanted:
+        return set()
+    ids = [int(r[0]) for r in conn.execute("SELECT id, name FROM lib2_artists")
+           if r[1] and artist_presence_key(r[1]) in wanted]
+    keys = set()
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        rows = conn.execute(f"""
+            SELECT al.title, ar.name
+              FROM lib2_albums al
+              JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+             WHERE al.primary_artist_id IN ({','.join('?' * len(chunk))})
+               AND al.title IS NOT NULL
+               AND {owned_sql('album', 'al')}
+        """, chunk)
+        keys.update(album_presence_key(t, a) for t, a in rows)
+    return keys
+
+
 @bp.route('/api/discover/undiscovered-albums', methods=['GET'])
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
@@ -1361,12 +1424,7 @@ def get_discover_undiscovered_albums():
 
         # Build library album keys for exclusion
         with database._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT LOWER(al.title), LOWER(ar.name)
-                FROM albums al JOIN artists ar ON ar.id = al.artist_id
-            """)
-            library_keys = {(r[0].strip(), r[1].strip()) for r in cursor.fetchall()}
+            library_keys = _owned_album_keys_for(conn, artist_names)
 
         albums = cache.get_undiscovered_albums(artist_names, library_keys, source=active_source, limit=20)
         return jsonify({'success': True, 'albums': albums})
@@ -1419,7 +1477,7 @@ def get_discover_label_explorer():
 @_hide_blocked({'tracks': WORKS})
 @_discover_shelf_cache()
 def get_discover_deep_cuts():
-    """Low-popularity tracks from artists you listen to — from cache."""
+    """Low-popularity tracks by the artists you listen to — from cache."""
     try:
         database = get_database()
         cache = get_metadata_cache()
@@ -1968,6 +2026,9 @@ def get_decade_playlist(decade):
 @bp.route('/api/discover/popular-picks', methods=['GET'])
 @bp.route('/api/discover/personalized/popular-picks', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_popular_picks_playlist():
     """Get high popularity tracks from discovery pool"""
     try:
@@ -1990,6 +2051,9 @@ def get_popular_picks_playlist():
 @bp.route('/api/discover/hidden-gems', methods=['GET'])
 @bp.route('/api/discover/personalized/hidden-gems', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_hidden_gems_playlist():
     """Get hidden gems (low popularity) from discovery pool"""
     try:
@@ -2112,6 +2176,9 @@ def get_mood_mixes():
 @bp.route('/api/discover/discovery-shuffle', methods=['GET'])
 @bp.route('/api/discover/personalized/discovery-shuffle', methods=['GET'])
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_discovery_shuffle():
     """Get Discovery Shuffle playlist - random tracks from discovery pool"""
     try:
@@ -3185,28 +3252,46 @@ def get_your_artist_info(artist_id):
             database = get_database()
             conn = database._get_connection()
             cursor = conn.cursor()
-            # Check by various ID columns
-            cursor.execute("""
-                SELECT * FROM artists WHERE id = ? OR spotify_artist_id = ? OR itunes_artist_id = ?
-                OR deezer_id = ? OR discogs_id = ? LIMIT 1
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-            row = cursor.fetchone()
+            # by the provider ids the card carries, never the catalogue row
+            # id: a Deezer id like 13 is not lib2 artist 13 (a stranger). the
+            # canonical row wins, and a name the card sent has to agree
+            from core.library2.importer import normalize_name
+            from core.library2.provider_ids import indexed_provider_id_sql
+            row = None
+            for source in ("spotify", "itunes", "deezer", "discogs"):
+                expression = indexed_provider_id_sql(source)
+                if not expression:
+                    continue
+                cursor.execute(
+                    f"SELECT * FROM lib2_artists WHERE {expression} = ? "
+                    "ORDER BY (canonical_artist_id IS NOT NULL), id LIMIT 1", (str(artist_id),))
+                found = cursor.fetchone()
+                if found and (not artist_name
+                              or normalize_name(found["name"] or "") == normalize_name(artist_name)):
+                    row = found
+                    break
             if row:
                 r = dict(row)
+                from core.library2.provider_ids import parse_external_ids
+                ids = parse_external_ids(r.get('external_ids'))
+                try:
+                    lastfm = (json.loads(r.get('enrichment') or '{}').get('lastfm') or {})
+                except (TypeError, ValueError):
+                    lastfm = {}
                 result.update({
                     'name': r.get('name', artist_name),
                     'genres': json.loads(r['genres']) if r.get('genres') else [],
                     'summary': r.get('summary', ''),
-                    'image_url': r.get('thumb_url', ''),
-                    'spotify_artist_id': r.get('spotify_artist_id'),
+                    'image_url': r.get('image_url', ''),
+                    'spotify_artist_id': r.get('spotify_id'),
                     'musicbrainz_id': r.get('musicbrainz_id'),
-                    'deezer_id': r.get('deezer_id'),
-                    'itunes_artist_id': r.get('itunes_artist_id'),
-                    'discogs_id': r.get('discogs_id'),
-                    'lastfm_url': r.get('lastfm_url'),
-                    'tidal_id': r.get('tidal_id'),
-                    'lastfm_listeners': r.get('lastfm_listeners', 0),
-                    'lastfm_playcount': r.get('lastfm_playcount', 0),
+                    'deezer_id': ids.get('deezer'),
+                    'itunes_artist_id': ids.get('itunes'),
+                    'discogs_id': ids.get('discogs'),
+                    'lastfm_url': ids.get('lastfm') or lastfm.get('url'),
+                    'tidal_id': ids.get('tidal'),
+                    'lastfm_listeners': lastfm.get('listeners', 0),
+                    'lastfm_playcount': lastfm.get('playcount', 0),
                 })
                 return jsonify(result)
         except Exception as e:
@@ -3411,16 +3496,29 @@ def serve_cached_image(cache_key):
         response.headers['X-SoulSync-Image-Cache'] = cached.status
         return response
     except Exception as exc:
-        logger.debug("cached image serve failed for %s: %s", cache_key, exc)
+        # An empty 404 made every distinct failure look identical from the
+        # browser — "key not found", "upstream refused", "host unreachable" and
+        # "not an image" were indistinguishable, so a production report could
+        # only say "218 images 404" without saying why. The reason travels in a
+        # header (secrets redacted) rather than a body so nothing about the
+        # response contract changes for the <img> that requested it.
+        from core.metadata.artwork import _redact_url_secrets
+        reason = ' '.join(_redact_url_secrets(str(exc)).split())[:200] \
+            or exc.__class__.__name__
+        logger.debug("cached image serve failed for %s: %s", cache_key, reason)
         try:
+            # send the browser to the original instead of a 404 (#1763), but
+            # never hand it a URL that carries a server token
             from core.image_cache import get_image_cache
-            cache = get_image_cache()
-            orig_url = cache.get_original_url(cache_key)
-            if orig_url:
+            orig_url = get_image_cache().get_original_url(cache_key)
+            if orig_url and _redact_url_secrets(orig_url) == orig_url:
                 return redirect(orig_url, code=302)
         except Exception as redirect_exc:
             logger.debug("original URL redirect lookup failed for %s: %s", cache_key, redirect_exc)
-        return '', 404
+        response = Response('', status=404)
+        response.headers['X-SoulSync-Image-Error'] = reason
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 from core.artists.map import (
@@ -3569,6 +3667,23 @@ def generate_custom_playlist():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
+# served by idx_discovery_pool_profile_release, which covers it: without that
+# every call read each pool row in full to reach release_date (6.9s live)
+AVAILABLE_DECADES_SQL = """
+    SELECT DISTINCT
+        (CAST(SUBSTR(release_date, 1, 4) AS INTEGER) / 10) * 10 as decade,
+        COUNT(*) as track_count
+    FROM discovery_pool
+    WHERE release_date IS NOT NULL
+      AND profile_id = ?
+      AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) >= 1950
+      AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) <= 2029
+    GROUP BY decade
+    HAVING track_count >= 10
+    ORDER BY decade ASC
+"""
+
+
 @bp.route('/api/discover/decades/available', methods=['GET'])
 @_discover_shelf_cache()
 def get_available_decades():
@@ -3580,19 +3695,7 @@ def get_available_decades():
             cursor = conn.cursor()
 
             # Get distinct decades from discovery pool
-            cursor.execute("""
-                SELECT DISTINCT
-                    (CAST(SUBSTR(release_date, 1, 4) AS INTEGER) / 10) * 10 as decade,
-                    COUNT(*) as track_count
-                FROM discovery_pool
-                WHERE release_date IS NOT NULL
-                  AND profile_id = ?
-                  AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) >= 1950
-                  AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) <= 2029
-                GROUP BY decade
-                HAVING track_count >= 10
-                ORDER BY decade ASC
-            """, (get_current_profile_id(),))
+            cursor.execute(AVAILABLE_DECADES_SQL, (get_current_profile_id(),))
 
             rows = cursor.fetchall()
             decades = []
