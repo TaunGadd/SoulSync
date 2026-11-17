@@ -67,6 +67,11 @@ _artwork_cache_state: Dict[str, Any] = {
 # monitor/upgrade/retag may run concurrently without overwriting each other.
 _job_registry = JobRegistry()
 
+# the integrity report runs as a job: how long a request waits for it before
+# answering 202, and how long a finished report is served again
+_INTEGRITY_REPORT_WAIT_S = 1.5
+_INTEGRITY_REPORT_FRESH_S = 60 * 60
+
 # A11: how long lib2_write_tags waits out an already-running "retag" job
 # (most commonly its own just-triggered cover-embed background job, see
 # lib2_album_art_apply) before falling back to a 409. Module-level so tests
@@ -95,6 +100,23 @@ _OWN_LIBRARY_WISH_ENDPOINTS = frozenset({
     # "All Releases" of an artist in the library: browsable, unmonitored
     # catalogue rows -- what a wish is made from, no file touched
     "lib2_discography_refresh",
+    # an artist's watchlist settings: the caller's own watchlist row (3.6.1's
+    # /api/watchlist/artist/<id>/config); the shared monitor_new_items column
+    # stays the admin's (the route drops it for anyone else)
+    "lib2_artist_settings",
+})
+# Wishes that start a download right away, not just a wishlist entry.
+_DOWNLOADING_ENDPOINTS = frozenset({"lib2_scoped_search", "lib2_enhance_quality"})
+
+# Writes that touch files and nothing every library shares: a profile with a
+# library of its own may run them on files that are all its own (3.6.1 let
+# every profile tag and loudness-tag). Catalogue rows (matches, metadata
+# fills) stay the admin's: one row serves every library.
+_OWN_LIBRARY_FILE_ENDPOINTS = frozenset({
+    "lib2_track_file_tags_edit",
+    "lib2_album_replaygain",
+    "lib2_track_replaygain",
+    "lib2_write_tags",
 })
 _PROFILE_TABLES = {"artists": "lib2_artists", "albums": "lib2_albums", "tracks": "lib2_tracks"}
 
@@ -205,7 +227,7 @@ def _start_artwork_cache(get_database: Callable[[], Any], config_manager: Any) -
             with _artwork_cache_lock:
                 _artwork_cache_state["stats"] = stats
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Library v2 background artwork cache failed: %s", exc)
+            logger.warning("Library background artwork cache failed: %s", exc)
             with _artwork_cache_lock:
                 _artwork_cache_state["error"] = str(exc)
         finally:
@@ -218,7 +240,7 @@ def _start_artwork_cache(get_database: Callable[[], Any], config_manager: Any) -
     try:
         threading.Thread(target=carrying_scope(_run), name="lib2-artwork-cache", daemon=True).start()
     except Exception as exc:  # noqa: BLE001 - optional presentation worker
-        logger.warning("Could not start Library v2 artwork cache worker: %s", exc)
+        logger.warning("Could not start Library artwork cache worker: %s", exc)
         with _artwork_cache_lock:
             _artwork_cache_state.update(
                 running=False,
@@ -302,7 +324,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         try:
             return bool(profile_page_allowed_getter("library"))
         except Exception as exc:  # noqa: BLE001 - fail closed on auth lookup errors
-            logger.warning("Library v2 profile permission lookup failed: %s", exc)
+            logger.warning("Library profile permission lookup failed: %s", exc)
             return False
 
     def _guard():
@@ -323,10 +345,18 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             # the admin's. Everything that changes files or shared metadata
             # stays with the admin.
             if request.endpoint in _OWN_LIBRARY_WISH_ENDPOINTS and _can_wish():
+                # a search downloads: a household member who asks first
+                # wishes (their wishlist becomes requests) but never grabs
+                if request.endpoint in _DOWNLOADING_ENDPOINTS and not _may_download():
+                    return _fail("Your profile asks before downloading: add it to your "
+                                 "Wishlist and an admin approves the request", 403)
+                return _named_row_hidden()
+            if (request.endpoint in _OWN_LIBRARY_FILE_ENDPOINTS and _wishes_in_own()
+                    and _touches_only_own_files()):
                 return _named_row_hidden()
             if request.endpoint == "lib2_update_ui_preferences" and _own_preferences_only():
                 return None
-            return _fail("Library v2 changes require the admin profile", 403)
+            return _fail("Library changes require the admin profile", 403)
         # E-06: for a profile, another library's row does not exist -- its
         # page, its tags, its history alike
         return _named_row_hidden()
@@ -389,17 +419,70 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         try:
             from core.library2.sql_util import entity_visible
             return not entity_visible(conn, entity, entity_id)
-        except Exception as exc:  # noqa: BLE001 - an unanswerable check hides nothing
-            logger.debug("scope visibility check failed for %s %s: %s", entity, entity_id, exc)
-            return False
-
-    def _can_wish() -> bool:
-        """May the caller monitor and search in the library it is looking at?
-        The admin anywhere; any other profile only in a library of its own."""
-        if _is_admin():
+        except Exception as exc:  # noqa: BLE001
+            # third #1062 review G03-7: fail closed. answering "visible" opened
+            # every own library's pages to every profile on any bug here
+            # (3.6.1's scope lived in the SQL, so a failure was a 500)
+            logger.warning("scope visibility check failed for %s %s: %s", entity, entity_id, exc,
+                           exc_info=True)
             return True
+
+    def _touches_only_own_files() -> bool:
+        """Every live file this file-write would touch belongs to the caller.
+        False when it names no file, or any file of another library."""
+        args = request.view_args or {}
+        with closing(_conn()) as conn:
+            if "track_id" in args:
+                track_ids = [int(args["track_id"])]
+            elif "album_id" in args:
+                track_ids = [r[0] for r in conn.execute(
+                    "SELECT id FROM lib2_tracks WHERE album_id=?", (int(args["album_id"]),))]
+            else:
+                body = request.get_json(silent=True) or {}
+                raw = body.get("track_ids") if isinstance(body, dict) else None
+                if not isinstance(raw, list) or not raw or any(
+                        isinstance(t, bool) or not isinstance(t, int) for t in raw):
+                    return False
+                track_ids = raw
+            if not track_ids:
+                return False
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN owner_profile_id = ? THEN 1 ELSE 0 END)"
+                "  FROM lib2_track_files"
+                " WHERE track_id IN (SELECT value FROM json_each(?))"
+                "   AND COALESCE(file_state,'active') NOT IN ('deleted','missing_confirmed')",
+                (int(_profile()), json.dumps([int(t) for t in track_ids]))).fetchone()
+        total, own = int(row[0] or 0), int(row[1] or 0)
+        return total > 0 and own == total
+
+    def _wishes_in_own() -> bool:
+        """E-13: a non-admin wishing in a library of its own"""
         from core.library_scope import wishes_in_own_library
         return wishes_in_own_library(_profile(), get_database())
+
+    def _can_wish() -> bool:
+        """May the caller monitor (watch, wishlist) in the library it reads?
+        The admin anywhere; a profile in a library of its own; and a
+        household member in the shared library, on their own watchlist and
+        wishlist (``intent_profile_id``), as 3.6.1 had it."""
+        if _is_admin():
+            return True
+        if _wishes_in_own():
+            return True
+        from core.library2.sql_util import shared_library_member
+        return shared_library_member() is not None
+
+    def _may_download() -> bool:
+        """may the caller start a download (not just a request)?"""
+        if _is_admin():
+            return True
+        try:
+            # review 4 R4-D-6: a profile that no longer exists (a stale
+            # session) is no profile, not one allowed to download
+            profile = get_database().get_profile(_profile())
+            return bool(profile and profile.get("can_download", 1))
+        except Exception:  # noqa: BLE001 - unreadable profile: a request, never a grab
+            return False
 
     def _conn():
         return get_database()._get_connection()
@@ -458,8 +541,10 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
     def _profile() -> int:
         try:
             return int(profile_id_getter()) if profile_id_getter else 1
-        except Exception:
-            return 1
+        except Exception as exc:  # noqa: BLE001
+            # G03-7: an unreadable profile is nobody, never the admin
+            logger.warning("Library: could not read the calling profile: %s", exc)
+            return 0
 
     def _intent_profile() -> int:
         """The profile whose intent a mutation on this page writes.
@@ -655,6 +740,12 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             "can_write": _is_admin(),
             # E-13: monitor/search in a library of one's own
             "can_wish": _can_wish(),
+            # a wish that downloads right away (Automatic Search) needs this
+            "can_download": _may_download(),
+            # a grab for a library track straight from its Interactive Search
+            # (the server's profile_may_grab: the admin, or a profile in a
+            # library of its own); everyone else grabs through the inspector
+            "can_grab": _is_admin() or _wishes_in_own(),
         })
 
     # -- acquisition requests / decisions (Phase 4) -------------------------
@@ -1546,10 +1637,15 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             return _fail("page/limit must be integers")
         if page < 1 or not 1 <= limit <= 500:
             return _fail("page must be positive and limit must be between 1 and 500")
+        try:
+            # #2106: one artist's missing tracks, from their completeness count
+            artist_id = int(request.args.get("artist") or 0) or None
+        except (TypeError, ValueError):
+            return _fail("artist must be an integer")
         with closing(_conn()) as conn:
             lister = WV.list_missing if kind == "missing" else WV.list_cutoff_unmet
             rows, total = lister(conn, search=search, page=page, limit=limit,
-                                 profile_id=_intent_profile())
+                                 profile_id=_intent_profile(), artist_id=artist_id)
         total_pages = (total + limit - 1) // limit if limit else 0
         return jsonify({
             "success": True,
@@ -1679,13 +1775,26 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             # the old library page's filters: alphabet bar, has/no provider
             # id, and "could be better" (the live quality evaluator)
             quality = request.args.get("quality", "")
+            # #2106/#2107: completeness filters, sort direction, credit-only artists
+            from core.library2.artist_completeness import completeness_filters
+            completeness = completeness_filters(
+                completion=request.args.get("completion", ""),
+                missing_min=request.args.get("missing_min"),
+                missing_max=request.args.get("missing_max"),
+                pct_min=request.args.get("pct_min"),
+                pct_max=request.args.get("pct_max"))
             artists, total = Q.list_artists(conn, search=search, sort=sort,
                                             monitored=monitored, page=page, limit=limit,
                                             include_size="size" in include,
                                             letter=(request.args.get("letter") or "all").lower(),
                                             source_filter=request.args.get("source", ""),
                                             quality_filter=quality if quality == "upgradable" else "",
-                                            include_upgradable="upgradable" in include)
+                                            include_upgradable="upgradable" in include,
+                                            # #2046: reviewed | unreviewed
+                                            review_filter=request.args.get("review", ""),
+                                            direction=request.args.get("dir", ""),
+                                            completeness=completeness,
+                                            credit=request.args.get("credit", ""))
         for a in artists:
             _apply_artwork_urls(a, "artist")
         total_pages = (total + limit - 1) // limit if limit else 0
@@ -1698,6 +1807,45 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 "has_prev": page > 1, "has_next": page < total_pages,
             },
         })
+
+    @_route("/api/library/v2/artists/ids")
+    def lib2_list_artist_ids():
+        """#2109: every artist id the list's filters match, in list order, for
+        "select all" on the Library page. The same filters as the list."""
+        from core.library2.artist_completeness import completeness_filters
+        from core.library2.artist_reader import read_artist_page
+        quality = request.args.get("quality", "")
+        with closing(_conn()) as conn:
+            rows, total = read_artist_page(
+                conn, search=request.args.get("search", ""),
+                sort=request.args.get("sort", "name"),
+                monitored=request.args.get("monitored", "all"),
+                include_size=False,
+                letter=(request.args.get("letter") or "all").lower(),
+                source_filter=request.args.get("source", ""),
+                quality_filter=quality if quality == "upgradable" else "",
+                review_filter=request.args.get("review", ""),
+                direction=request.args.get("dir", ""),
+                completeness=completeness_filters(
+                    completion=request.args.get("completion", ""),
+                    missing_min=request.args.get("missing_min"),
+                    missing_max=request.args.get("missing_max"),
+                    pct_min=request.args.get("pct_min"),
+                    pct_max=request.args.get("pct_max")),
+                credit=request.args.get("credit", ""),
+                ids_only=True)
+        return jsonify({"success": True, "ids": [r["id"] for r in rows], "total": total})
+
+    @_route("/api/library/v2/artists/overview")
+    def lib2_artist_overview():
+        """#2107: the library at a glance, for the overview above the list.
+        ``part=upgrades`` is the could-be-better count on its own: it can take
+        a while the first time, so the rest never waits for it."""
+        from core.library2.library_overview import library_overview, upgrades_overview
+        with closing(_conn()) as conn:
+            if request.args.get("part") == "upgrades":
+                return jsonify({"success": True, **upgrades_overview(conn)})
+            return jsonify({"success": True, **library_overview(conn, profile_id=_profile())})
 
     @_route("/api/library/v2/artists/upgradable-counts")
     def lib2_artist_upgradable_counts():
@@ -1978,13 +2126,17 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 # 320k tracks where each branch on its own is an index seek
                 # (perf-audit PERF-08). Each half is now separately indexable
                 # and UNION does the de-duplication DISTINCT used to.
+                # the caller's bookmark, not the shared column: a member's
+                # and an own library's live in their rules (review 5 R5-B-3)
+                from core.library2.sql_util import monitored_sql
+                mon = monitored_sql("track", "t")
                 rows = conn.execute(
-                    f"""SELECT t.id, t.title, t.monitored
+                    f"""SELECT t.id, t.title, {mon} AS monitored
                           FROM lib2_tracks t
                           JOIN lib2_track_artists ta ON ta.track_id = t.id
                          WHERE ta.artist_id IN ({marks})
                         UNION
-                        SELECT t.id, t.title, t.monitored
+                        SELECT t.id, t.title, {mon} AS monitored
                           FROM lib2_tracks t
                           JOIN lib2_albums al ON al.id = t.album_id
                          WHERE al.primary_artist_id IN ({marks})""",
@@ -2199,6 +2351,14 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 database = get_database()
                 worker_conn = database._get_connection()
                 from core.library2.completeness import load_album_catalogue
+                from core.library2.mirror_outbox import drain_since, queue_mark
+                # the landed tracks queue a member's wish for their wishlist
+                # (review 5 R5-B-1): deliver it now, not at the hourly reconcile
+                try:
+                    mark = queue_mark(worker_conn)
+                except Exception as e:  # noqa: BLE001 - no outbox: nothing to deliver
+                    logger.debug("tracklist resolve outbox mark failed (%s): %s", album_id, e)
+                    mark = None
                 # the tracklist lands (and the polling page shows it) before
                 # the slow all-services enrichment runs
                 resolved = load_album_catalogue(
@@ -2213,6 +2373,8 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                         "UPDATE lib2_albums SET tracklist_status='failed' "
                         "WHERE id=? AND tracklist_status='pending'", (album_id,))
                     worker_conn.commit()
+                elif mark is not None:
+                    drain_since(database, mark)
             except Exception as e:  # noqa: BLE001
                 logger.debug("background tracklist resolve failed (%s): %s", album_id, e)
             finally:
@@ -2455,6 +2617,46 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             bundle = album_match_bundle(conn, album_id, available_services=available)
         return jsonify({"success": True, **bundle})
 
+    @_route("/api/library/v2/albums/<int:album_id>/versions")
+    def lib2_album_versions(album_id):
+        """#2145: the album's other versions (musicbrainz release group + the
+        primary source's same-title releases). ``?q=`` searches this artist."""
+        from core.library2 import album_versions
+        query = request.args.get("q")
+        if query is not None:
+            payload = album_versions.search_versions(get_database(), album_id, query)
+        else:
+            payload = album_versions.list_versions(get_database(), album_id)
+        if payload is None:
+            return _fail("Album not found", 404)
+        return jsonify({"success": True, **payload})
+
+    @_route("/api/library/v2/albums/<int:album_id>/versions/preview", methods=["POST"])
+    def lib2_album_version_preview(album_id):
+        """What switching to one version changes, before anything is written."""
+        from core.library2.album_versions import preview_version
+        body = request.get_json(silent=True) or {}
+        payload = preview_version(get_database(), album_id, body.get("source"),
+                                  body.get("release_id"))
+        return jsonify(payload), (200 if payload.get("success") else 400)
+
+    @_route("/api/library/v2/albums/<int:album_id>/versions/apply", methods=["POST"])
+    def lib2_album_version_apply(album_id):
+        """Point the album at the picked version: the manual album match (#758)."""
+        from core.library2.album_versions import apply_version
+        body = request.get_json(silent=True) or {}
+        payload = apply_version(get_database(), album_id, body.get("source"),
+                                body.get("release_id"), actor=f"profile:{_profile()}")
+        if not payload.get("success"):
+            return jsonify(payload), 400
+        from core.enrichment.unmatched import invalidate_unmatched_snapshots
+        invalidate_unmatched_snapshots()
+        # the new release's guests, same as a manual match
+        from core.library2.provider_credits import schedule_match_credits
+        schedule_match_credits(get_database(), "album", album_id, payload["source"],
+                               payload["release_id"])
+        return jsonify(payload)
+
     @_route(
         "/api/library/v2/<entity_type>/<int:entity_id>/manual-match",
         methods=["PUT", "DELETE"],
@@ -2480,6 +2682,9 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                                           watchlist_row_id=body.get("watchlist_row_id"),
                                           profile_id=_profile())
             conn.commit()
+            # the enrichment modal's unmatched list (review 5 R5-D-1)
+            from core.enrichment.unmatched import invalidate_unmatched_snapshots
+            invalidate_unmatched_snapshots()
         except WatchlistMismatch as exc:
             conn.rollback()
             return _fail(str(exc), 409)
@@ -2669,6 +2874,20 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             result = enqueue_artist_reorganize_all(get_database(), artist_id)
         except ReorganizeBridgeError as exc:
             return _fail(str(exc), exc.status)
+        return jsonify({"success": True, **result})
+
+    @_route("/api/library/v2/artists/<int:artist_id>/rename-check")
+    def lib2_artist_rename_check(artist_id):
+        """#2141: how many files of each album Preview rename would move, one
+        time-bounded slice at a time (``?start=`` from the last ``next``)."""
+        from core.library2.rename_check import check_artist_renames
+
+        # renaming is the admin's, so is the hint that offers it
+        if not _is_admin():
+            return jsonify({"success": True, "enabled": False, "reason": "admin",
+                            "albums": {}, "tracks": [], "next": None, "total": 0})
+        start = request.args.get("start", default=0, type=int) or 0
+        result = check_artist_renames(get_database(), config_manager, artist_id, start=start)
         return jsonify({"success": True, **result})
 
     @_route("/api/library/v2/quality-profiles/sync", methods=["POST"])
@@ -2951,12 +3170,14 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             # HTML 500, which the client renders as an unexplained "API error"
             # for an operation that is simply worth retrying.
             conn.rollback()
-            logger.warning("Library v2 album art apply hit a locked database: %s", exc)
+            logger.warning("Library album art apply hit a locked database: %s", exc)
             return _fail("The database is busy right now — try again in a moment.", 503)
         finally:
             conn.close()
         if not ok:
-            return _fail("Could not download or validate that image URL")
+            from core.library2.artwork import remote_artwork_failure
+            return _fail(remote_artwork_failure(url)
+                         or "Could not download or validate that image URL")
 
         # A1: a picked cover only lands in the DB/cache above — without this,
         # existing files keep their old embedded art forever (build_tag_diff
@@ -2986,24 +3207,29 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                         try:
                             def _progress(_stage, current, total):
                                 _job_registry.update(job_id, current=current, total=total)
-                            stats = retag.write_tags(db, track_ids, embed_cover=True,
-                                                     force_cover=True, progress=_progress)
+                            # the cover only: without options this took the
+                            # Write Tags path and rewrote every text tag of
+                            # every track for a cover pick
+                            stats = retag.write_tags(
+                                db, track_ids, embed_cover=True, progress=_progress,
+                                options={'fields': ['cover_art'], 'cover_art': 'replace'})
                             _job_registry.update(job_id, result=stats)
                         except Exception as e:  # noqa: BLE001
-                            logger.error("Library v2 cover-embed retag failed: %s", e, exc_info=True)
+                            logger.error("Library cover-embed retag failed: %s", e, exc_info=True)
                             _job_registry.update(job_id, error=str(e))
                         finally:
                             _job_registry.finish(job_id)
 
                     threading.Thread(target=carrying_scope(_run), name="lib2-cover-embed", daemon=True).start()
         except Exception as e:  # noqa: BLE001
-            logger.error("Library v2 cover-embed scheduling failed: %s", e, exc_info=True)
+            logger.error("Library cover-embed scheduling failed: %s", e, exc_info=True)
             embed_error = str(e)
 
         payload = {
             "success": True,
             "album_id": album_id,
             "image_url": _artwork_url("album", album_id),
+            **_outbound_art("album", album_id),
         }
         if embed_error:
             payload["embed_warning"] = (
@@ -3114,16 +3340,34 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         except sqlite3.OperationalError as exc:
             # dd28-03: see the matching handler on the album art route.
             conn.rollback()
-            logger.warning("Library v2 artist art apply hit a locked database: %s", exc)
+            logger.warning("Library artist art apply hit a locked database: %s", exc)
             return _fail("The database is busy right now — try again in a moment.", 503)
         finally:
             conn.close()
         if not ok:
-            return _fail("Could not download or validate that image URL")
+            from core.library2.artwork import remote_artwork_failure
+            return _fail(remote_artwork_failure(url)
+                         or "Could not download or validate that image URL")
         return jsonify({
             "success": True, "artist_id": artist_id,
             "image_url": _artwork_url("artist", artist_id),
+            **_outbound_art("artist", artist_id),
         })
+
+    def _outbound_art(kind: str, entity_id: int) -> dict:
+        """the picked image beyond SoulSync (the media server's poster,
+        cover.jpg / artist.jpg on disk), as 3.6.1's picker did. from the bytes
+        the artwork cache just stored; best effort, never fails the pick"""
+        try:
+            from core.library2.artwork import artwork_file
+            path = artwork_file(get_database(), kind, int(entity_id))
+            data = path.read_bytes() if path.is_file() else None
+            from api import artist_detail
+            return (artist_detail.push_album_art_outbound(entity_id, data) if kind == "album"
+                    else artist_detail.push_artist_art_outbound(entity_id, data))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("outbound %s art for %s skipped: %s", kind, entity_id, exc)
+            return {}
 
     # -- monitoring (mirrors watchlist / wishlist) ----------------------------
 
@@ -3478,6 +3722,12 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         job_id = job["job_id"]
         # Resolve the active profile in the request context, never in the thread.
         active_profile = _intent_profile()
+        # review 4 R4-D-2: new-release auto-monitor follows the SHARED artist
+        # row's watch, which is the admin's. a household member reading the
+        # shared library refreshes the catalogue only; otherwise the admin's
+        # new releases were filed as the member's own wishes
+        from core.library2.sql_util import shared_library_member
+        auto_monitor = _is_admin() or shared_library_member() is None
 
         def _run():
             db = get_database()
@@ -3488,6 +3738,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                     artist_id,
                     config_manager,
                     wishlist_profile_id=active_profile,
+                    auto_monitor=auto_monitor,
                 )
             except ValueError:
                 _job_registry.update(job_id, error="Artist not found")
@@ -3713,12 +3964,107 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             )
         except (TypeError, ValueError):
             return _fail("max_findings must be an integer")
+        refresh = str(request.args.get("refresh") or "").strip().lower() in {
+            "1", "true", "yes",
+        }
+        # the report checks every library file on disk, most of an hour on a
+        # 300k-track library, and the request used to wait for all of it. it
+        # now runs as a job; the request waits a moment, then answers 202
+        # with the job and the next call gets the finished report.
+        # review 5 perf
+        with _integrity_lock:
+            if not refresh:
+                ready = _integrity_ready(max_findings)
+                if ready is not None:
+                    return jsonify(ready)
+            try:
+                job = _job_registry.start("integrity-report")
+                done = threading.Event()
+                _integrity_state["done"] = done
+                _start_integrity_job(job["job_id"], max_findings, done)
+            except JobAlreadyRunning as exc:
+                job = exc.state
+                done = _integrity_state.get("done") or threading.Event()
+        job_id = job["job_id"]
+        if done.wait(_INTEGRITY_REPORT_WAIT_S):
+            with _integrity_lock:
+                error = _integrity_state.get("error")
+                if error and error[0] == job_id:
+                    return _fail(error[1], 500)
+                ready = _integrity_ready(max_findings)
+                if ready is not None:
+                    return jsonify(ready)
+        state = _job_registry.get(job_id) or job
+        return jsonify({
+            "success": True,
+            "running": bool(state.get("running")),
+            "job_id": job_id,
+            "current": state.get("current", 0),
+            "total": state.get("total", 0),
+        }), 202
+
+    _integrity_lock = threading.Lock()
+    _integrity_state: Dict[str, Any] = {
+        "report": None, "max_findings": -1, "generated_at": None,
+        "error": None, "done": None,
+    }
+
+    def _integrity_ready(max_findings: int) -> Optional[Dict[str, Any]]:
+        """The last finished report, if fresh and big enough; under the lock."""
+        report = _integrity_state["report"]
+        if report is None or _integrity_state["max_findings"] < max_findings:
+            return None
+        if time.time() - _integrity_state["generated_at"] > _INTEGRITY_REPORT_FRESH_S:
+            return None
+        findings = list(report.get("findings") or [])
+        if len(findings) > max_findings:
+            # same first findings a run with this bound would have kept
+            report = {**report, "findings": findings[:max_findings], "truncated": True}
+        return {
+            "success": True,
+            "report": report,
+            "generated_at": _integrity_state["generated_at"],
+        }
+
+    def _start_integrity_job(job_id: str, max_findings: int, done: threading.Event) -> None:
+        def _progress(current, total):
+            try:
+                _job_registry.update(job_id, current=current, total=total)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("integrity report progress update failed: %s", exc)
+
+        def _run():
+            try:
+                report = integrity_report_runner(
+                    max_findings=max_findings, progress=_progress,
+                )
+                with _integrity_lock:
+                    _integrity_state.update(
+                        report=report, max_findings=max_findings,
+                        generated_at=time.time(), error=None,
+                    )
+                _job_registry.update(job_id, result={
+                    "findings_total": report.get("findings_total"),
+                    "truncated": report.get("truncated"),
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Library integrity report failed: %s", exc)
+                with _integrity_lock:
+                    _integrity_state["error"] = (job_id, str(exc))
+                _job_registry.update(job_id, error=str(exc))
+            finally:
+                _job_registry.finish(job_id)
+                done.set()
+
         try:
-            report = integrity_report_runner(max_findings=max_findings)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Library-v2 integrity report failed: %s", exc)
-            return _fail(str(exc), 500)
-        return jsonify({"success": True, "report": report})
+            threading.Thread(
+                target=carrying_scope(_run), name="lib2-integrity-report", daemon=True,
+            ).start()
+        except Exception:
+            # a job that never ran must not block every later report
+            _job_registry.finish(job_id, error="could not start the report")
+            done.set()
+            raise
 
     def _bulk_track_ids_for_albums(conn, album_ids: List[int]) -> List[int]:
         if not album_ids:
@@ -3791,17 +4137,23 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         # _profile() degrades to 1 without one, which would mirror into the
         # wrong user's wishlist on multi-profile installs.
         active_profile = _intent_profile()
+        # same for the shared intent (review 5 R5-B-2): the thread has no
+        # request, so a member read as the admin there and wrote the shared
+        # monitored columns
+        shared_intent = _shared_intent()
 
         def _run():
             db = get_database()
             try:
                 with closing(db._get_connection()) as conn:
-                    from core.library2.artist_aliases import artist_album_scope_ids
+                    from core.library2.artist_aliases import artist_fronted_album_ids
 
                     albums = []
                     if album_allowlist is None or album_allowlist:
                         allowlist_sql = ""
-                        scoped_album_ids = artist_album_scope_ids(conn, artist_id)
+                        # the releases the artist fronts, never the ones it
+                        # only guests on (another artist's album, a compilation)
+                        scoped_album_ids = artist_fronted_album_ids(conn, artist_id)
                         if not scoped_album_ids:
                             scoped_album_ids = [-1]
                         scope_marks = ",".join("?" for _ in scoped_album_ids)
@@ -3831,7 +4183,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                                 except Exception as e:  # noqa: BLE001
                                     logger.debug("bulk tracklist resolve failed (%s): %s",
                                                  album_id, e)
-                        if _shared_intent():
+                        if shared_intent:
                             conn.execute("UPDATE lib2_albums SET monitored=? WHERE id=?",
                                          (1 if monitored else 0, album_id))
                         from core.library2.monitor_rules import (
@@ -3861,7 +4213,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                             track_ids = _bulk_track_ids_for_albums(conn, [album_id])
                         if track_ids:
                             marks = ",".join("?" for _ in track_ids)
-                            if _shared_intent():
+                            if shared_intent:
                                 conn.execute(
                                     f"UPDATE lib2_tracks SET monitored=? WHERE id IN ({marks})",
                                     [1 if monitored else 0, *track_ids])
@@ -3961,19 +4313,26 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         conn = _conn()
         sources = _watchlist_metadata_sources()
         try:
+            # the acting profile's own watchlist row: the admin working in
+            # profile 3's library edits profile 3's, a member edits their own
+            # (both read and wrote the admin's before)
+            acting = _intent_profile()
             if request.method == "PUT":
                 body = request.get_json(silent=True)
+                if isinstance(body, dict) and not _is_admin():
+                    # one artist row serves every library
+                    body = {k: v for k, v in body.items() if k != "monitor_new_items"}
                 settings = update_artist_settings(
                     conn,
                     artist_id,
                     body,
-                    profile_id=ADMIN_PROFILE_ID,
+                    profile_id=acting,
                     allowed_metadata_sources=sources,
                 )
                 conn.commit()
             else:
                 settings = get_artist_settings(
-                    conn, artist_id, profile_id=ADMIN_PROFILE_ID
+                    conn, artist_id, profile_id=acting
                 )
             try:
                 from core.metadata.registry import get_primary_source
@@ -4170,7 +4529,8 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             conn.close()
 
     def _unmonitor_tracks_and_delete(db, conn, *, artist_id: Optional[int] = None,
-                                     album_ids: Optional[List[int]] = None) -> Dict[str, int]:
+                                     album_ids: Optional[List[int]] = None,
+                                     keep_listed: bool = False) -> Dict[str, int]:
         """Shared delete path: unmirror wishlist entries, then delete lib2 rows.
 
         NEVER touches files on disk — this removes library entries only,
@@ -4200,7 +4560,12 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             for profile_id in sorted(profiles | {_intent_profile()}):
                 unmirrored += len(enqueue_tracks(conn, track_ids, False, profile_id=profile_id))
         removed_albums = 0
+        kept_listed = 0
         for aid_ in album_ids:
+            if keep_listed and _provider_listed(conn, aid_):
+                _forget_owned_release(conn, aid_)
+                kept_listed += 1
+                continue
             conn.execute("DELETE FROM lib2_album_artists WHERE album_id=?", (aid_,))
             conn.execute(
                 "DELETE FROM lib2_track_artists WHERE track_id IN "
@@ -4215,7 +4580,45 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             conn.execute("DELETE FROM lib2_albums WHERE id=?", (aid_,))
             removed_albums += 1
             _delete_artwork_files(db, "album", aid_)
-        return {"albums": removed_albums, "tracks": len(track_ids), "unmirrored": unmirrored}
+        return {"albums": removed_albums, "tracks": len(track_ids), "unmirrored": unmirrored,
+                "kept_listed": kept_listed}
+
+    def _provider_listed(conn, album_id: int) -> bool:
+        """a release a metadata provider lists (it carries a provider id)"""
+        row = conn.execute("SELECT spotify_id, musicbrainz_id, external_ids FROM lib2_albums WHERE id=?",
+                           (int(album_id),)).fetchone()
+        if not row:
+            return False
+        if row["spotify_id"] or row["musicbrainz_id"]:
+            return True
+        from core.library2.provider_ids import parse_external_ids, provider_only
+        return bool(provider_only(parse_external_ids(row["external_ids"])))
+
+    def _forget_owned_release(conn, album_id: int) -> None:
+        """#2012: removing a release the provider lists takes it out of the
+        library, not off the artist's discography. as in lidarr (and 3.6.1's
+        provider-counted page) it stays listed, not owned and not wanted, so
+        "2 of 3" doesn't become "2 of 2" until the next discography refresh.
+        its file links and wanted rows go, its intent becomes an explicit no,
+        so the back catalogue's auto add doesn't wish it straight back"""
+        from core.library2.monitor_rules import PROVENANCE_USER, record_rule
+        track_ids = [r[0] for r in conn.execute("SELECT id FROM lib2_tracks WHERE album_id=?",
+                                                (int(album_id),))]
+        marks = ",".join("?" for _ in track_ids) or "NULL"
+        profiles = {int(r[0]) for r in conn.execute(
+            "SELECT DISTINCT profile_id FROM lib2_monitor_rules WHERE "
+            f"(entity_type='album' AND entity_id=?) OR (entity_type='track' AND entity_id IN ({marks}))",
+            (int(album_id), *track_ids))} | {_intent_profile()}
+        conn.execute(f"DELETE FROM lib2_track_files WHERE track_id IN ({marks})", track_ids)
+        conn.execute(f"DELETE FROM lib2_wanted_tracks WHERE track_id IN ({marks})", track_ids)
+        conn.execute(f"UPDATE lib2_tracks SET monitored=0, updated_at=CURRENT_TIMESTAMP "
+                     f"WHERE id IN ({marks})", track_ids)
+        conn.execute("UPDATE lib2_albums SET monitored=0, origin='discography', "
+                     "updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(album_id),))
+        for profile in sorted(profiles):
+            record_rule(conn, "album", int(album_id), False, PROVENANCE_USER, profile_id=profile)
+            for track_id in track_ids:
+                record_rule(conn, "track", track_id, False, PROVENANCE_USER, profile_id=profile)
 
     def _refresh_cached_artwork(db, album_ids, artist_ids) -> None:
         """Rebuild the covers a refresh scope already shows, in place.
@@ -4417,6 +4820,14 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         # whole queue first, so behind a backlog the delete hung
         from core.library2.mirror_outbox import drain
         drain(db, ids=outbox_ids)
+        # a removed copy's row is not a missing track (#1985)
+        try:
+            from core.library2.dedup_repair import fold_fileless_twins
+            with closing(db._get_connection()) as conn:
+                if fold_fileless_twins(conn, ids):
+                    conn.commit()
+        except Exception as exc:  # noqa: BLE001 - the removal itself is done
+            logger.warning("leftover track rows not folded after a removal: %s", exc)
 
     @_route(
         "/api/library/v2/<entity>/<int:eid>/file-remove",
@@ -4620,7 +5031,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 return _fail("Album not found", 404)
             from core.library2.mirror_outbox import drain_since, queue_mark
             mark = queue_mark(conn)
-            stats = _unmonitor_tracks_and_delete(db, conn, album_ids=[album_id])
+            stats = _unmonitor_tracks_and_delete(db, conn, album_ids=[album_id], keep_listed=True)
             conn.commit()
             # this delete's own withdrawals, not the oldest rows of a backlog
             drain_since(db, mark)
@@ -4641,10 +5052,15 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
 
             album_ids = artist_album_scope_ids(conn, artist_id)
             album_marks = ",".join("?" for _ in album_ids) or "NULL"
+            # each side's toggle is the caller's intent, not the shared
+            # column (review 5 R5-X1-1)
+            from core.library2.sql_util import monitored_sql
             rows = conn.execute(
-                f"""SELECT s.id AS single_id, s.title, s.monitored AS single_monitored,
+                f"""SELECT s.id AS single_id, s.title,
+                          {monitored_sql("track", "s")} AS single_monitored,
                           sal.title AS single_album,
-                          c.id AS canonical_id, c.monitored AS canonical_monitored,
+                          c.id AS canonical_id,
+                          {monitored_sql("track", "c")} AS canonical_monitored,
                           cal.title AS canonical_album
                      FROM lib2_tracks s
                      JOIN lib2_albums sal ON sal.id = s.album_id
@@ -4837,6 +5253,27 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             conn.commit()
         return jsonify({"success": True, "track_id": track_id, "file_id": file_id})
 
+    @_route("/api/library/v2/tracks/<int:track_id>/remove-leftover", methods=["POST"])
+    def lib2_remove_leftover_track(track_id):
+        """take a row with no file off its album when another row at its
+        position has the file (#2094). it folds into that row."""
+        from core.library2.dedup_repair import LeftoverError, remove_leftover_track
+        from core.library2.mirror_outbox import drain_since, queue_mark
+        db = get_database()
+        with closing(db._get_connection()) as conn:
+            mark = queue_mark(conn)
+            try:
+                result = remove_leftover_track(conn, track_id)
+            except LeftoverError as e:
+                return _fail(str(e), e.status)
+            conn.commit()
+        # its own wishlist withdrawals, not a backlog in front of them
+        try:
+            drain_since(db, mark)
+        except Exception as e:  # noqa: BLE001 - the row is gone, the mirror catches up later
+            logger.debug("outbox drain after leftover removal skipped: %s", e)
+        return jsonify({"success": True, **result})
+
     @_route("/api/library/v2/tracks/<int:track_id>/move-file", methods=["POST"])
     def lib2_move_track_file(track_id):
         """Move this track's file link onto another track (single↔album move).
@@ -4912,6 +5349,184 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 return _fail("Track not found", 404)
             history = scoped_history(conn, scope="track", entity_id=track_id, limit=limit)
         return jsonify({"success": True, "history": history})
+
+    # ── #2046: reviewed and locked ───────────────────────────────────────────
+
+    def _lock_state(conn, entity_type, entity_id):
+        """Everything the padlock's sheet shows for one album or artist."""
+        from core.library2 import locks
+
+        table = "lib2_albums" if entity_type == "album" else "lib2_artists"
+        columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
+        wanted = [c for c in ("art_locked", "genres_locked", "canonical_locked") if c in columns]
+        row = conn.execute(
+            f"SELECT id{''.join(', ' + c for c in wanted)} FROM {table} WHERE id=?",
+            (int(entity_id),)).fetchone()
+        if row is None:
+            return None
+        state = locks.get_lock(conn, entity_type, entity_id) or locks.unlocked_state(
+            entity_type, entity_id)
+        # the single-field locks that were here before the padlock, on the same sheet
+        state["field_locks"] = {
+            "artwork": bool(row["art_locked"]) if "art_locked" in wanted else False,
+            "genres": bool(row["genres_locked"]) if "genres_locked" in wanted else False,
+            "edition": bool(row["canonical_locked"]) if "canonical_locked" in wanted else False,
+        }
+        state["scope_options"] = [{"scope": scope, "label": locks.SCOPE_LABELS[scope]}
+                                  for scope in locks.SCOPES]
+        state["skips"] = locks.skips(conn, entity_type, entity_id) if state["locked"] else []
+        state["can_lock"] = _is_admin()
+        if entity_type == "artist":
+            state["review"] = locks.artist_review_counts(conn, entity_id)
+        return state
+
+    def _lock_changed():
+        """A lock or unlock changes what the enrichment queue may offer."""
+        try:
+            from core.library2.worker_queue import invalidate_pending_cache
+            invalidate_pending_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("enrichment queue not refreshed after a lock change: %s", exc)
+
+    def _lock_route(entity_type, entity_id):
+        from core.library2 import locks
+
+        if request.method == "GET":
+            with closing(_conn()) as conn:
+                state = _lock_state(conn, entity_type, entity_id)
+            if state is None:
+                return _fail(f"{entity_type.title()} not found", 404)
+            return jsonify({"success": True, "lock": state})
+        if not _is_admin():
+            return _fail("Locking needs the admin profile", 403)
+        with closing(_conn()) as conn:
+            try:
+                if request.method == "DELETE":
+                    if conn.execute(
+                            f"SELECT 1 FROM lib2_{entity_type}s WHERE id=?",
+                            (int(entity_id),)).fetchone() is None:
+                        return _fail(f"{entity_type.title()} not found", 404)
+                    locks.clear_lock(conn, entity_type, entity_id)
+                else:
+                    body = request.get_json(silent=True) or {}
+                    scopes = body.get("scopes")
+                    if scopes is not None and not isinstance(scopes, list):
+                        return _fail("scopes must be a list")
+                    locks.set_lock(conn, entity_type, entity_id, scopes,
+                                   profile_id=_profile(),
+                                   review=body.get("review") is not False)
+                    if entity_type == "artist" and body.get("albums") is True:
+                        # "and all current albums": the ones with files, as they
+                        # stand today. a later release starts open
+                        album_ids = [r[0] for r in conn.execute(
+                            "SELECT al.id FROM lib2_albums al WHERE al.primary_artist_id=? "
+                            "AND EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f "
+                            "ON f.track_id=t.id WHERE t.album_id=al.id "
+                            "AND COALESCE(f.file_state,'active')='active')",
+                            (int(entity_id),))]
+                        locks.set_many(conn, "album", album_ids, scopes, profile_id=_profile())
+                conn.commit()
+            except locks.LockError as exc:
+                conn.rollback()
+                missing = "not found" in str(exc)
+                return _fail(str(exc), 404 if missing else 400)
+            state = _lock_state(conn, entity_type, entity_id)
+        _lock_changed()
+        return jsonify({"success": True, "lock": state})
+
+    @_route("/api/library/v2/albums/<int:album_id>/lock", methods=["GET", "PUT", "DELETE"])
+    def lib2_album_lock(album_id):
+        """The album's lock: read it, set it (``{"scopes": [...]}``, every
+        scope when left out; ``"review": false`` changes the switches without
+        counting as a new review), or remove it. Changing it is admin only."""
+        return _lock_route("album", album_id)
+
+    @_route("/api/library/v2/artists/<int:artist_id>/lock", methods=["GET", "PUT", "DELETE"])
+    def lib2_artist_lock(artist_id):
+        """The artist's lock. ``"albums": true`` on PUT also locks every album
+        of theirs that has files today."""
+        return _lock_route("artist", artist_id)
+
+    @_route("/api/library/v2/artists/<int:artist_id>/review")
+    def lib2_artist_review(artist_id):
+        """Which of an artist's albums are reviewed, and the next one that is not."""
+        from core.library2 import locks
+
+        with closing(_conn()) as conn:
+            if conn.execute("SELECT 1 FROM lib2_artists WHERE id=?",
+                            (artist_id,)).fetchone() is None:
+                return _fail("Artist not found", 404)
+            rows = conn.execute(
+                """SELECT al.id, lk.locked_at, lk.snapshot
+                     FROM lib2_albums al
+                     LEFT JOIN lib2_entity_locks lk
+                            ON lk.entity_type='album' AND lk.entity_id=al.id
+                    WHERE al.primary_artist_id=?
+                      AND EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f
+                                   ON f.track_id=t.id WHERE t.album_id=al.id
+                                     AND COALESCE(f.file_state,'active')='active')
+                    ORDER BY COALESCE(al.release_date, CAST(al.year AS TEXT), ''), al.id""",
+                (artist_id,)).fetchall()
+            reviewed, changed, open_ids = [], [], []
+            for row in rows:
+                if row["locked_at"] is None:
+                    open_ids.append(int(row["id"]))
+                    continue
+                reviewed.append(int(row["id"]))
+                if row["snapshot"] and locks.album_fingerprint(conn, row["id"]) != row["snapshot"]:
+                    changed.append(int(row["id"]))
+        try:
+            after = int(request.args.get("after") or 0)
+        except (TypeError, ValueError):
+            after = 0
+        # the next one after the album being looked at, wrapping to the first
+        following = [album_id for album_id in open_ids if album_id != after]
+        if after in [int(r["id"]) for r in rows]:
+            order = [int(r["id"]) for r in rows]
+            later = [a for a in order[order.index(after) + 1:] if a in open_ids]
+            following = later + [a for a in following if a not in later]
+        return jsonify({
+            "success": True, "albums": len(rows), "reviewed": len(reviewed),
+            "reviewed_album_ids": reviewed, "changed_album_ids": changed,
+            "next_album_id": following[0] if following else None,
+        })
+
+    @_route("/api/library/v2/locks", methods=["GET", "POST"])
+    def lib2_locks():
+        """GET: every locked album and artist id (for marks on cards).
+        POST ``{"entity_type", "ids", "locked", "scopes"}``: lock or unlock a
+        selection. Admin only."""
+        from core.library2 import locks
+
+        if request.method == "GET":
+            with closing(_conn()) as conn:
+                held = locks.lock_map(conn)
+            return jsonify({
+                "success": True,
+                "albums": sorted(i for (kind, i) in held if kind == "album"),
+                "artists": sorted(i for (kind, i) in held if kind == "artist"),
+            })
+        if not _is_admin():
+            return _fail("Locking needs the admin profile", 403)
+        body = request.get_json(silent=True) or {}
+        entity_type = str(body.get("entity_type") or "album")
+        ids = body.get("ids")
+        if entity_type not in locks.ENTITY_TYPES:
+            return _fail("entity_type must be album or artist")
+        if not isinstance(ids, list) or not ids or len(ids) > 5000:
+            return _fail("ids must be a list of 1 to 5000 ids")
+        scopes = body.get("scopes")
+        with closing(_conn()) as conn:
+            try:
+                done = locks.set_many(conn, entity_type, ids, scopes,
+                                      locked=body.get("locked") is not False,
+                                      profile_id=_profile())
+                conn.commit()
+            except locks.LockError as exc:
+                conn.rollback()
+                return _fail(str(exc))
+        _lock_changed()
+        return jsonify({"success": True, "updated": done})
 
     @_route("/api/library/v2/albums/<int:album_id>/history")
     def lib2_album_history(album_id):
@@ -5129,14 +5744,29 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         """
         if entity not in ("artists", "albums"):
             return _fail("Unknown entity")
-        from core.library2.enhance import enhance_candidates
+        from core.library2.enhance import enhance_candidates, target_quality_profile
         profile = _intent_profile()
+        body = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
+        if not isinstance(body, dict):
+            return _fail("JSON body must be an object")
+        raw_target = (request.args.get("quality_profile_id") if request.method == "GET"
+                      else body.get("quality_profile_id"))
         db = get_database()
         with closing(db._get_connection()) as conn:
-            candidates = enhance_candidates(conn, entity, eid, profile_id=profile)
+            try:
+                target = target_quality_profile(conn, raw_target)
+            except LookupError:
+                return _fail("Quality profile not found", 404)
+            except ValueError as exc:
+                return _fail(str(exc))
+            # "upgrade to" pins the picks to that profile: a catalogue column
+            # every library shares, so it is the admin's to set
+            if target is not None and request.method == "POST" and not _is_admin():
+                return _fail("Choosing another quality profile requires the admin profile", 403)
+            candidates = enhance_candidates(conn, entity, eid, profile_id=profile, target=target)
             if request.method == "GET":
                 return jsonify({"success": True, "tracks": candidates})
-            requested = (request.get_json(silent=True) or {}).get("track_ids")
+            requested = body.get("track_ids")
             if not isinstance(requested, list) or any(type(t) is not int for t in requested):
                 return _fail("track_ids must be a list of track ids")
             picked = sorted({c["track_id"] for c in candidates} & set(requested))
@@ -5145,6 +5775,14 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             from core.library2.mirror_outbox import drain, enqueue_projected_tracks
             from core.library2.monitor_rules import PROVENANCE_USER, record_rules
             from core.library2.wanted import recompute_wanted
+            if target is not None:
+                # the Wishlist keeps aiming for the chosen quality after this
+                # search, the way 3.6.1's picked tier did for its run
+                from core.library2.profile_lookup import (
+                    assign_quality_profile, effective_quality_profile)
+                for track_id in picked:
+                    if effective_quality_profile(conn, "tracks", track_id)["id"] != target["id"]:
+                        assign_quality_profile(conn, "tracks", track_id, int(target["id"]))
             if _shared_intent():
                 conn.execute("UPDATE lib2_tracks SET monitored=1"
                              " WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(picked),))
@@ -5201,7 +5839,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         """Diff of file tags vs lib2 metadata for an album's or artist's tracks."""
         if entity not in ("artists", "albums"):
             return _fail("Unsupported entity")
-        from core.library2 import retag
+        from core.library2 import retag, server_tag_sync
         try:
             options = retag.retag_options(request.args)
         except ValueError as exc:
@@ -5230,13 +5868,88 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             "refresh": refresh_result,
             "changed_count": sum(1 for p in preview if p.get("has_changes")),
             "truncated": truncated,
+            # G15-5: Write Tags offers "Sync to Plex/Jellyfin" from this
+            "server_type": server_tag_sync.active_server_type(),
         })
+
+    # -- #2070: the other direction, the Library takes what the files say -----
+
+    def _tags_to_library_ids(entity, eid):
+        from core.library2 import retag
+        db = get_database()
+        with closing(db._get_connection()) as conn:
+            table = {"artists": "lib2_artists", "albums": "lib2_albums", "tracks": "lib2_tracks"}[entity]
+            if not conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (eid,)).fetchone():
+                return db, None
+            if entity == "tracks":
+                return db, [int(eid)]
+            return db, (retag.album_track_ids(conn, eid) if entity == "albums"
+                        else retag.artist_track_ids(conn, eid))
+
+    @_route("/api/library/v2/<entity>/<int:eid>/use-file-tags")
+    def lib2_use_file_tags_preview(entity, eid):
+        """What using the files' own tags would change for a track, an album
+        or an artist: fields, album renames and moves. Changes nothing."""
+        if entity not in ("artists", "albums", "tracks"):
+            return _fail("Unsupported entity")
+        from core.library2 import tags_to_library
+        db, track_ids = _tags_to_library_ids(entity, eid)
+        if track_ids is None:
+            return _fail("Not found", 404)
+        return jsonify({"success": True, **tags_to_library.plan(db, track_ids)})
+
+    @_route("/api/library/v2/<entity>/<int:eid>/use-file-tags", methods=["POST"])
+    def lib2_use_file_tags_apply(entity, eid):
+        """Save what the files say as manual edits, and move the tracks whose
+        tag names another album. The plan is worked out again here."""
+        if entity not in ("artists", "albums", "tracks"):
+            return _fail("Unsupported entity")
+        from core.library2 import tags_to_library
+        db, track_ids = _tags_to_library_ids(entity, eid)
+        if track_ids is None:
+            return _fail("Not found", 404)
+        result = tags_to_library.apply(db, track_ids, profile_id=_profile())
+        return jsonify({"success": True, **result})
+
+    @_route("/api/library/v2/<entity>/<int:eid>/use-file-tags", methods=["DELETE"])
+    def lib2_use_file_tags_release(entity, eid):
+        """Let go of the values this track, album or artist took from file
+        tags (#2084). They go back to what the metadata sources say and are
+        free for enrichment and repairs again. Hand edits and files stay."""
+        if entity not in ("artists", "albums", "tracks"):
+            return _fail("Unsupported entity")
+        from core.library2 import tags_to_library
+        from core.library2.metadata_overrides import MetadataOverrideError
+        db, track_ids = _tags_to_library_ids(entity, eid)
+        if track_ids is None:
+            return _fail("Not found", 404)
+        try:
+            return jsonify({"success": True,
+                            **tags_to_library.release(db, track_ids, profile_id=_profile())})
+        except MetadataOverrideError as exc:
+            return _fail(str(exc), exc.status)
+
+    @_route("/api/library/v2/use-file-tags", methods=["GET", "DELETE"])
+    def lib2_use_file_tags_library():
+        """The whole Library's values taken from file tags: how many (GET),
+        or let go of every one of them (DELETE)."""
+        from core.library2 import tags_to_library
+        from core.library2.metadata_overrides import MetadataOverrideError
+        db = get_database()
+        if request.method == "GET":
+            with closing(db._get_connection()) as conn:
+                return jsonify({"success": True, "held": tags_to_library.held_values(conn)})
+        try:
+            return jsonify({"success": True,
+                            **tags_to_library.release(db, None, profile_id=_profile())})
+        except MetadataOverrideError as exc:
+            return _fail(str(exc), exc.status)
 
     @_route("/api/library/v2/tags/write", methods=["POST"])
     def lib2_write_tags():
         """Write lib2 metadata into the given tracks' file tags (background job).
 
-        Body: ``{"track_ids": [...], "embed_cover": true}``. Poll
+        Body: ``{"track_ids": [...], "embed_cover": true, "sync_to_server": false}``. Poll
         ``/api/library/v2/jobs/status`` for progress/result.
         """
         body = request.get_json(silent=True) or {}
@@ -5260,6 +5973,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             return _fail(str(exc))
         track_ids = list(dict.fromkeys(raw_track_ids))
         embed_cover = bool(body.get("embed_cover", True))
+        sync_to_server = body.get("sync_to_server") is True
         # Fields a person set by hand win by default. `overwrite_manual` is how
         # the user hands one back to the catalogue: `true` for the bulk "apply
         # everything" choice, or [[track_id, field], ...] for the per-field
@@ -5319,9 +6033,17 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                                          protect_hand_tagged=True,
                                          options=options,
                                          progress=_progress)
+                if sync_to_server:
+                    # G15-5: 3.6.1's "Sync to Plex/Jellyfin"; every track
+                    # that didn't fail (an already-correct file can still be
+                    # stale on the server)
+                    from core.library2.server_tag_sync import sync_tracks_to_server
+                    failed = {e.get("track_id") for e in stats.get("errors") or []}
+                    stats["server_sync"] = sync_tracks_to_server(
+                        db, [t for t in track_ids if t not in failed])
                 _job_registry.update(job_id, result=stats)
             except Exception as e:  # noqa: BLE001
-                logger.error("Library v2 retag failed: %s", e, exc_info=True)
+                logger.error("Library retag failed: %s", e, exc_info=True)
                 _job_registry.update(job_id, error=str(e))
             finally:
                 _job_registry.finish(job_id)
@@ -5419,7 +6141,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 stats["enriched_from"] = enriched_from
                 _job_registry.update(job_id, result=stats)
             except Exception as e:  # noqa: BLE001
-                logger.error("Library v2 fill-tag-gaps failed: %s", e, exc_info=True)
+                logger.error("Library fill-tag-gaps failed: %s", e, exc_info=True)
                 _job_registry.update(job_id, error=str(e))
             finally:
                 _job_registry.finish(job_id)
@@ -5494,6 +6216,12 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                         states.extend((_coerce_tags(r[0]).get('_validation') or {}).get('status', 'unknown') for r in conn.execute(
                             f"SELECT tags_json FROM lib2_track_files WHERE id IN ({','.join('?' for _ in ids)})", ids))
                     scan_stats.update(metadata_issues=states.count('issues'), metadata_unknown=states.count('unknown'))
+                    # a row a moved file left behind at its own position (#2094)
+                    from core.library2.dedup_repair import fold_leftover_rows
+                    folded = fold_leftover_rows(conn, album_ids)["leftover_tracks_folded"]
+                    if folded:
+                        conn.commit()
+                        scan_stats["leftover_tracks_folded"] = folded
                 # A scan is the moment we learn a file is gone or back, and
                 # acquisition is the consumer of exactly that. Handing it over
                 # here — scoped to the tracks that actually changed — is what
@@ -5517,7 +6245,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "Library v2 refresh failed (%s %s): %s",
+                    "Library refresh failed (%s %s): %s",
                     entity, eid, exc, exc_info=True,
                 )
                 _job_registry.update(job_id, error=str(exc))
@@ -5591,6 +6319,10 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 return _fail("Import already running", 409)
             if _artwork_cache_snapshot()["running"]:
                 return _fail("Artwork caching is still running; retry when it finishes", 409)
+            # review 4 R4-D-4: the convergence after an import folds and
+            # merges the rows a second import would be writing
+            if any(t.name == "lib2-converge" and t.is_alive() for t in threading.enumerate()):
+                return _fail("The last import is still settling; retry when it finishes", 409)
             # Ordered AFTER the in-progress checks on purpose: "a run is
             # already happening" is the more specific answer, and the existing
             # contract tests read it back.
@@ -5617,6 +6349,22 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
             # state offers, and would be told forever to send a flag that tile
             # cannot send. An empty catalogue has nothing stale to protect, so
             # it is never the case this guard is for.
+            # #2062: an install created since the cutover has no older library
+            # at all. The Library page's empty state used to offer this import
+            # anyway, the importer failed on the missing tables, and the failed
+            # row made the page say the upgrade had failed and everything was
+            # paused. Nothing to read is an answer, not an error: say so, and
+            # leave the persisted state alone (correcting it if an earlier
+            # build already wrote the failure).
+            if not lib2_bootstrap.legacy_source_present(get_database()):
+                lib2_bootstrap.settle_failed_without_source(get_database())
+                return jsonify({
+                    "success": False,
+                    "code": "nothing_to_import",
+                    "error": ("This install has no older SoulSync library to "
+                              "import. Add music from Search, or bring in files "
+                              "you already have from the Import page."),
+                }), 409
             if not (reset or force):
                 database = get_database()
                 state = lib2_bootstrap.get_state(database)
@@ -5707,8 +6455,17 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 # continue independently so the UI can browse immediately.
                 _import_state.update(stage="done", current=0, total=0)
                 _start_artwork_cache(get_database, config_manager)
+                # P2C-8: the whole-library convergence the import no longer
+                # runs inside its own transaction, on the rebuilt rows now
+                # rather than at the next start (startup's own pass)
+                def _converge():
+                    try:
+                        lib2_bootstrap.run_deferred_backfills(get_database())
+                    except Exception as conv_err:  # noqa: BLE001 - retries next start
+                        logger.warning("Library convergence after import failed: %s", conv_err)
+                threading.Thread(target=_converge, name="lib2-converge", daemon=True).start()
             except Exception as e:  # noqa: BLE001
-                logger.error("Library v2 import failed: %s", e, exc_info=True)
+                logger.error("Library import failed: %s", e, exc_info=True)
                 _import_state.update(error=str(e), stage="failed")
                 try:
                     lib2_bootstrap.mark_failed(get_database(), bootstrap_owner, str(e))
@@ -5788,6 +6545,22 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
                 cursor.execute(f'DELETE FROM "{table}"')
                 if cursor.rowcount > 0:
                     cleared[table] = cursor.rowcount
+            # review 4 R4-A-5: the 3.6.1 carries and the twin merge run once
+            # after an upgrade import. their markers outlived the reset, so a
+            # re-run upgrade skipped them and wasn't what a user gets
+            from core.library2 import legacy_columns, legacy_issues, legacy_locks
+            from core.library2.catalogue_duplicates import _IMPORT_TWINS_MARKER
+            from core.library2.legacy_credits import _MARKER as _CREDITS_MARKER
+            from core.library2.monitor_sync import _MEMBER_WATCHLISTS_MARKER
+            carry_markers = (legacy_columns.MARKER, legacy_columns.KIND_MARKER,
+                             legacy_issues.MARKER, legacy_locks.MARKER)
+            cursor.execute("CREATE TABLE IF NOT EXISTS lib2_upgrade_repairs "
+                           "(name TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            cursor.execute(
+                "DELETE FROM lib2_upgrade_repairs WHERE name IN (%s)"
+                % ",".join("?" * len(carry_markers)), carry_markers)
+            for marker_table in (_IMPORT_TWINS_MARKER, _CREDITS_MARKER, _MEMBER_WATCHLISTS_MARKER):
+                cursor.execute(f'DROP TABLE IF EXISTS "{marker_table}"')
             # Re-arm: 'pending' with no watermark and no checkpoint is exactly
             # the state a never-migrated installation is in.
             cursor.execute(
@@ -5802,7 +6575,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
             lib2_bootstrap.mark_failed(get_database(), owner_token, str(exc))
-            logger.error("Library v2 reset failed: %s", exc, exc_info=True)
+            logger.error("Library reset failed: %s", exc, exc_info=True)
             return _fail(str(exc), 500)
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
@@ -5811,12 +6584,12 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         _reset_artwork_cache_state()
         _import_state.update(running=False, stage=None, current=0, total=0,
                              stats=None, error=None, finished_at=None)
-        logger.warning("Library v2 catalogue reset: %s", cleared or "already empty")
+        logger.warning("Library catalogue reset: %s", cleared or "already empty")
         return jsonify({
             "success": True,
             "cleared": cleared,
             "message": (
-                "Library v2 is empty and the automatic migration is re-armed. "
+                "The Library is empty and the automatic migration is re-armed. "
                 "Restart the server to watch it run."
             ),
         })
@@ -5826,11 +6599,22 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         # "bootstrap" is the persisted state (core/library2/bootstrap.py) — unlike
         # _import_state (this process, this click) it also reflects an automatic
         # background import that this request didn't itself trigger.
+        database = get_database()
+        # #2062: a fresh install has no older library, so the page offers no
+        # import there, and a failure an earlier build left behind is cleared
+        has_legacy = lib2_bootstrap.legacy_source_present(database)
+        bootstrap_state = lib2_bootstrap.get_state(database)
+        # only on the failure itself: this is polled every second, and the
+        # correction is a write
+        if not has_legacy and bootstrap_state.get("status") == "failed":
+            lib2_bootstrap.settle_failed_without_source(database)
+            bootstrap_state = lib2_bootstrap.get_state(database)
         return jsonify({
             "success": True,
+            "has_legacy_source": has_legacy,
             **_import_state,
             "artwork_cache": _artwork_cache_snapshot(),
-            "bootstrap": lib2_bootstrap.get_state(get_database()),
+            "bootstrap": bootstrap_state,
             "preparation": _preparation_snapshot(),
         })
 
@@ -5838,7 +6622,7 @@ def register_library_v2_routes(app, *, get_database: Callable[[], Any],
         from core.library2.post_import import preparation_state
         return preparation_state()
 
-    logger.info("Library v2 routes registered (/api/library/v2/*)")
+    logger.info("Library routes registered (/api/library/v2/*)")
 
 
 __all__ = ["register_library_v2_routes", "start_artwork_precache"]

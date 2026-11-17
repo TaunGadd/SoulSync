@@ -202,10 +202,11 @@ describe('finding labels', () => {
     expect(FINDING_FIXABLE_TYPES.quality_upgrade_review).toBe('Wishlist & Upgrade');
     expect(FINDING_FIXABLE_TYPES.quality_format_not_targeted).toBe('Leave As-is');
     expect(FINDING_FIXABLE_TYPES.quality_unknown).toBe('Leave As-is');
-    expect(Object.keys(FINDING_TYPE_LABELS)).toHaveLength(31);
+    expect(Object.keys(FINDING_TYPE_LABELS)).toHaveLength(32);
+    // 30 with library_unreachable (#2005). 3.6.1's duplicate_tracks lost its fixer to the native detector (G16-3)
     expect(Object.keys(FINDING_FIXABLE_TYPES)).toHaveLength(30);
-    // 17 music + obsolete + the 10 video fix actions + the scan retirement
-    expect(Object.keys(FINDING_ACTION_LABELS)).toHaveLength(29);
+    // 18 music (kept_whole, #2150) + obsolete + the 10 video fix actions + the scan retirement
+    expect(Object.keys(FINDING_ACTION_LABELS)).toHaveLength(30);
   });
 
   it('labels known finding types', () => {
@@ -221,7 +222,9 @@ describe('finding labels', () => {
   });
 
   it('gives fixable types their button label and others none', () => {
-    expect(findingFixLabel('duplicate_tracks')).toBe('Keep Best');
+    // 3.6.1's duplicate findings have no fixer since the native detector (G16-3)
+    expect(findingFixLabel('duplicate_tracks')).toBeNull();
+    expect(findingFixLabel('native_duplicate_tracks')).toBe('Keep Best');
     expect(findingFixLabel('genre_enrichment')).toBe('Apply Genres');
     expect(findingFixLabel('comma_artist_split')).toBe('Split Artists');
     expect(findingFixLabel('fake_lossless')).toBe('Re-download');
@@ -782,6 +785,24 @@ describe('findingsBulkBarState', () => {
       selectAllIndeterminate: false,
     });
     expect(findingsBulkBarState(0, 0, 0).selectAllChecked).toBe(false);
+  });
+});
+
+describe('a bulk re-tag that filled and left differences', () => {
+  it('is counted apart from what was fixed, and is not a failure', () => {
+    expect(bulkFixRunMessage({ fixed: 30000, partial: 11000, failed: 0, total: 41000 })).toEqual({
+      message:
+        'Fixed 30000, filled the blank tags in 11000 more (what differs is left for you to review) of 41000',
+      type: 'success',
+    });
+    // nothing fully fixed, some filled: still a success, never "error"
+    expect(bulkFixRunMessage({ fixed: 0, partial: 3, failed: 0, total: 3 }).type).toBe('success');
+    expect(bulkFixLoopMessage(2, 0, '', 0, 0, 1)).toEqual({
+      message: 'Fixed 2, filled the blank tags in 1 more (what differs is left for you to review)',
+      type: 'success',
+    });
+    // and a run with none of them reads as it always did
+    expect(bulkFixRunMessage({ fixed: 8, failed: 0, total: 8 }).message).toBe('Fixed 8 of 8');
   });
 });
 

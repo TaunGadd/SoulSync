@@ -92,12 +92,49 @@ class VideoEnrichmentEngine:
             return hit
         out = []
         w = self.workers.get("tmdb")
-        if w and getattr(w, "enabled", False) and hasattr(w.client, "alternative_titles"):
+        if w and getattr(w, "enabled", False) and hasattr(w.client, "title_identity"):
+            # TMDB's own name and the original-language name lead the list: a
+            # library title in another language (#2021) still matches a
+            # release named in english or in the original
+            ident = self.title_identity(kind, tmdb_id)
+            seen = set()
+            for t in [ident.get("name"), ident.get("original_name"), *(ident.get("aliases") or [])]:
+                t = str(t or "").strip()
+                if t and t.lower() not in seen:
+                    seen.add(t.lower())
+                    out.append(t)
+            if not ident:
+                self._cache_put(key, out, ttl=600)
+                return out
+        elif w and getattr(w, "enabled", False) and hasattr(w.client, "alternative_titles"):
             try:
                 out = w.client.alternative_titles(kind, tmdb_id) or []
             except Exception:   # noqa: BLE001 - a matching assist must never break a grab
                 logger.debug("alt_titles_for failed for %s %s", kind, tmdb_id, exc_info=True)
         self._cache_put(key, out, ttl=86400)
+        return out
+
+    def title_identity(self, kind, tmdb_id) -> dict:
+        """TMDB's {name, original_name, year, aliases} for a movie/show, cached
+        hard like the aliases (one TMDB call a day per title). {} when TMDB
+        isn't configured or can't say; never raises."""
+        if not tmdb_id:
+            return {}
+        key = ("title_identity", kind, str(tmdb_id))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        out = {}
+        w = self.workers.get("tmdb")
+        if w and getattr(w, "enabled", False) and hasattr(w.client, "title_identity"):
+            try:
+                out = w.client.title_identity(kind, tmdb_id) or {}
+            except Exception:   # noqa: BLE001 - a matching assist must never break a grab
+                logger.debug("title_identity failed for %s %s", kind, tmdb_id, exc_info=True)
+                out = {}
+        # a miss (TMDB down, a timeout) is retried soon, not held for a day:
+        # without it a grab has no year to check the release against
+        self._cache_put(key, out, ttl=86400 if out else 600)
         return out
 
     def _omdb_blocked_now(self) -> bool:
@@ -236,7 +273,7 @@ class VideoEnrichmentEngine:
         self._scan_paused = set()
 
     def refresh_show_art(self, show_id, *, with_ratings: bool = True,
-                         recent_seasons_only: bool = False) -> dict:
+                         recent_seasons_only: bool = False, fresh: bool = False) -> dict:
         """On-demand (lazy) backfill of a show's season posters + episode art from
         TMDB, used when the detail page is opened and art is missing. Works
         regardless of the show's match status (sidesteps 'already matched, never
@@ -252,7 +289,11 @@ class VideoEnrichmentEngine:
         call per season, per show) is pure waste since backfill is gap-fill and settled
         seasons write nothing. It also leaves the episodes-synced flag untouched, so a show
         that hasn't had its FULL history pulled yet still gets its older seasons filled by
-        the background episode-sync pass rather than being falsely marked complete."""
+        the background episode-sync pass rather than being falsely marked complete.
+
+        ``fresh=True`` also overwrites what changes after a show is matched (it ended, it
+        came back, its last air date): the page's own refresh. Everything else stays
+        gap-fill."""
         w = self.workers.get("tmdb")
         if not w or not w.enabled:
             return {"ok": False, "reason": "tmdb_not_configured"}
@@ -270,6 +311,8 @@ class VideoEnrichmentEngine:
         # Backfills season posters + show metadata gaps (never clobbers).
         self.db.enrichment_apply("tmdb", "show", show_id, matched=True,
                                  external_id=result["id"], metadata=result.get("metadata"))
+        if fresh:
+            self.db.refresh_volatile("show", show_id, result.get("metadata"))
         nums = []
         try:
             nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
@@ -306,10 +349,12 @@ class VideoEnrichmentEngine:
                 except Exception:   # noqa: BLE001
                     logger.debug("tvdb episode backfill failed (show %s S%s)", show_id, sn, exc_info=True)
 
-    def refresh_movie_art(self, movie_id) -> dict:
+    def refresh_movie_art(self, movie_id, *, with_ratings: bool = True,
+                          fresh: bool = False) -> dict:
         """On-demand (lazy) backfill of a movie's cast / genres / backdrop / ratings
         from TMDB when the detail page is opened and they're missing. Works
-        regardless of match status; caches the result."""
+        regardless of match status; caches the result. ``fresh=True`` also overwrites
+        what changes after a match (status, release date, the collection it joined)."""
         w = self.workers.get("tmdb")
         if not w or not w.enabled:
             return {"ok": False, "reason": "tmdb_not_configured"}
@@ -326,7 +371,10 @@ class VideoEnrichmentEngine:
             return {"ok": False, "reason": "no_match"}
         self.db.enrichment_apply("tmdb", "movie", movie_id, matched=True,
                                  external_id=result["id"], metadata=result.get("metadata"))
-        self._backfill_ratings("movie", movie_id)
+        if fresh:
+            self.db.refresh_volatile("movie", movie_id, result.get("metadata"))
+        if with_ratings:
+            self._backfill_ratings("movie", movie_id)
         return {"ok": True}
 
     def item_extras(self, kind, item_id, watcher=None) -> dict:
@@ -948,6 +996,19 @@ class VideoEnrichmentEngine:
         d["anime"] = {"main": slim(main), "entries": [slim(r) for r in rows]}
         if main.get("score"):
             d["anilist_score"] = main["score"]
+        # split TMDB's lumped seasons the way the library does (Thibs: Frieren
+        # and JJK showed one season on a preview). the season fetch below reads
+        # the same map, so a split season loads its slice of the TMDB season
+        if kind == "show" and d.get("seasons"):
+            from core.video.numbering import split_preview_seasons
+            seasons, source = split_preview_seasons(d["seasons"], rows)
+            if source:
+                d["seasons"] = seasons
+                d["season_count"] = len(seasons)
+                try:
+                    self._cache_put(("anime_split", tmdb_id), {"source": source, "rows": rows})
+                except AttributeError:
+                    pass   # an engine built without its cache (tests)
 
     def _fill_tmdb_ratings(self, d) -> None:
         imdb_id = d.get("imdb_id")
@@ -969,7 +1030,39 @@ class VideoEnrichmentEngine:
 
     def tmdb_season(self, tv_id, season_number) -> dict | None:
         """One season's episodes for a TMDB (un-owned) show — lazy-loaded when the
-        season is selected on the search detail page. Nothing is owned."""
+        season is selected on the search detail page. Nothing is owned. A season
+        the preview split (anime, see _fill_preview_anime) is its slice of the
+        TMDB season it came from, renumbered."""
+        split = None
+        try:
+            split = self._cache_get(("anime_split", tv_id))
+        except AttributeError:
+            split = None
+        if split is None:
+            # the split lives in the cache with the detail. a season asked for
+            # after it expired (or from another worker) came back as TMDB's own
+            # season 2, which doesn't exist: a card with no episodes (Thibs'
+            # Frieren). building the detail again puts the split back
+            try:
+                self.tmdb_detail("show", tv_id)
+                split = self._cache_get(("anime_split", tv_id))
+                if split is None:
+                    # nothing to split: say so once, not on every season opened
+                    self._cache_put(("anime_split", tv_id), {"source": {}, "rows": []})
+            except Exception:   # noqa: BLE001 - then it is TMDB's own season, as before
+                split = None
+        src = (split or {}).get("source", {}).get(int(season_number)) if split else None
+        if src is not None:
+            raw = self._tmdb_season_raw(tv_id, src)
+            if not raw:
+                return None
+            from core.video.numbering import anilist_regroup
+            groups, _moved = anilist_regroup(src, raw.get("episodes") or [], split["rows"])
+            return dict(raw, season_number=int(season_number),
+                        episodes=groups.get(int(season_number), []))
+        return self._tmdb_season_raw(tv_id, season_number)
+
+    def _tmdb_season_raw(self, tv_id, season_number) -> dict | None:
         w = self.workers.get("tmdb")
         if not w or not w.enabled:
             return None

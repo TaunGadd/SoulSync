@@ -310,6 +310,50 @@ def test_demonitor_matches_by_name_fallback(imported_conn):
                         ).fetchone()[0] == 0
 
 
+# review 5 R5-F-2: the removal endpoints send provider ids as a dict, and that
+# branch let a bare name match run alongside the id match, past the A9 rule
+
+def _monitored(conn, artist_id):
+    return conn.execute("SELECT monitored FROM lib2_artists WHERE id=?", (artist_id,)).fetchone()[0]
+
+
+def test_removing_one_namesake_by_its_id_keeps_the_other(imported_conn):
+    conn = imported_conn
+    us = _add_artist(conn, "Nirvana", monitored=1, spotify_id="sp-us")
+    uk = _add_artist(conn, "Nirvana", monitored=1, external_ids='{"musicbrainz":"mb-uk-1967"}')
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    result = sync_watchlist_removal(
+        db, None, {"name": "Nirvana", "provider_ids": {"spotify": "sp-us"}}, profile_id=1)
+
+    assert result["matched"] == 1
+    assert (_monitored(conn, us), _monitored(conn, uk)) == (0, 1)
+    assert conn.execute("SELECT 1 FROM lib2_monitor_rules WHERE entity_type='artist' "
+                        "AND entity_id=?", (uk,)).fetchone() is None
+
+
+def test_a_dict_descriptor_name_fallback_needs_exactly_one_namesake(imported_conn):
+    conn = imported_conn
+    one = _add_artist(conn, "Nirvana", monitored=1, external_ids='{"musicbrainz":"mb-1"}')
+    two = _add_artist(conn, "Nirvana", monitored=1, external_ids='{"musicbrainz":"mb-2"}')
+    solo = _add_artist(conn, "Solo Act", monitored=1)
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    # no id matches: two namesakes is ambiguous, nobody is touched
+    ambiguous = sync_watchlist_removal(
+        db, None, {"name": "Nirvana", "provider_ids": {"spotify": "sp-x"}}, profile_id=1)
+    assert ambiguous["matched"] == 0
+    assert (_monitored(conn, one), _monitored(conn, two)) == (1, 1)
+
+    # one namesake: the fallback still resolves it
+    single = sync_watchlist_removal(
+        db, None, {"name": "Solo Act", "provider_ids": {"spotify": "sp-y"}}, profile_id=1)
+    assert single["matched"] == 1
+    assert _monitored(conn, solo) == 0
+
+
 def test_demonitor_idempotent(imported_conn):
     conn = imported_conn
     _add_artist(conn, "Once", monitored=1, spotify_id="once-sp")
@@ -730,6 +774,112 @@ def test_watchlist_provider_ids_are_compared_with_their_namespace(imported_conn)
     ) is False
 
 
+def _two_nirvanas(conn):
+    _ensure_watchlist_table(conn)
+    us = _add_artist(conn, "Nirvana", monitored=1, spotify_id="sp-us")
+    uk = _add_artist(conn, "Nirvana", monitored=0,
+                     external_ids='{"musicbrainz":"mb-uk-1967"}')
+    conn.execute("INSERT INTO watchlist_artists(spotify_artist_id, artist_name, profile_id) "
+                 "VALUES('sp-us', 'Nirvana', 1)")
+    conn.commit()
+    return us, uk
+
+
+def test_reconcile_does_not_watch_a_namesake_of_the_watched_artist(imported_conn):
+    """review 5 W2-WF-2: R5-F-2's rule on the hourly reconcile. the watched
+    US Nirvana holds the entry's id, so the UK one is not it by name"""
+    conn = imported_conn
+    us, uk = _two_nirvanas(conn)
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    reconcile_artist_watchlist(db, profile_id=1)
+
+    states = dict(conn.execute("SELECT id, monitored FROM lib2_artists WHERE id IN (?,?)",
+                               (us, uk)).fetchall())
+    assert states == {us: 1, uk: 0}
+    rule = conn.execute("SELECT monitored FROM lib2_monitor_rules WHERE entity_type='artist' "
+                        "AND entity_id=? AND profile_id=1", (uk,)).fetchone()
+    assert rule is None or rule[0] == 0
+
+
+def test_reconcile_name_fallback_needs_one_artist_of_that_name(imported_conn):
+    """two lib2 artists of the watched name and neither holds its id: a name
+    cannot say which one, so neither is watched by it"""
+    conn = imported_conn
+    _ensure_watchlist_table(conn)
+    a = _add_artist(conn, "Nirvana", monitored=0, external_ids='{"musicbrainz":"mb-a"}')
+    b = _add_artist(conn, "Nirvana", monitored=0, external_ids='{"deezer":"dz-b"}')
+    alone = _add_artist(conn, "Mudhoney", monitored=0, external_ids='{"deezer":"dz-m"}')
+    conn.execute("INSERT INTO watchlist_artists(spotify_artist_id, artist_name, profile_id) "
+                 "VALUES('sp-us', 'Nirvana', 1), ('sp-mud', 'Mudhoney', 1)")
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    reconcile_artist_watchlist(db, profile_id=1)
+
+    states = dict(conn.execute("SELECT id, monitored FROM lib2_artists WHERE id IN (?,?,?)",
+                               (a, b, alone)).fetchall())
+    # the only artist of a watched name still matches it across namespaces
+    assert states == {a: 0, b: 0, alone: 1}
+
+
+def test_reconcile_name_fallback_still_watches_an_alias_of_the_artist(imported_conn):
+    """an alias row (§40) is the same artist, not a namesake"""
+    conn = imported_conn
+    _ensure_watchlist_table(conn)
+    main = _add_artist(conn, "Nirvana", monitored=0, external_ids='{"musicbrainz":"mb-a"}')
+    alias = _add_artist(conn, "Nirvana", monitored=0, external_ids='{"deezer":"dz-b"}')
+    conn.execute("UPDATE lib2_artists SET canonical_artist_id=? WHERE id=?", (main, alias))
+    conn.execute("INSERT INTO watchlist_artists(spotify_artist_id, artist_name, profile_id) "
+                 "VALUES('sp-us', 'Nirvana', 1)")
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    reconcile_artist_watchlist(db, profile_id=1)
+
+    states = dict(conn.execute("SELECT id, monitored FROM lib2_artists WHERE id IN (?,?)",
+                               (main, alias)).fetchall())
+    assert states == {main: 1, alias: 1}
+
+
+def test_a_new_namesake_is_not_born_watched(imported_conn):
+    """review 5 W2-WF-2 at insert time (autolink)"""
+    from core.library2.monitor_sync import artist_is_watchlisted
+
+    conn = imported_conn
+    _two_nirvanas(conn)
+    assert artist_is_watchlisted(
+        conn, "Nirvana", {"musicbrainz": "mb-uk-1967"}, profile_id=1) is False
+    # the watched artist itself, by id, still is
+    assert artist_is_watchlisted(conn, "Nirvana", {"spotify": "sp-us"}, profile_id=1) is True
+
+
+def test_a_new_artist_is_not_watched_by_name_when_another_holds_the_id(imported_conn):
+    from core.library2.monitor_sync import artist_is_watchlisted
+
+    conn = imported_conn
+    _ensure_watchlist_table(conn)
+    _add_artist(conn, "Nirvana (US)", monitored=1, spotify_id="sp-us")
+    conn.execute("INSERT INTO watchlist_artists(spotify_artist_id, artist_name, profile_id) "
+                 "VALUES('sp-us', 'Nirvana', 1)")
+    conn.commit()
+    assert artist_is_watchlisted(
+        conn, "Nirvana", {"musicbrainz": "mb-uk-1967"}, profile_id=1) is False
+
+
+def test_a_watched_artists_first_row_is_still_born_watched_by_name(imported_conn):
+    """the watchlist knows a spotify id, the first download came from deezer:
+    no lib2 artist of that name or id yet, so the name still says it"""
+    from core.library2.monitor_sync import artist_is_watchlisted
+
+    conn = imported_conn
+    _ensure_watchlist_table(conn)
+    conn.execute("INSERT INTO watchlist_artists(spotify_artist_id, artist_name, profile_id) "
+                 "VALUES('sp-us', 'Nirvana', 1)")
+    conn.commit()
+    assert artist_is_watchlisted(conn, "Nirvana", {"deezer": "dz-1"}, profile_id=1) is True
+
+
 def _stale_wishlist_row(conn, track_id: int, provider_id: str) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS wishlist_tracks(
@@ -889,3 +1039,206 @@ def test_a_full_recompute_prunes_rows_of_deleted_tracks(imported_conn):
     assert 999999 not in rows and keep in rows
     # nothing left to prune: the next run writes no delete
     assert recompute_wanted(conn, profile_id=1)["pruned"] == 0
+
+
+def test_a_wishlist_removal_never_reads_the_whole_catalogue(imported_conn):
+    """review 5 R5-F-1: every removal loaded and parsed all tracks first (18 s
+    on a 316k library; Clear Wishlist held the write lock for it), even for a
+    row that names its lib2 track. each id is looked up through its index"""
+    from core.library2.monitor_sync import _descriptor_lib2_track_ids
+    conn = imported_conn
+    artist = _add_artist(conn, "Track Artist", monitored=0, spotify_id="ta-sp")
+    named = _add_track(conn, artist, "Named", spotify_id="named-sp")
+    by_deezer = _add_track(conn, artist, "Deezer", spotify_id=None)
+    conn.execute("UPDATE lib2_tracks SET external_ids='{\"deezer\": \"dz-9\"}' WHERE id=?", (by_deezer,))
+    conn.commit()
+    seen = []
+    conn.set_trace_callback(seen.append)
+    got = _descriptor_lib2_track_ids(conn, [
+        {"source_info": {"lib2_track_id": named}},
+        {"spotify_track_id": "dz-9"},                      # a bare id
+        {"track_data": {"id": "named-sp", "provider": "spotify"}},
+    ])
+    conn.set_trace_callback(None)
+    assert sorted(set(got)) == sorted({named, by_deezer})
+    flat = [" ".join(q.split()) for q in seen]
+    whole = [q for q in flat if "FROM lib2_tracks t JOIN lib2_albums" in q and "WHERE" not in q.upper()]
+    assert whole == []
+
+
+# --- #2060: automatic upgrades, a few at a time and remembered ----------------
+
+
+def _below_target_library(conn):
+    """a 128k file under a 320k profile, and a wanted track with no file"""
+    profile_id = conn.execute(
+        "INSERT INTO quality_profiles(name, ranked_targets, upgrade_policy, fallback_enabled) "
+        "VALUES('MP3 320', '[{\"label\":\"MP3 320\",\"format\":\"mp3\",\"min_bitrate\":320}]', "
+        "'acceptable', 1)"
+    ).lastrowid
+    artist = _add_artist(conn, "Real McCoy", spotify_id="rm-a")
+    owned = _add_track(conn, artist, "Another Night", monitored=1,
+                       with_file=True, spotify_id="owned-128")
+    missing = _add_track(conn, artist, "Run Away", monitored=1,
+                         with_file=False, spotify_id="missing-sp")
+    conn.execute("UPDATE lib2_track_files SET format='mp3', bitrate=128 WHERE track_id=?", (owned,))
+    conn.execute(
+        "UPDATE lib2_tracks SET quality_profile_id=?, quality_profile_explicit=1 "
+        "WHERE id IN (?, ?)", (profile_id, owned, missing))
+    recompute_wanted(conn, track_ids=[owned, missing])
+    conn.commit()
+    return owned, missing
+
+
+def test_an_owned_track_below_its_target_is_never_readded_with_upgrades_off(imported_conn):
+    """the reported loop: every song just downloaded at 128k came back on the
+    wishlist each hour, was swept as already owned, and came back again"""
+    from core.library2.wishlist_mirror import upgrade_candidate_track_ids
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    # the premise: the profile does still count the 128k file as upgradable
+    assert owned in upgrade_candidate_track_ids(conn, profile_id=1, definite_only=True)
+
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+    stats = reconcile_track_wishlist(db, profile_id=1)
+
+    assert "owned-128" not in db.added
+    assert "missing-sp" in db.added   # the one with no file still comes back
+    assert stats["added"] == 1 and stats["upgrades_queued"] == 0
+
+
+def test_an_upgrade_is_asked_for_once_and_then_waits_its_turn(imported_conn):
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    first = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert first["upgrades_queued"] == 1 and db.added.count("owned-128") == 1
+
+    # the next hour, with the wish gone again (tried, nothing better): no loop
+    second = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert second["upgrades_queued"] == 0 and db.added.count("owned-128") == 1
+    assert second["upgrades_waiting"] == 1
+
+    # eight days on it is due again, and the wait after that is twice as long
+    conn.execute(
+        "UPDATE lib2_tracks SET upgrade_attempt=json_set(upgrade_attempt, '$.at', "
+        "datetime('now', '-8 days')) WHERE id=?", (owned,))
+    conn.commit()
+    third = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert third["upgrades_queued"] == 1 and db.added.count("owned-128") == 2
+    conn.execute(
+        "UPDATE lib2_tracks SET upgrade_attempt=json_set(upgrade_attempt, '$.at', "
+        "datetime('now', '-8 days')) WHERE id=?", (owned,))
+    conn.commit()
+    fourth = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert fourth["upgrades_queued"] == 0 and db.added.count("owned-128") == 2
+
+
+def test_upgrades_are_asked_for_a_few_at_a_time(imported_conn):
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    artist = conn.execute("SELECT id FROM lib2_artists WHERE name='Real McCoy'").fetchone()[0]
+    profile_id = conn.execute("SELECT quality_profile_id FROM lib2_tracks WHERE id=?",
+                              (owned,)).fetchone()[0]
+    more = [_add_track(conn, artist, f"Song {n}", monitored=1, with_file=True,
+                       spotify_id=f"more-{n}") for n in range(4)]
+    marks = ",".join("?" for _ in more)
+    conn.execute(f"UPDATE lib2_track_files SET format='mp3', bitrate=128 WHERE track_id IN ({marks})", more)
+    conn.execute(
+        f"UPDATE lib2_tracks SET quality_profile_id=?, quality_profile_explicit=1 "
+        f"WHERE id IN ({marks})", (profile_id, *more))
+    recompute_wanted(conn, track_ids=more)
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+
+    stats = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=2)
+    assert stats["upgrades_queued"] == 2 and stats["upgrades_waiting"] == 3
+    again = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=2)
+    # the next two, not the same two
+    assert again["upgrades_queued"] == 2
+    asked = [a for a in db.added if a == "owned-128" or str(a).startswith("more-")]
+    assert len(asked) == len(set(asked)) == 4
+
+
+def test_a_file_whose_quality_cannot_be_read_is_not_asked_for_unattended(imported_conn):
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    conn.execute("UPDATE lib2_track_files SET format=NULL, bitrate=NULL WHERE track_id=?", (owned,))
+    conn.commit()
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+    stats = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert stats["upgrades_queued"] == 0 and "owned-128" not in db.added
+
+
+def _wishlist_table(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS wishlist_tracks(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, spotify_track_id TEXT,
+               source_type TEXT, source_info TEXT, profile_id INTEGER,
+               quality_profile_id INTEGER,
+               date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+
+
+def test_an_upgrade_search_that_found_nothing_steps_aside(imported_conn):
+    import json as _json
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+    reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    # the wish the attempt made, still on the list a day later, and one a
+    # person asked for (Enhance Quality) long after that attempt
+    _wishlist_table(conn)
+    info = _json.dumps({"source": "library_v2", "lib2_track_id": owned, "upgrade_check": True})
+    conn.execute(
+        "UPDATE lib2_tracks SET upgrade_attempt=json_set(upgrade_attempt, '$.at', "
+        "datetime('now', '-1 day')) WHERE id=?", (owned,))
+    conn.execute(
+        "INSERT INTO wishlist_tracks(spotify_track_id, source_type, source_info, profile_id, date_added) "
+        "VALUES('owned-128', 'album', ?, 1, datetime('now', '-1 day'))", (info,))
+    conn.commit()
+    stats = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert stats["upgrades_withdrawn"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM wishlist_tracks").fetchone()[0] == 0
+
+    conn.execute(
+        "INSERT INTO wishlist_tracks(spotify_track_id, source_type, source_info, profile_id) "
+        "VALUES('owned-128', 'album', ?, 1)", (info,))
+    conn.commit()
+    stats = reconcile_track_wishlist(db, profile_id=1, upgrades_per_run=5)
+    assert stats["upgrades_withdrawn"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM wishlist_tracks").fetchone()[0] == 1
+
+
+def test_the_owned_sweep_leaves_a_live_upgrade_wish_alone(imported_conn, monkeypatch):
+    """it removed every upgrade wish as "already in your library" before the
+    wish was tried: owning the file is the premise of the wish"""
+    from types import SimpleNamespace
+    from core.wishlist import library_match, processing
+    conn = imported_conn
+    owned, _missing = _below_target_library(conn)
+    db = _FakeDB(conn.execute("PRAGMA database_list").fetchone()[2])
+    upgrade = {"name": "Another Night", "artists": [{"name": "Real McCoy"}],
+               "spotify_track_id": "owned-128",
+               "source_info": {"source": "library_v2", "lib2_track_id": owned, "upgrade_check": True}}
+    plain = {"name": "Another Night", "artists": [{"name": "Real McCoy"}],
+             "spotify_track_id": "plain-1", "source_info": {"source": "playlist"}}
+    removed = []
+    service = SimpleNamespace(
+        get_wishlist_tracks_for_download=lambda profile_id: [upgrade, plain],
+        mark_track_download_result=lambda track_id, **kw: removed.append(track_id) or True)
+    monkeypatch.setattr(library_match, "find_owned_match",
+                        lambda *a, **k: (SimpleNamespace(file_path="/m/x.mp3"), 1.0, "Real McCoy"))
+    monkeypatch.setattr("core.library.manual_library_match.get_match_for_track",
+                        lambda *a, **k: None)
+    profiles = SimpleNamespace(get_all_profiles=lambda: [{"id": 1}])
+
+    assert processing.remove_tracks_already_in_library(service, profiles, db, "plex") == 1
+    assert removed == ["plain-1"]
+
+    # once the file meets the profile the wish is an owned track like any other
+    conn.execute("UPDATE lib2_track_files SET bitrate=320 WHERE track_id=?", (owned,))
+    conn.commit()
+    removed.clear()
+    assert processing.remove_tracks_already_in_library(service, profiles, db, "plex") == 2
+    assert sorted(removed) == ["owned-128", "plain-1"]

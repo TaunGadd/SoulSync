@@ -6,7 +6,32 @@ import { z } from 'zod';
 //   - neither    -> artist overview
 // Keeping it to one route (vs nested file routes) keeps the TanStack route tree
 // small and avoids codegen surprises while still giving the full drill-down UX.
-export const LIBRARY_V2_SORTS = ['name', 'added', 'albums', 'tracks'] as const;
+export const LIBRARY_V2_SORTS = [
+  'name',
+  'added',
+  'albums',
+  'tracks',
+  // #2106/#2107: by the artist's collection completeness
+  'completion',
+  'missing',
+  'upgrades',
+  'incomplete_albums',
+] as const;
+/** #2107: '' is the sort's own way round */
+export const LIBRARY_V2_SORT_DIRS = ['', 'asc', 'desc'] as const;
+export type LibraryV2SortDir = (typeof LIBRARY_V2_SORT_DIRS)[number];
+/** #2107: the collection filter */
+export const LIBRARY_V2_COMPLETION_FILTERS = [
+  '',
+  'complete',
+  'incomplete',
+  'none_owned',
+  'unchecked',
+] as const;
+export type LibraryV2CompletionFilter = (typeof LIBRARY_V2_COMPLETION_FILTERS)[number];
+/** what an artist's collection is: everything here, some missing, a release
+ *  of unknown size (so maybe not everything), or nothing expected yet */
+export type LibraryV2Completion = 'complete' | 'incomplete' | 'unchecked' | 'unknown';
 export const LIBRARY_V2_SONG_SORTS = ['title', 'artist', 'album', 'year', 'recent'] as const;
 export type LibraryV2SongSort = (typeof LIBRARY_V2_SONG_SORTS)[number];
 export type LibraryV2Sort = (typeof LIBRARY_V2_SORTS)[number];
@@ -31,6 +56,8 @@ const coercedString = z.preprocess(
   z.string(),
 );
 
+const optionalCount = z.coerce.number().int().min(0).optional().catch(undefined);
+
 const libraryV2SearchObject = z.object({
   section: z.enum(['artists', 'albums', 'songs', 'wanted']).default('artists').catch('artists'),
   // Same trap as `discover`/`discoverName` below, and it bit here too: a filter
@@ -49,7 +76,23 @@ const libraryV2SearchObject = z.object({
     .catch(false),
   /** 'upgradable' (could be better; artists and songs) or 'lossless' (songs) */
   quality: z.enum(['', 'lossless', 'upgradable']).default('').catch(''),
+  /** #2046: artists whose albums are all reviewed and locked, or not yet */
+  review: z.enum(['', 'reviewed', 'unreviewed']).default('').catch(''),
   view: z.enum(['table', 'cards', 'discovery']).default('cards').catch('cards'),
+  /** #2107: turn the artist sort around */
+  dir: z.enum(LIBRARY_V2_SORT_DIRS).default('').catch(''),
+  /** #2107: complete, missing tracks, nothing owned, catalogue not checked */
+  completion: z.enum(LIBRARY_V2_COMPLETION_FILTERS).default('').catch(''),
+  /** #2107: missing-track and completion-% ranges; unset is open */
+  missingMin: optionalCount,
+  missingMax: optionalCount,
+  pctMin: optionalCount,
+  pctMax: optionalCount,
+  /** #2107: release artists (default), only featured guests, or both */
+  credit: z.enum(['', 'featured', 'all']).default('').catch(''),
+  /** #2106: the wanted list narrowed to one artist (from their missing count) */
+  wantedArtist: z.coerce.number().int().positive().optional().catch(undefined),
+  wantedArtistName: coercedString.optional().catch(undefined),
   monitored: z.enum(LIBRARY_V2_MONITOR_FILTERS).default('all').catch('all'),
   page: z.coerce.number().int().positive().default(1).catch(1),
   artist: z.coerce.number().int().positive().optional().catch(undefined),
@@ -226,6 +269,15 @@ export interface LibraryV2ArtistSummary {
   provider_ids?: Record<string, string>;
   /** tracks below their quality profile; only with include=upgradable */
   upgradable_count?: number;
+  /** #2106: own releases nobody has looked up the size of */
+  unverified_albums?: number;
+  /** #2106: complete is only ever said when something is expected and every
+   *  release's size is known */
+  completion?: LibraryV2Completion;
+  /** what the count is against: a Watchlist artist's collection settings
+   *  (missing tracks are in Wanted) or, for anyone else, the albums you have
+   *  (missing tracks are on the artist's page) */
+  completeness_basis?: 'watchlist' | 'albums';
 }
 
 /** One row of the album browse (`GET /api/library/v2/albums`). */
@@ -270,6 +322,9 @@ export interface LibraryV2AlbumSummary {
   spotify_id: string | null;
   /** the release card's musicbrainz link. */
   musicbrainz_id?: string | null;
+  /** #2055: what kind of release it is ('live', 'soundtrack', ...). An array,
+   *  even an empty one, is known; null means nobody has said yet. */
+  release_types?: string[] | null;
   /** the release's ids by provider: a release you don't have opens the
    *  download modal from the one matching the artist's source */
   provider_ids?: Record<string, string>;
@@ -284,6 +339,11 @@ export interface LibraryV2AlbumSummary {
   /** I8: sum of each present track's primary file size, in bytes. */
   total_size_bytes: number;
   user_overrides: Record<string, unknown>;
+  /** the row that stands for this release on the artist page: itself, unless
+   *  the catalogue holds the release more than once (see -library-v2.releases) */
+  release_lead_id?: number;
+  /** how many rows of this release have files */
+  release_copies?: number;
 }
 
 export interface LibraryV2ArtistDetail {
@@ -345,6 +405,8 @@ export interface LibraryV2ArtistSettings {
   include_eps: boolean;
   include_singles: boolean;
   include_live: boolean;
+  /** #2082: live versions on releases that are not live albums */
+  include_live_tracks: boolean;
   include_remixes: boolean;
   include_acoustic: boolean;
   include_compilations: boolean;
@@ -455,7 +517,7 @@ export interface LibraryV2QueueStatusResponse {
 export interface LibraryV2MatchService {
   service: string;
   label: string;
-  /** 'matched' | 'not_found' | 'pending' (kept as string for forward-compat). */
+  /** 'matched' | 'not_found' | 'error' | 'cleared' | 'pending' (kept as string for forward-compat). */
   status: string;
   external_id: string | null;
   last_attempted: string | null;
@@ -618,6 +680,8 @@ export interface LibraryV2Track {
   /** Plex/Jellyfin/Navidrome instances that recognised this imported track. */
   media_server_sources?: string[];
   is_missing?: boolean;
+  /** #2144: one of the album's most played tracks on Last.fm (album detail only). */
+  popular?: boolean;
   /** Quality vs the album's profile (null when missing or not measurable). */
   meets_profile?: boolean | null;
   upgrade_candidate?: boolean | null;
@@ -684,6 +748,10 @@ export interface LibraryV2QualityProfile {
 }
 
 export interface LibraryV2ImportState {
+  /** False on an install created since the catalogue cutover: there is no
+   * older library to import, so the page offers no import (#2062). Absent
+   * from an older server, which reads as "may have one". */
+  has_legacy_source?: boolean;
   running: boolean;
   stage: string | null;
   current: number;

@@ -11,7 +11,7 @@ call site.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, Set
+from typing import Optional, Any, Dict, Iterable, Set
 
 # Well under SQLite's oldest documented SQLITE_MAX_VARIABLE_NUMBER (999), so a
 # single chunk's placeholder count is safe on every SQLite build we run on.
@@ -132,24 +132,44 @@ _OWNED = {
     "album": ("EXISTS (SELECT 1 FROM lib2_tracks owned_t"
               "         JOIN lib2_track_files owned_f ON owned_f.track_id = owned_t.id"
               "        WHERE owned_t.album_id = {alias}.id AND " + _LIVE_FILE + ")"),
-    # a release of their own on disk: the album's primary artist, or a primary
-    # album artist (a split or joint album). Not a featured credit.
+    # a release of their own on disk, by the artist page's rule
+    # (queries._own_release_ids): the album's primary artist, or the lead
+    # credit on more than half its tracks (a joint album). Not a guest.
+    #
+    # The album junction's 'primary' role is not that rule: plex-era rows
+    # carry it for guests on compilations and on other people's albums (876
+    # extra artists on a 7k-artist library), and the page files those
+    # releases under Appears On. #2142: a 2pac library listed nate dogg,
+    # outlawz, dr. dre beside him.
     #
     # Two EXISTS, never one with an OR inside: "primary_artist_id = x OR a
     # credit row names x" can't use either index, so SQLite walked every album
     # for every artist (30k x 71k on a big library, minutes per cold Library
-    # page load, Nov 4 2026). Each branch here starts from its own index.
+    # page load, Nov 4 2026). Each branch here starts from its own index, and
+    # the counts only run for a track the artist leads on an album on disk.
     "release_artist": ("(EXISTS (SELECT 1 FROM lib2_albums owned_al"
                        "          JOIN lib2_tracks owned_t ON owned_t.album_id = owned_al.id"
                        "          JOIN lib2_track_files owned_f ON owned_f.track_id = owned_t.id"
                        "         WHERE owned_al.primary_artist_id = {alias}.id"
                        "           AND " + _LIVE_FILE + ")"
-                       " OR EXISTS (SELECT 1 FROM lib2_album_artists owned_aa"
-                       "              JOIN lib2_tracks owned_t ON owned_t.album_id = owned_aa.album_id"
-                       "              JOIN lib2_track_files owned_f ON owned_f.track_id = owned_t.id"
-                       "             WHERE owned_aa.artist_id = {alias}.id"
-                       "               AND owned_aa.role = 'primary'"
-                       "               AND " + _LIVE_FILE + "))"),
+                       " OR EXISTS (SELECT 1 FROM lib2_track_artists owned_ta"
+                       "              JOIN lib2_tracks owned_lt ON owned_lt.id = owned_ta.track_id"
+                       "              JOIN lib2_albums owned_la ON owned_la.id = owned_lt.album_id"
+                       "             WHERE owned_ta.artist_id = {alias}.id"
+                       "               AND owned_la.primary_artist_id <> {alias}.id"
+                       "               AND owned_ta.role = 'primary'"
+                       "               AND EXISTS (SELECT 1 FROM lib2_tracks owned_t"
+                       "                   JOIN lib2_track_files owned_f ON owned_f.track_id = owned_t.id"
+                       "                  WHERE owned_t.album_id = owned_la.id"
+                       "                    AND " + _LIVE_FILE + ")"
+                       "               AND 2 * (SELECT COUNT(*) FROM lib2_tracks owned_ct"
+                       "                   JOIN lib2_track_artists owned_ca"
+                       "                     ON owned_ca.track_id = owned_ct.id"
+                       "                    AND owned_ca.artist_id = {alias}.id"
+                       "                    AND owned_ca.role = 'primary'"
+                       "                  WHERE owned_ct.album_id = owned_la.id)"
+                       "                 > (SELECT COUNT(*) FROM lib2_tracks owned_nt"
+                       "                     WHERE owned_nt.album_id = owned_la.id)))"),
     # Either credit counts: the album's primary artist and a featured credit on
     # the track are both in the library.
     "artist": ("(EXISTS (SELECT 1 FROM lib2_tracks owned_t"
@@ -183,7 +203,8 @@ def scope_visibility_sql(entity_type: str, alias: str, *, scope=_AMBIENT) -> str
         raise ValueError(f"Unknown entity type: {entity_type!r}")
     if not _VALID_IDENTIFIER.match(alias):
         raise ValueError(f"Invalid alias: {alias!r}")
-    intent = intent_profile_id(resolved)
+    # the caller's intent: a household member's own wishes are visible to them
+    intent = intent_profile_id(scope)
     # Intent at ANY level below the row, from either table. An artist whose
     # only claim is a monitored ALBUM, or a wanted TRACK, is exactly the row a
     # user is waiting for -- checking the artist level alone hid it and made
@@ -355,8 +376,33 @@ def intent_profile_id(scope=_AMBIENT) -> int:
     """
     resolved = _resolve_scope(scope)
     if resolved is ANY_OWNER or resolved is None or resolved == "shared":
+        # a household member reading the shared library keeps their own
+        # watchlist and wishlist, as 3.6.1 did and plex/jellyfin do: their
+        # rows, not the admin's. only for the caller of a request; a job or
+        # an explicitly passed scope speaks for the shared library
+        if scope is _AMBIENT:
+            member = shared_library_member()
+            if member is not None:
+                return member
         return 1
     return int(resolved)
+
+
+def shared_library_member() -> Optional[int]:
+    """The calling profile when it is a non-admin reading the shared library
+    in a request, else None (an admin, a background job, its own library)."""
+    try:
+        from flask import has_request_context
+        if not has_request_context():
+            return None
+        from core.profile_context import get_current_profile_id, is_admin_request
+        pid = get_current_profile_id()
+        if not pid or int(pid) == 1 or is_admin_request():
+            return None
+        from core.library_scope import library_scope_for_profile
+        return int(pid) if library_scope_for_profile(int(pid)) == "shared" else None
+    except Exception:  # noqa: BLE001 - unknown caller: the shared library's intent
+        return None
 
 
 def monitored_sql(entity_type: str, alias: str, *, scope=_AMBIENT) -> str:
@@ -474,6 +520,28 @@ def scoped_primary_file_join(track_alias: str, file_alias: str, *, scope=_AMBIEN
             f" ORDER BY {primary_order('pf')} LIMIT 1)")
 
 
-__all__ = ["ANY_OWNER", "in_library_sql", "library_index_artist_ids_sql", "owned_in_library_sql", "intent_profile_id", "library_artist_sql", "library_member_sql", "monitored_sql", "owned_sql",
-           "owner_clause", "scoped_primary_file_join",
+#: the active-server name of standalone mode, where SoulSync's own files are the library
+STANDALONE_SERVER = "soulsync"
+
+
+def on_server_sql(entity_type: str, alias: str, server_source: Optional[str]) -> tuple:
+    """``(sql, params)``: ``alias`` is on ``server_source``, by a mapping or
+    by the row's own stamp.
+
+    standalone has no server to recognise anything, so a row nobody stamped
+    (full refresh, an import made under another mode) counts as its own.
+    the callers still ask for a live file, so a fileless catalogue row never
+    passes (#2111)."""
+    if not _VALID_IDENTIFIER.match(alias) or entity_type not in ("artist", "album", "track"):
+        raise ValueError(f"Invalid on_server_sql args: {entity_type!r} {alias!r}")
+    sql = ("(EXISTS (SELECT 1 FROM lib2_media_server_mappings m "
+           f"WHERE m.entity_type='{entity_type}' AND m.entity_id={alias}.id "
+           f"AND m.server_source=?) OR {alias}.server_source=?")
+    if server_source == STANDALONE_SERVER:
+        sql += f" OR {alias}.server_source IS NULL"
+    return sql + ")", [server_source, server_source]
+
+
+__all__ = ["ANY_OWNER", "in_library_sql", "library_index_artist_ids_sql", "owned_in_library_sql", "intent_profile_id", "library_artist_sql", "library_member_sql", "monitored_sql", "on_server_sql", "owned_sql",
+           "owner_clause", "STANDALONE_SERVER", "scoped_primary_file_join",
            "scope_visibility_sql", "scoped_monitored", "select_existing_ids"]

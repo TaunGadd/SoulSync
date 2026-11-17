@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.imports.folder_artist import resolve_folder_artist
+from core.imports.paths import artist_folder_names
 from core.imports.paths import config_root_path, docker_resolve_path
 from core.imports.pipeline import import_rejection_reason, kept_existing_library_file
 from utils.logging_config import get_logger
@@ -1193,12 +1194,18 @@ class AutoImportWorker:
             except Exception as exc:
                 logger.debug("display-name tag read failed for %s: %s", group_files[0], exc)
 
+            # A subfolder holding one album is named by the folder (#1289). The
+            # staging root is not a folder anyone named: a lone album's files
+            # dropped straight into it were listed as "Staging", and looked up
+            # as an album called Staging.
+            named_by_folder = len(groups) == 1 and not is_root
             candidates.append(FolderCandidate(
                 path=directory,
-                name=os.path.basename(directory) if len(groups) == 1 else str(display_name),
+                name=os.path.basename(directory) if named_by_folder else str(display_name),
                 audio_files=audio_files,
                 disc_structure=disc_structure if len(disc_structure) > 1 else {},
                 folder_hash=folder_hash,
+                is_staging_root=is_root,
             ))
 
         if untagged and not is_root:
@@ -1422,7 +1429,9 @@ class AutoImportWorker:
             try:
                 cursor = conn.cursor()
                 removed = delete_replaced_track(cursor, hint.replace_track_id,
-                                                resolve_fn=_resolve_old, new_paths=new_paths)
+                                                resolve_fn=_resolve_old, new_paths=new_paths,
+                                                id_space=hint.replace_id_space,
+                                                file_id=hint.replace_file_id)
                 consume_hint(cursor, hint.id)
                 conn.commit()
             finally:
@@ -2148,7 +2157,9 @@ class AutoImportWorker:
             if self._config_manager.get('import.folder_artist_override', True):
                 staging_root = self._resolve_staging_path() or self.staging_path
                 rel_path = os.path.relpath(candidate.path, staging_root)
-                folder_artist = resolve_folder_artist(rel_path, artist_name, enabled=True)
+                folder_artist = resolve_folder_artist(
+                    rel_path, artist_name, enabled=True,
+                    same_as=artist_folder_names(artist_name))
                 if folder_artist:
                     logger.info(f"[Auto-Import] Parent folder artist '{folder_artist}' differs from tag artist '{artist_name}' — using folder artist")
                     artist_name = folder_artist
@@ -2176,6 +2187,11 @@ class AutoImportWorker:
             int(m.get('track', {}).get('duration_ms', 0) or 0)
             for m in all_matches
         )
+        # #2068: $explicit. the album's flag over every matched track, so the
+        # folder is the same for all of them; each file reads its own track's.
+        from core.imports.paths import album_explicit_flag
+        album_explicit = album_explicit_flag(
+            album_data, [m.get('track') or {} for m in all_matches])
         # Ensure an active-import entry exists for this candidate.
         # Callers from `_process_one_candidate` already registered, but
         # tests invoke `_process_matches` directly without going
@@ -2345,6 +2361,7 @@ class AutoImportWorker:
                         'images': album_data.get('images', [{'url': image_url}] if image_url else []),
                         'artists': [{'name': artist_name, 'id': identification.get('artist_id') or ''}],
                         'album_type': album_data.get('album_type', 'album'),
+                        'explicit': album_explicit,
                         # Album total duration in ms (sum of every
                         # matched track). Read by side_effects to
                         # populate the album row's `duration` column —
@@ -2359,6 +2376,7 @@ class AutoImportWorker:
                         'track_number': track_number,
                         'disc_number': disc_number,
                         'duration_ms': track.get('duration_ms', 0),
+                        'explicit': track.get('explicit'),
                         'artists': track.get('artists', [{'name': artist_name}]),
                         'uri': track.get('uri', ''),
                         # Album-id back-reference + per-recording IDs so
@@ -2393,6 +2411,8 @@ class AutoImportWorker:
                 # default", which the pipeline resolves on its own.
                 if auto_import_profile_id:
                     context['track_info']['quality_profile_id'] = auto_import_profile_id
+                    # the user set it for this import, so it pins (review 5 W2-WD-1)
+                    context['track_info']['quality_profile_explicit'] = True
 
                 # #1504: AcoustID relocate breadcrumb — the staged file may
                 # carry a sidecar with the owning user profile. Read it into

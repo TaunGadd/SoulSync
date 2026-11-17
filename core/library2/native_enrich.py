@@ -141,6 +141,12 @@ def titles_are_same_release(wanted: Any, candidate: Any) -> bool:
     still decides whether the titles are *close*, this decides whether the
     thing that makes them differ is allowed to be folded away.
     """
+    from core.text.title_match import numbers_conflict
+
+    # the signature only reads a number at the very end, and 'Group Therapy
+    # 701 (DJ Mix)' ends in 'mix', so 702 passed as the same release (#2134)
+    if numbers_conflict(str(wanted or ""), str(candidate or "")):
+        return False
     return _title_variant_signature(wanted) == _title_variant_signature(candidate)
 
 
@@ -341,6 +347,10 @@ def resolve_and_enrich_native_artist(
     "reason": "not_found"}`` when nothing resolved (the expected outcome for
     genuine collaboration names like "Ian Asher & Galantis").
     """
+    from core.library2 import locks
+    if locks.blocks("artist", artist_id, "match", "Artist matching", conn=conn):
+        # #2046: reviewed and locked, its ids and art stay as they are
+        return {"success": False, "attempted": False, "reason": "locked"}
     if resolver is None:
         resolver = default_artist_resolver
     if anchor_resolver is None:
@@ -352,7 +362,7 @@ def resolve_and_enrich_native_artist(
         (int(artist_id),),
     ).fetchone()
     if row is None:
-        raise LookupError(f"Library v2 artist {artist_id} not found")
+        raise LookupError(f"Library artist {artist_id} not found")
 
     anchors = _artist_catalog_anchors(conn, int(artist_id))
     if anchors:
@@ -495,6 +505,9 @@ def enrich_native_artist_artwork(
     asks the artwork engine for an image, writing it onto the row. No-op (returns
     False) when the row has no provider id or the engine finds nothing.
     """
+    from core.library2 import locks
+    if locks.blocks("artist", artist_id, "artwork", "Artist artwork", conn=conn):
+        return False
     row = conn.execute(
         "SELECT id, name, image_url, spotify_id, musicbrainz_id, external_ids "
         "FROM lib2_artists WHERE id=?",
@@ -536,8 +549,9 @@ def schedule_native_artist_artwork(database: Any, artist_id: int):
     """
     import threading
 
+    from core.library2 import locks
     thread = threading.Thread(
-        target=_run_native_artist_artwork,
+        target=locks.carry(_run_native_artist_artwork),
         args=(database, int(artist_id)),
         name="lib2-native-artist-artwork",
         daemon=True,
@@ -593,6 +607,9 @@ def _apply_descriptive_metadata(
     written on every enrich the provider's spelling replaced the file's ("Come
     Together" became "Come Together - Remastered 2009") and could flip between
     providers run to run."""
+    from core.library2 import locks
+    if locks.blocks_entity(entity_type, entity_id, "metadata", "Metadata refresh", conn=conn):
+        return None
 
     columns = {
         "artist": {
@@ -624,6 +641,12 @@ def _apply_descriptive_metadata(
         if column == "image_url" and entity_type in {"artist", "album"}:
             assignments.append(
                 "image_url=CASE WHEN COALESCE(art_locked,0)=1 THEN image_url ELSE ? END"
+            )
+        elif column == "genres":
+            # the genre cleanup locked these; enrich and full retag must not
+            # put back what it removed (review 5 W2-WF-1)
+            assignments.append(
+                "genres=CASE WHEN COALESCE(genres_locked,0)=1 THEN genres ELSE ? END"
             )
         elif fill_identity_only and column in _IDENTITY_COLUMNS:
             assignments.append(
@@ -703,6 +726,11 @@ def enrich_native_entity_for_service(
     if canonical is None:
         raise ValueError(f"Unsupported entity type: {entity_type}")
     service = str(service or "").strip().lower()
+    from core.library2 import locks
+    if locks.blocks_entity(canonical, entity_id, "metadata",
+                           f"{service.title()} enrichment", conn=conn):
+        # #2046: reviewed and locked, so nothing is searched or written
+        return {"success": False, "error": "locked", "locked": True}
 
     if canonical == "artist":
         row = conn.execute(
@@ -735,7 +763,7 @@ def enrich_native_entity_for_service(
         artist_name = str(row["artist_name"] or "") if row else ""
         album_title = str(row["album_title"] or "") if row else ""
     if row is None:
-        raise LookupError(f"Library v2 {canonical} {entity_id} not found")
+        raise LookupError(f"Library {canonical} {entity_id} not found")
 
     source_ids = _stored_source_ids(row)
     provider_id = source_ids.get(service)
@@ -830,9 +858,11 @@ def enrich_native_entity_for_service(
         ProviderIdentityConflict, set_library_v2_match,
     )
     try:
+        # a search's pick, not the user's: labelled automatic, and never
+        # relabels a match the user made by hand
         set_library_v2_match(
             conn, canonical, int(entity_id), actual_source, provider_id,
-            actor="native_enrichment",
+            actor="native_enrichment", origin="automatic",
         )
     except ProviderIdentityConflict as conflict:
         # Another entity already IS this provider release. Leaving this one
@@ -1001,7 +1031,9 @@ def schedule_native_entity_enrich(
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("native entity enrich close failed: %s", exc)
 
-    thread = threading.Thread(target=_run, name="lib2-native-entity-enrich", daemon=True)
+    from core.library2 import locks
+    thread = threading.Thread(target=locks.carry(_run), name="lib2-native-entity-enrich",
+                              daemon=True)
     thread.start()
     return thread
 
@@ -1017,11 +1049,33 @@ def _get_or_create_component_artist(
     still-unmapped* row is enriched too. A legacy-backed match is left untouched
     (it keeps the authoritative legacy path).
     """
+    from core.library2.importer import normalize_name
+
+    source = str(identity["source"]).strip().lower()
+    provider_id = str(identity["artist_id"]).strip()
+    columns = "id, legacy_artist_id, spotify_id, musicbrainz_id, external_ids"
+    # third #1062 review P2B-7: the name the way autolink keys it (name_key,
+    # through its index), then whoever already holds the resolver's id ("Ian
+    # Asher & Beyonce" splits to "Beyonce"; the library's "Beyoncé" holds the
+    # spotify id). a NOCASE name match missed the accent and minted a second
+    # row carrying the same id
     existing = conn.execute(
-        "SELECT id, legacy_artist_id, spotify_id, musicbrainz_id, external_ids "
-        "FROM lib2_artists WHERE name=? COLLATE NOCASE ORDER BY id LIMIT 1",
+        f"SELECT {columns} FROM lib2_artists WHERE name_key=? ORDER BY id LIMIT 1",
+        (normalize_name(name),),
+    ).fetchone() or conn.execute(
+        # a row written without a name_key
+        f"SELECT {columns} FROM lib2_artists WHERE name=? COLLATE NOCASE ORDER BY id LIMIT 1",
         (name,),
     ).fetchone()
+    if existing is None and source and provider_id:
+        from core.library2.match_status import provider_id_owner
+        try:
+            holder = provider_id_owner(conn, "artist", source, provider_id)
+        except Exception:  # noqa: BLE001 - a provider the owner check doesn't know
+            holder = None
+        if holder is not None:
+            existing = conn.execute(f"SELECT {columns} FROM lib2_artists WHERE id=?",
+                                    (holder,)).fetchone()
     if existing is not None:
         cid = int(existing["id"])
         unmapped = (
@@ -1030,7 +1084,7 @@ def _get_or_create_component_artist(
             and not existing["musicbrainz_id"]
             and (existing["external_ids"] or "{}") in ("", "{}")
         )
-        if unmapped:
+        if unmapped and identity_is_free(conn, cid, source, provider_id):
             _persist_identity(
                 conn, cid,
                 source=str(identity["source"]).strip().lower(),
@@ -1041,13 +1095,15 @@ def _get_or_create_component_artist(
             )
         return cid
 
-    from core.library2.importer import normalize_name
-
     cur = conn.execute(
         "INSERT INTO lib2_artists(name, name_key, sort_name, monitored) VALUES(?, ?, ?, ?)",
         (name, normalize_name(name), name, monitored),
     )
     cid = int(cur.lastrowid)
+    if not identity_is_free(conn, cid, source, provider_id):
+        # never a second holder of one provider identity (the single-artist
+        # path's rule); the component stays a plain name row
+        return cid
     _persist_identity(
         conn, cid,
         source=str(identity["source"]).strip().lower(),
@@ -1114,14 +1170,39 @@ def _rehome_and_delete_combined(
             )
     conn.execute("DELETE FROM lib2_track_artists WHERE artist_id=?", (combined_id,))
 
-    # 4) Drop the ghost's monitor rules so they don't linger.
+    # 4) Every profile's watch on the ghost goes to the artist it became
+    #    (3.6.1's watchlist rows survived an artist merge or split; dropping
+    #    them showed the artist unwatched and recomputed its wants away). A
+    #    component's own rule for that profile wins. Then the ghost's go.
+    #    review 4 R4-B-5: only the primary component. a watch on "Ian Asher
+    #    & Beyonce" put every component's whole discography on the wanted
+    #    list (an artist rule wants all of it); nobody chose Beyonce.
+    watch_targets = [int(primary_id)]
     try:
+        ghost = conn.execute("SELECT COALESCE(monitored,0) FROM lib2_artists WHERE id=?",
+                             (combined_id,)).fetchone()
+        if ghost and int(ghost[0]) == 1:
+            for cid in watch_targets:
+                conn.execute("UPDATE lib2_artists SET monitored=1, updated_at=CURRENT_TIMESTAMP "
+                             "WHERE id=?", (cid,))
+        rules = conn.execute(
+            "SELECT profile_id, monitored, provenance FROM lib2_monitor_rules "
+            "WHERE entity_type='artist' AND entity_id=?", (combined_id,)).fetchall()
+        for profile_id, monitored, provenance in rules:
+            for cid in watch_targets:
+                if conn.execute("SELECT 1 FROM lib2_monitor_rules WHERE entity_type='artist' "
+                                "AND entity_id=? AND profile_id=?", (cid, profile_id)).fetchone():
+                    continue
+                conn.execute(
+                    "INSERT INTO lib2_monitor_rules(entity_type, entity_id, profile_id, "
+                    "monitored, provenance) VALUES('artist', ?, ?, ?, ?)",
+                    (cid, profile_id, monitored, provenance))
         conn.execute(
             "DELETE FROM lib2_monitor_rules WHERE entity_type='artist' AND entity_id=?",
             (combined_id,),
         )
     except Exception as exc:  # noqa: BLE001 — table optional/absent on minimal DBs
-        logger.debug("ghost monitor-rule cleanup skipped (%s): %s", combined_id, exc)
+        logger.debug("ghost monitor-rule carry skipped (%s): %s", combined_id, exc)
 
     # 5) The ghost is now unreferenced by any primary or junction.
     # If it is legacy-backed, keep it as an alias so future legacy imports
@@ -1138,6 +1219,26 @@ def _rehome_and_delete_combined(
         )
     else:
         conn.execute("DELETE FROM lib2_artists WHERE id=?", (combined_id,))
+
+
+def _identified_name_keys(conn, *, exclude_id: Optional[int] = None) -> set:
+    """normalized names of every artist a provider identified, the row
+    ``exclude_id`` aside."""
+    from core.library2.importer import normalize_name
+
+    keys = set()
+    for aid, name in conn.execute(
+            f"SELECT a.id, a.name FROM lib2_artists a WHERE a.canonical_artist_id IS NULL "
+            f"AND {_IDENTIFIED_SQL}"):
+        if exclude_id is not None and int(aid) == int(exclude_id):
+            continue
+        key = normalize_name(name or "")
+        if key:
+            keys.add(key)
+    # a name the user said is one artist counts as identified (#2150)
+    from core.imports.collab_artist import kept_whole_keys
+    keys.update(kept_whole_keys())
+    return keys
 
 
 def smart_split_combined_artist(
@@ -1171,9 +1272,17 @@ def smart_split_combined_artist(
     if row is None:
         return None
 
-    from core.library2.importer import split_artist_credits
+    from core.library2.importer import normalize_name, split_known_artist_credits
 
-    components = split_artist_credits(row["name"])
+    # an artist the library already knows by a run of this name stays whole
+    # ("Above & Beyond & Mat Zo" is two artists), and a name the library
+    # already holds as an identified artist is that artist, not a list:
+    # "Above" and "Beyond" both resolve on their own (#2136)
+    identified = _identified_name_keys(conn, exclude_id=int(artist_id))
+    if normalize_name(row["name"] or "") in identified:
+        return None
+    components = split_known_artist_credits(
+        row["name"], lambda name: normalize_name(name) in identified)
     if len(components) < 2:
         return None
 
@@ -1184,12 +1293,12 @@ def smart_split_combined_artist(
             return None  # not confident — leave the combined row intact
         identities.append((component, identity))
 
-    ghost_monitored = int(row["monitored"] if row["monitored"] is not None else 1)
-
     component_ids: List[int] = []
     for component, identity in identities:
+        # born unwatched: _rehome_and_delete_combined gives the ghost's watch
+        # to the primary only, nobody chose the guest (review 5 W2-WF-4)
         cid = _get_or_create_component_artist(
-            conn, component, identity, monitored=ghost_monitored
+            conn, component, identity, monitored=0
         )
         if cid not in component_ids:
             component_ids.append(cid)
@@ -1237,9 +1346,13 @@ def _mark_reconcile_attempted(conn, artist_id: int) -> None:
 
 def _pending_unmapped_artists(
     conn, limit: Optional[int], *, cooldown_hours: Optional[float] = None,
-    combined_only: bool = False,
+    combined_only: bool = False, oldest_attempt_first: bool = False,
 ) -> List[Dict[str, Any]]:
     """Artists (both native and legacy) that still carry no catalog provider id.
+
+    ``oldest_attempt_first`` puts never-tried artists first, then the ones
+    tried longest ago, so a capped batch rotates instead of retrying the same
+    unresolvable names forever (review 5 R5-I-7).
 
     ``cooldown_hours`` skips rows attempted inside that window — the backoff an
     automated (post-import) run needs so a permanently unresolvable name does
@@ -1265,7 +1378,11 @@ def _pending_unmapped_artists(
         # name is theirs: every worker matches it by name on its own cadence
         from core.library2.artist_credit_gate import unresolved_credit_sql
         sql += f"  AND {unresolved_credit_sql('lib2_artists')} "
-    sql += "ORDER BY id"
+    if oldest_attempt_first and _has_attempt_column(conn):
+        sql += ("ORDER BY unmapped_last_attempted_at IS NOT NULL, "
+                "unmapped_last_attempted_at, id")
+    else:
+        sql += "ORDER BY id"
     rows = conn.execute(sql, params).fetchall()
 
     from core.library2.artist_credit_gate import CATALOG_PROVIDERS
@@ -1316,18 +1433,26 @@ def _clear_borrowed_identity(conn, artist_id: int, namespace: str,
         assignments.append("spotify_id=NULL")
     elif namespace == "musicbrainz":
         assignments.append("musicbrainz_id=NULL")
-    else:
-        assignments.append("external_ids=json_remove(external_ids, ?)")
-        params.append(f"$.{namespace}")
+    # every namespace, the two with a column of their own included: the same id
+    # is also kept in external_ids, and the pass reads it from there when the
+    # column is empty. Clearing only the column left the artist holding the
+    # id, so it was "taken back" again on every start and never was (30 rows
+    # on one library, Nov 13 2026).
+    assignments.append(
+        "external_ids=CASE WHEN json_valid(external_ids) "
+        "THEN json_remove(external_ids, ?) ELSE external_ids END")
+    params.append(f"$.{namespace}")
     row = conn.execute(
-        "SELECT image_url, genres, art_locked FROM lib2_artists WHERE id=?",
+        "SELECT image_url, genres, art_locked, genres_locked FROM lib2_artists WHERE id=?",
         (int(artist_id),),
     ).fetchone()
     if row is not None:
         if (not row["art_locked"] and row["image_url"]
                 and row["image_url"] == owner_row["image_url"]):
             assignments.append("image_url=NULL")
-        if row["genres"] and row["genres"] == owner_row["genres"]:
+        # the genre cleanup settled locked genres (review 5 W2-WF-1)
+        if (not row["genres_locked"] and row["genres"]
+                and row["genres"] == owner_row["genres"]):
             assignments.append("genres='[]'")
     params.append(int(artist_id))
     conn.execute(
@@ -1390,7 +1515,10 @@ def release_borrowed_artist_identities(conn) -> Dict[str, Any]:
                   if _artist_is_a_release_primary(conn, aid)]
         if len(owners) != 1:
             stats["ambiguous"] += 1
-            logger.info(
+            # one line each at debug: these groups are left as they are, so the
+            # same ones came back on every pass (304 info lines per start on
+            # one library). the pass says how many in one line below
+            logger.debug(
                 "borrowed identity %s/%s shared by %s and no catalogue owner",
                 namespace, value, artist_ids,
             )
@@ -1403,6 +1531,10 @@ def release_borrowed_artist_identities(conn) -> Dict[str, Any]:
             stats["released"] += 1
             if aid not in stats["artist_ids"]:
                 stats["artist_ids"].append(aid)
+    if stats["ambiguous"] or stats["released"]:
+        logger.info(
+            "borrowed identities: %d taken back, %d shared with no catalogue owner and left alone",
+            stats["released"], stats["ambiguous"])
     return stats
 
 
@@ -1489,6 +1621,40 @@ def prune_browse_only_artists(conn) -> Dict[str, Any]:
                   WHERE ta2.artist_id = a.id
                     AND (al3.origin <> 'discography' OR al3.monitored = 1
                          OR COALESCE(t2.monitored, 0) = 1))
+           -- every profile's intent, not only the admin's columns: a
+           -- household member's watch (a rule; the column stays 0) or their
+           -- wanted tracks keep the artist, or the prune took their wishes
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_monitor_rules r
+                  WHERE r.entity_type = 'artist' AND r.entity_id = a.id AND r.monitored = 1)
+           -- review 4 R4-B-6: two lookups, no OR, the artist's tracks
+           -- first (CROSS JOIN keeps that order). otherwise SQLite walked
+           -- every track rule per artist when it had no stats
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_track_artists ta4
+                   CROSS JOIN lib2_monitor_rules r2 ON r2.entity_type = 'track'
+                        AND r2.entity_id = ta4.track_id AND r2.monitored = 1
+                  WHERE ta4.artist_id = a.id)
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_track_artists ta6
+                   CROSS JOIN lib2_tracks t6 ON t6.id = ta6.track_id
+                   CROSS JOIN lib2_monitor_rules r4 ON r4.entity_type = 'album'
+                        AND r4.entity_id = t6.album_id AND r4.monitored = 1
+                  WHERE ta6.artist_id = a.id)
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_track_artists ta5
+                   CROSS JOIN lib2_wanted_tracks w ON w.track_id = ta5.track_id AND w.wanted = 1
+                  WHERE ta5.artist_id = a.id)
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_album_artists aa5
+                   CROSS JOIN lib2_monitor_rules r3 ON r3.entity_type = 'album'
+                        AND r3.entity_id = aa5.album_id AND r3.monitored = 1
+                  WHERE aa5.artist_id = a.id)
+           AND NOT EXISTS (
+                 SELECT 1 FROM lib2_album_artists aa6
+                   CROSS JOIN lib2_tracks t6 ON t6.album_id = aa6.album_id
+                   CROSS JOIN lib2_wanted_tracks w2 ON w2.track_id = t6.id AND w2.wanted = 1
+                  WHERE aa6.artist_id = a.id)
            AND (
                  EXISTS (SELECT 1 FROM lib2_album_artists aa3 WHERE aa3.artist_id = a.id)
               OR EXISTS (SELECT 1 FROM lib2_track_artists ta3 WHERE ta3.artist_id = a.id)
@@ -1506,6 +1672,19 @@ def prune_browse_only_artists(conn) -> Dict[str, Any]:
 
 _IDENTIFIED_SQL = ("(COALESCE(a.spotify_id,'')<>'' OR COALESCE(a.musicbrainz_id,'')<>'' "
                    "OR COALESCE(a.external_ids,'{}') NOT IN ('','{}'))")
+
+
+def _known_pieces(name: str, known_ids: Dict[str, int], own_id: int) -> List[str]:
+    """the parts of a combined credit, a run that spells an artist in
+    ``known_ids`` (normalized name -> id) kept whole. the credit's own row
+    never vouches for itself."""
+    from core.library2.importer import normalize_name, split_known_artist_credits
+
+    def _known(piece: str) -> bool:
+        aid = known_ids.get(normalize_name(piece))
+        return aid is not None and int(aid) != int(own_id)
+
+    return split_known_artist_credits(name, _known)
 
 
 def _clear_wrong_id_collab_artists(conn, split_artist_credits, normalize_name) -> int:
@@ -1547,7 +1726,7 @@ def _clear_wrong_id_collab_artists(conn, split_artist_credits, normalize_name) -
     cleared = 0
     for gid, name in candidates:
         gid = int(gid)
-        pieces = split_artist_credits(name or "")
+        pieces = _known_pieces(name or "", owners, gid)
         keys = [normalize_name(piece) for piece in pieces]
         if len(keys) < 2 or not all(key in owners for key in keys):
             continue
@@ -1584,7 +1763,8 @@ def _clear_wrong_id_collab_artists(conn, split_artist_credits, normalize_name) -
             track_ids = [int(r[0]) for r in conn.execute(
                 f"SELECT id FROM lib2_tracks WHERE album_id IN ({marks})", albums)]
             for table, album_kinds, track_kinds in (
-                    ("lib2_metadata_overrides", ("album", "albums"), ("track", "tracks")),
+                    # an album's hand edits are stored as 'release_group'
+                    ("lib2_metadata_overrides", ("release_group", "album"), ("track", "tracks")),
                     ("lib2_media_server_mappings", ("album", "album"), ("track", "track"))):
                 try:
                     hit = conn.execute(
@@ -1617,6 +1797,99 @@ def _clear_wrong_id_collab_artists(conn, split_artist_credits, normalize_name) -
                     name, len(albums))
         cleared += 1
     return cleared
+
+
+def drop_band_fragment_credits(conn) -> int:
+    """Take back the credits a blind split carved out of a band's name.
+
+    "Above & Beyond & Mat Zo" split on every "&" credited "Above" and
+    "Beyond" next to "Above & Beyond" on the same track, and those two
+    phantoms then named the reorganize folder ("Above") and the tags
+    ("Above (feat. Beyond)") (#2131, #2136). Only a track (or album) that
+    credits the whole band and every one of its parts loses the parts: a
+    real guest credit is never spelled exactly like that.
+
+    The band has to be a provider-identified artist: "bbno$, So Loki" with
+    no id is itself a split-able credit, not a band, and bbno$ keeps his.
+    The album's own primary artist is never left without its credit: an
+    unidentified part ("Foam" on Foam and Sand's album) hands the album to
+    the band, an identified one (a real solo name) keeps the album and its
+    credits, nothing guessed. Returns how many credit rows went.
+    """
+    from core.library2.importer import normalize_name, split_artist_credits
+
+    ids_by_key: Dict[str, List[int]] = {}
+    identified: set = set()
+    wholes = []
+    for aid, name, has_id in conn.execute(
+            f"SELECT a.id, a.name, {_IDENTIFIED_SQL} FROM lib2_artists a "
+            "WHERE a.canonical_artist_id IS NULL"):
+        key = normalize_name(name or "")
+        if not key:
+            continue
+        ids_by_key.setdefault(key, []).append(int(aid))
+        if has_id:
+            identified.add(int(aid))
+        if has_id and _BAND_SEPARATOR_RE.search(name or ""):
+            wholes.append((int(aid), name))
+    dropped = 0
+    rehomed = 0
+    for whole_id, name in wholes:
+        pieces = split_artist_credits(name)
+        keys = [normalize_name(piece) for piece in pieces]
+        if len(keys) < 2 or normalize_name(name) in keys or not all(k in ids_by_key for k in keys):
+            continue
+        part_ids = [[i for i in ids_by_key[k] if i != whole_id] for k in keys]
+        if not all(part_ids):
+            continue
+        every_part = [i for ids in part_ids for i in ids]
+        marks = ",".join("?" for _ in every_part)
+        # albums first, so a track of a re-homed album sees the band as primary
+        for table, column in (("lib2_album_artists", "album_id"),
+                              ("lib2_track_artists", "track_id")):
+            owners = {int(r[0]) for r in conn.execute(
+                f"SELECT {column} FROM {table} WHERE artist_id=?", (whole_id,))}
+            for ids in part_ids:
+                if not owners:
+                    break
+                id_marks = ",".join("?" for _ in ids)
+                owners &= {int(r[0]) for r in conn.execute(
+                    f"SELECT {column} FROM {table} WHERE artist_id IN ({id_marks})", ids)}
+            done = 0
+            for owner in sorted(owners):
+                if column == "album_id":
+                    primary = conn.execute(
+                        "SELECT primary_artist_id FROM lib2_albums WHERE id=?", (owner,)).fetchone()
+                else:
+                    primary = conn.execute(
+                        "SELECT al.primary_artist_id FROM lib2_tracks t "
+                        "JOIN lib2_albums al ON al.id=t.album_id WHERE t.id=?", (owner,)).fetchone()
+                primary_id = int(primary[0]) if primary and primary[0] is not None else None
+                if primary_id in every_part:
+                    if column == "track_id" or primary_id in identified:
+                        # a real artist (or an album not re-homed above) keeps it
+                        continue
+                    conn.execute("UPDATE lib2_albums SET primary_artist_id=?, "
+                                 "updated_at=CURRENT_TIMESTAMP WHERE id=?", (whole_id, owner))
+                    conn.execute("UPDATE lib2_album_artists SET role='primary' "
+                                 "WHERE album_id=? AND artist_id=?", (owner, whole_id))
+                    rehomed += 1
+                dropped += conn.execute(
+                    f"DELETE FROM {table} WHERE {column}=? AND artist_id IN ({marks})",
+                    (owner, *every_part)).rowcount or 0
+                done += 1
+            if done:
+                logger.info("dropped the parts of %r from %d %s", name, done,
+                            "track(s)" if column == "track_id" else "album(s)")
+    if dropped or rehomed:
+        logger.info("band fragments: %d credit row(s) dropped, %d album(s) back on their band",
+                    dropped, rehomed)
+        conn.commit()
+    return dropped
+
+
+# a name a blind split would cut: the separators split_artist_credits uses
+_BAND_SEPARATOR_RE = re.compile(r"[,;/&×+]|\b(?:and|x|vs\.?)\b", re.IGNORECASE)
 
 
 def split_combined_credits_locally(conn, *, progress: Optional[Callable[[int, int], None]] = None,
@@ -1653,6 +1926,7 @@ def split_combined_credits_locally(conn, *, progress: Optional[Callable[[int, in
             identified.setdefault(key, int(aid))
 
     unghosted = _clear_wrong_id_collab_artists(conn, split_artist_credits, normalize_name)
+    fragments = drop_band_fragment_credits(conn)
 
     # every combined-looking credit that owns no album. One with an id or a
     # legacy id only qualifies for the anchored split below: a credit carrying
@@ -1669,9 +1943,9 @@ def split_combined_credits_locally(conn, *, progress: Optional[Callable[[int, in
         "ORDER BY a.id").fetchall()
     ghosts = [g for g in ghosts if not g[3] or len(split_artist_credits(g[1] or "")) >= 2]
     stats = {"considered": len(ghosts), "merged": 0, "split": 0, "left": 0, "created": 0,
-             "collab_ghosts_cleared": unghosted}
+             "collab_ghosts_cleared": unghosted, "band_fragments_dropped": fragments}
     total = len(ghosts)
-    for index, (gid, name, monitored, settled) in enumerate(ghosts, start=1):
+    for index, (gid, name, _monitored, settled) in enumerate(ghosts, start=1):
         gid = int(gid)
         key = normalize_name(name or "")
         target = None if settled else identified.get(key)
@@ -1679,7 +1953,7 @@ def split_combined_credits_locally(conn, *, progress: Optional[Callable[[int, in
             _rehome_and_delete_combined(conn, gid, target, [target])
             stats["merged"] += 1
         else:
-            pieces = split_artist_credits(name or "")
+            pieces = _known_pieces(name or "", identified, gid)
             keys = [normalize_name(piece) for piece in pieces]
             anchors = {normalize_name(r[0] or "") for r in conn.execute(
                 "SELECT DISTINCT pa.name FROM lib2_track_artists ta "
@@ -1702,10 +1976,12 @@ def split_combined_credits_locally(conn, *, progress: Optional[Callable[[int, in
                 for piece, pkey in zip(pieces, keys, strict=True):
                     cid = identified.get(pkey) or anyone.get(pkey)
                     if cid is None or cid == gid:
+                        # born unwatched, the rehome watches the lead only
+                        # (review 5 W2-WF-4)
                         cid = int(conn.execute(
                             "INSERT INTO lib2_artists(name, name_key, sort_name, monitored) "
-                            "VALUES(?, ?, ?, ?)",
-                            (piece, pkey, piece, int(monitored or 0))).lastrowid)
+                            "VALUES(?, ?, ?, 0)",
+                            (piece, pkey, piece)).lastrowid)
                         anyone[pkey] = cid
                         stats["created"] += 1
                     if cid not in components:
@@ -1927,7 +2203,15 @@ def backfill_missing_provider_ids(
             entity_id = int(item.get("id"))
             try:
                 result = enricher(conn, entity_type, entity_id, service) or {}
-                status = "matched" if result.get("success") else "not_found"
+                answered = str(result.get("source") or service).strip().lower()
+                if result.get("success") and answered != service:
+                    # the service fell back to another provider (Spotify
+                    # Free / rate-limited -> iTunes): that one's id is stored,
+                    # but this service never answered. 'matched' settled the
+                    # pair for good; an error is asked again
+                    status = "error"
+                else:
+                    status = "matched" if result.get("success") else "not_found"
             except Exception as exc:  # noqa: BLE001 — one entity, not the run
                 logger.debug("provider backfill: %s %s via %s failed: %s",
                              entity_type, entity_id, service, exc)
@@ -1964,6 +2248,7 @@ __all__ = [
     "clear_placeholder_artist_images",
     "identity_is_free",
     "smart_split_combined_artist",
+    "drop_band_fragment_credits",
     "enrich_native_artist_artwork",
     "default_artist_resolver",
     "default_artwork_fetcher",
@@ -1979,8 +2264,13 @@ def refresh_native_entity_metadata(conn, entity_type, entity_id, source_ids,
     ``fill_identity_only`` (see _apply_descriptive_metadata).
     """
     from dataclasses import asdict, replace
+    from core.library2 import locks
     from core.library2.provider_adapters import fetch_descriptive_metadata
     from core.library2.provider_writes import write_provider_enrichment
+    # #2046: a reviewed and locked row is not refreshed, and no provider is
+    # asked about it
+    if locks.blocks_entity(entity_type, entity_id, "metadata", "Metadata refresh", conn=conn):
+        return None
     conn.commit()  # provider caches may write through their own connection
     metadata = fetch_descriptive_metadata(entity_type, source_ids,
                                           source_order=tuple(source_ids))

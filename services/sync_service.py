@@ -31,6 +31,13 @@ _WRITE_LOCKS: Dict[str, threading.Lock] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
 
 
+def _db_backed(server_type: str) -> bool:
+    """every server but plex takes a playlist track as the db row's server
+    id. plex wants its own item from fetchItem. a list of the others left
+    music assistant out (#2111)."""
+    return bool(server_type) and server_type != "plex"
+
+
 def _playlist_write_lock(server_type: str) -> threading.Lock:
     with _WRITE_LOCKS_GUARD:
         lock = _WRITE_LOCKS.get(server_type)
@@ -187,17 +194,26 @@ def navidrome_client_for_profile(profile_id, client):
     authenticated, so this is what puts a profile's playlist on their
     navidrome user instead of the app account's (#1265). a view, never a
     change to the shared client. no saved login, no profile, or a db that
-    will not answer = the client as-is."""
+    will not answer = the client as-is. an own-library profile's view also
+    reads its own navidrome library only (#2031)."""
     if not profile_id or client is None:
         return client
     try:
         from database.music_database import MusicDatabase
-        login = MusicDatabase().get_profile_navidrome_login(profile_id)
+        db = MusicDatabase()
+        login = db.get_profile_navidrome_login(profile_id)
+        from core.library_scope import own_navidrome_folder
+        folder = own_navidrome_folder(profile_id, db)
     except Exception as e:
         logger.error(f"Per-profile: could not read navidrome login for profile {profile_id}: {e}")
         return client
-    if not login or not hasattr(client, 'as_user'):
+    if not hasattr(client, 'as_user') or not (login or folder):
         return client
+    if folder:
+        logger.info(f"Per-profile: navidrome runs as '{login[0] if login else 'the app account'}' "
+                    f"in library {folder} for profile {profile_id}")
+        return client.as_user(login[0] if login else None, login[1] if login else None,
+                              music_folder_id=folder)
     logger.info(f"Per-profile: navidrome playlist writes run as '{login[0]}' for profile {profile_id}")
     return client.as_user(*login)
 
@@ -454,6 +470,15 @@ class PlaylistSyncService:
                     logger.error("SoulSync library client not provided to sync service")
                     return None, "soulsync"
                 return client, "soulsync"
+            elif active_server and active_server != "plex":
+                # music assistant and any server added later: by its registered
+                # name. it used to fall through to plex, so a music assistant
+                # sync logged "syncing to PLEX" and failed (#2111)
+                client = self._media_client(active_server)
+                if not client:
+                    logger.error("%s client not provided to sync service", active_server)
+                    return None, active_server
+                return client, active_server
             else:  # Default to Plex
                 client = self._media_client('plex')
                 if profile_id and client:
@@ -562,8 +587,10 @@ class PlaylistSyncService:
         accept it — Plex/Jellyfin keep their existing signatures.
         """
         fn = getattr(client, 'reconcile_playlist', None)
+        # only a client that follows a playlist by id is ever handed one
+        id_kw = {'playlist_id': playlist_id} if playlist_id is not None else {}
         if fn is None:
-            return client.update_playlist(playlist_name, tracks)
+            return client.update_playlist(playlist_name, tracks, **id_kw)
         from core.navidrome_client import NavidromeClient
         if isinstance(client, NavidromeClient):
             # A refused/failed Navidrome write must not trigger another destructive attempt.
@@ -573,7 +600,7 @@ class PlaylistSyncService:
                 logger.error("Navidrome reconcile failed for %r: %s", playlist_name, exc)
                 return False
         try:
-            if fn(playlist_name, tracks):
+            if fn(playlist_name, tracks, **id_kw):
                 return True
             logger.warning(
                 "Reconcile sync failed for '%s' — falling back to replace "
@@ -581,7 +608,7 @@ class PlaylistSyncService:
         except Exception as e:
             logger.warning(
                 "Reconcile sync errored for '%s' (%s) — falling back to replace", playlist_name, e)
-        return client.update_playlist(playlist_name, tracks)
+        return client.update_playlist(playlist_name, tracks, **id_kw)
 
     def _resolve_mirrored_server_playlist_id(
         self,
@@ -911,9 +938,11 @@ class PlaylistSyncService:
                     # media server calls block, keep them off the shared loop.
                     # Only the Navidrome client accepts playlist_id; Plex /
                     # Jellyfin keep their existing signatures.
+                    from core.sync.mirrored_server_link import follows_by_id
                     _navidrome_id_kw = (
                         {'playlist_id': server_playlist_id}
-                        if server_type == 'navidrome' else {}
+                        if follows_by_id(server_type) and server_playlist_id is not None
+                        else {}
                     )
                     # what each source track matched, so append can drop an
                     # old wrong match the right track replaced (#1801)
@@ -951,7 +980,7 @@ class PlaylistSyncService:
                     sync_success, _write_skipped_ids = await run_blocking(
                         _dispatch_write)
 
-                    if (sync_success and server_type == 'navidrome'
+                    if (sync_success and follows_by_id(server_type)
                             and server_playlist_id is None and media_client is not None):
                         # Nothing was linked and the name-match found nothing,
                         # so the write above created the playlist — record its
@@ -1225,7 +1254,7 @@ class PlaylistSyncService:
                 # stringify past it instead of matching "unknown artist".
                 stub_artist = _artist_name((spotify_track.artists or [None])[0])
                 if is_stub_id(spotify_track.id) and not should_wishlist_stub(
-                    stub_artist, spotify_track.name,
+                    stub_artist, spotify_track.name, spotify_track.id,
                 ):
                     logger.info(f"Skipping wishlist for wing-it track: {spotify_track.name}")
                     drop_reasons["wing-it stub (ineligible)"] = drop_reasons.get("wing-it stub (ineligible)", 0) + 1
@@ -1425,7 +1454,7 @@ class PlaylistSyncService:
                 dbt = cache_db.get_track_by_server_id(server_track_id, active_server)
                 if not dbt:
                     return None
-                if server_type in ("jellyfin", "navidrome", "soulsync"):
+                if _db_backed(server_type):
                     class DbTrackFromCache:
                         def __init__(self, db_t):
                             self.ratingKey = db_t.id
@@ -1637,7 +1666,7 @@ class PlaylistSyncService:
                         
                         # Fetch the actual track object from active media server using the database track ID
                         try:
-                            if server_type in ("jellyfin", "navidrome", "soulsync"):
+                            if _db_backed(server_type):
                                 # DB-backed servers — no remote fetchItem (SoulSync standalone included).
                                 class DbTrackFromDB:
                                     def __init__(self, db_track):

@@ -5,8 +5,9 @@ import { mountCandidateInspectorHost } from '@/features/downloads/inspector-moda
 import { mountFeaturePickerHost } from '@/features/feature-picker/host';
 import { mountOnboardingHost } from '@/features/onboarding/host';
 import { mountAddToPlaylistHost } from '@/features/playlists/add-to-playlist';
-import { mountLibraryDiscographySourceSelector } from '@/features/settings/library-discography-source';
+import { mountSettingsHost } from '@/features/settings/host';
 import { mountVideoLibraryTabHost } from '@/features/video-library/host';
+import { mountVideoLibraryManagerHost } from '@/features/video-manager/host';
 import { bindWindowWebRouter, SHELL_LIBRARY_SCOPE_CHANGED_EVENT } from '@/platform/shell/bridge';
 import { ROUTER_ROOT_ID } from '@/platform/shell/route-controllers';
 import { openDownloadTaskSearch } from '@/routes/library/-ui/interactive-search-host';
@@ -70,12 +71,14 @@ export async function bootstrapApp() {
 
 // before init.js's DOMContentLoaded handler, which opens it on first run
 mountOnboardingHost();
-void mountLibraryDiscographySourceSelector();
 mountCandidateInspectorHost();
 // A failed download's Interactive Search is the library's when it is for a library track.
 window.openDownloadTaskInspector = (taskId, track) => void openDownloadTaskSearch(taskId, track);
 mountAddToPlaylistHost();
 mountVideoLibraryTabHost();
+mountVideoLibraryManagerHost();
 // make soulsync yours (#1909): window.openFeaturePicker
 mountFeaturePickerHost();
+// the Settings tabs ported to React (SETTINGS_PORT.md): window.SoulSyncSettings
+mountSettingsHost();
 void bootstrapApp();

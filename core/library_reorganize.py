@@ -15,6 +15,7 @@ preview with the move.
 """
 
 import errno
+import filecmp
 import hashlib
 import json
 import os
@@ -68,6 +69,7 @@ def resolve_album_profile_id(db, album_id, tracks=None, resolve_file_path_fn=Non
     ``owner_profile_id``. Returns None for the shared library (unchanged
     behavior)."""
     from core.imports.paths import profile_id_for_path
+    shared_path = None
     # 1. file location wins — where the files actually sit right now
     try:
         track_list = tracks
@@ -82,20 +84,29 @@ def resolve_album_profile_id(db, album_id, tracks=None, resolve_file_path_fn=Non
                 pid = profile_id_for_path(resolved)
                 if pid:
                     return pid
-                break  # resolved but shared — don't keep looking
+                # resolved outside every own-library root: only THIS file's
+                # recorded owner can still say otherwise. another library's
+                # copy of the album must not decide (it planned bob's copy for
+                # the admin looking at the shared one)
+                shared_path = db_path
+                break
     except Exception as e:
         logger.debug("[Reorganize] profile resolution from path failed: %s", e)
-    # 2. DB fallback: whose library the album's files are recorded in. Ours:
-    # Library v2 keeps the owner per file, not per album row.
+    # 2. DB fallback: whose library the album's files are recorded in, within
+    # the caller's own library scope (just the file above, when one resolved)
     try:
+        from core.library2.sql_util import owner_clause
         conn = db._get_connection()
         try:
+            same_file = " AND f.path = ?" if shared_path else ""
             row = conn.execute(
                 "SELECT f.owner_profile_id FROM lib2_track_files f"
                 "  JOIN lib2_tracks t ON t.id = f.track_id"
                 " WHERE t.album_id = ? AND COALESCE(f.file_state,'active') = 'active'"
                 "   AND f.owner_profile_id IS NOT NULL"
-                " ORDER BY f.is_primary DESC, f.id LIMIT 1", (str(album_id),)
+                f"{owner_clause(column='f.owner_profile_id')}{same_file}"
+                " ORDER BY f.is_primary DESC, f.id LIMIT 1",
+                (str(album_id), *([shared_path] if shared_path else [])),
             ).fetchone()
             if row and row[0]:
                 return int(row[0])
@@ -488,6 +499,8 @@ def _build_post_process_context(
             'name': api_album_name,
             'release_date': api_album_release,
             'total_tracks': api_album_total_tracks,
+            # the release's runtime when known: $albumtype's store rule
+            'duration_ms': int(api_album.get('duration_ms') or 0),
             'total_discs': total_discs,
             # Reorganize is the caller that really knows: it counted the discs
             # off the source tracklist it just resolved, so the path builder must
@@ -508,6 +521,9 @@ def _build_post_process_context(
             'secondary_types': list(api_album.get('secondary_types') or []),
             'is_compilation': is_comp,
             'artists': [{'name': album_artist_name}],
+            # the library's own album: its artist is the release's, never a
+            # batch guess to distrust over a track by someone else (#2133)
+            '_library_album': True,
             # #1860: $explicit in a folder. the source's word, else the
             # library's, so a tag-mode album keeps the badge its import gave it
             'explicit': (api_album.get('explicit') if api_album.get('explicit') is not None
@@ -643,6 +659,23 @@ def _display_relative_to_root(path, root):
     return path
 
 
+def _relative_through_another_mount(resolved, transfer_dir):
+    """The file's path inside the output folder when ``resolved`` reaches it
+    through a second mount of that folder, else None.
+
+    Storm mounts one music folder twice, as /app/Transfer (the output folder)
+    and /music (what navidrome reports). a track filed from navidrome's path
+    showed as '/music/x/y/z.mp3' beside 'x/y/z.mp3' in the preview, the same
+    file under two names. Match the path's tail inside the output folder and
+    keep it only when it's the same physical file."""
+    parts = [p for p in os.path.normpath(str(resolved)).replace('\\', '/').split('/') if p]
+    for start in range(1, len(parts)):
+        candidate = os.path.join(transfer_dir, *parts[start:])
+        if os.path.exists(candidate) and _same_physical_file(resolved, candidate):
+            return os.path.join(*parts[start:])
+    return None
+
+
 def _trim_to_transfer(db_path, resolved, transfer_dir):
     """Compose the user-facing 'current path' string — relative to the
     transfer dir if the file lives there, else the raw DB value."""
@@ -650,6 +683,12 @@ def _trim_to_transfer(db_path, resolved, transfer_dir):
         trimmed = _display_relative_to_root(resolved, transfer_dir)
         if trimmed != resolved:
             return trimmed
+        try:
+            through = _relative_through_another_mount(resolved, transfer_dir)
+        except OSError:
+            through = None
+        if through:
+            return through
     return db_path or 'No file'
 
 
@@ -1073,7 +1112,25 @@ def reorganize_album_rename_only(
         _emit(moved=summary['moved'],
               processed=summary['moved'] + summary['skipped'] + summary['failed'])
 
-    for src_dir in src_dirs_touched:
+    tidy_moved_from(src_dirs_touched, dest_dirs, cleanup_empty_dir_fn)
+
+    if summary.get('moved', 0) > 0 and preview.get('record_type') == 'compilation':
+        _persist_compilation_record_type(db, album_id)
+
+    if (_run_placed_everything(summary, stop_check)
+            and tracks and all(t.get('matched') and t.get('file_exists')
+                               and not t.get('collision') for t in tracks)):
+        mark_album_placed(db, album_id)
+    return summary
+
+
+def tidy_moved_from(src_dirs, dest_dirs, cleanup_empty_dir_fn=None) -> None:
+    """After tracks moved out of ``src_dirs`` (``dest_dirs`` says where each
+    folder's tracks went): the album's own files follow the last track, the
+    emptied folders go, and so do the empty album folders beside the new ones.
+    Every mover calls this, so none leaves cover.jpg and its folder behind (#2010).
+    """
+    for src_dir in src_dirs:
         album_dst = _album_destination(dest_dirs.get(src_dir))
         if album_dst:
             try:
@@ -1090,7 +1147,7 @@ def reorganize_album_rename_only(
         except Exception as e:
             logger.debug("[Reorganize/rename] source prune of %s failed: %s", src_dir, e)
     try:
-        _tidy_album_and_artist_dirs(src_dirs_touched, dest_dirs)
+        _tidy_album_and_artist_dirs(src_dirs, dest_dirs)
     except Exception as e:  # noqa: BLE001 - the tracks moved; the extras stay put
         logger.warning("[Reorganize/rename] album / artist folder tidy failed: %s", e)
 
@@ -1102,15 +1159,6 @@ def reorganize_album_rename_only(
             _prune_empty_album_dirs(artist_dir)
         except Exception as e:  # noqa: BLE001 - cosmetic
             logger.debug("[Reorganize/rename] album-dir prune of %s failed: %s", artist_dir, e)
-
-    if summary.get('moved', 0) > 0 and preview.get('record_type') == 'compilation':
-        _persist_compilation_record_type(db, album_id)
-
-    if (_run_placed_everything(summary, stop_check)
-            and tracks and all(t.get('matched') and t.get('file_exists')
-                               and not t.get('collision') for t in tracks)):
-        mark_album_placed(db, album_id)
-    return summary
 
 
 def naming_fingerprint() -> str:
@@ -1217,6 +1265,17 @@ def _move_entry(src: str, dst: str) -> None:
         shutil.move(src, dst)
 
 
+def _same_content(src: str, dst: str) -> bool:
+    """Two separate regular files with the same bytes."""
+    try:
+        if (not os.path.isfile(src) or os.path.islink(src) or not os.path.isfile(dst)
+                or os.path.islink(dst) or _same_physical_file(src, dst)):
+            return False
+        return filecmp.cmp(src, dst, shallow=False)
+    except OSError:
+        return False
+
+
 def _carry_album_files(src_dir: str, dst_dir: str) -> List[str]:
     """Move the album's own files after its tracks, once every track has left
     ``src_dir`` for the one folder ``dst_dir``. A rename moved the tracks and
@@ -1241,6 +1300,13 @@ def _carry_album_files(src_dir: str, dst_dir: str) -> List[str]:
             continue
         dst = os.path.join(dst_dir, name)
         if os.path.lexists(dst):
+            # the same cover is already there (an earlier run, a download into
+            # the new folder): this copy only kept the old folder alive (#2010).
+            # a different file stays put
+            if _same_content(src, dst):
+                os.remove(src)
+                logger.info("[Reorganize/rename] %s is already at %s, dropped the old copy",
+                            name, dst_dir)
             continue
         _move_entry(src, dst)
         moved.append(dst)

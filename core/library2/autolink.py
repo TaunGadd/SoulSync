@@ -29,6 +29,7 @@ from .importer import (
     release_title_key,
 )
 from .path_drift import split_track_numbering
+from .release_split import is_other_release_by_year, tag_year
 from .tag_cache import read_tag_snapshot
 
 logger = get_logger("library2.autolink")
@@ -202,9 +203,24 @@ def _find_or_create_artist(conn, name: str, *, spotify_id: Optional[str] = None,
                 return row["id"]
         elif namespace is not None:
             # A real qualified id wins over the old poisoned-column fallback.
-            for candidate in conn.execute(
+            # an indexed provider is a seek on its expression index; a LIKE
+            # scanned every artist, once per credit, inside the catalogue
+            # write transaction (review 5 R5-E-3)
+            from core.library2.match_status import SERVICES
+            from core.library2.provider_ids import external_id_sql
+
+            if namespace in {service for service, _label, _ids in SERVICES}:
+                lookup = (
+                    "SELECT id, external_ids FROM lib2_artists WHERE "
+                    f"{external_id_sql('external_ids', namespace)} = ?",
+                    (provider_id,),
+                )
+            else:
+                lookup = (
                     "SELECT id, external_ids FROM lib2_artists WHERE external_ids LIKE ?",
-                    (f"%{provider_id}%",)):
+                    (f"%{provider_id}%",),
+                )
+            for candidate in conn.execute(*lookup):
                 ids = _row_external_ids(candidate["external_ids"])
                 if ids.get(namespace) == provider_id:
                     return candidate["id"]
@@ -309,12 +325,19 @@ def _find_or_create_album(conn, artist_id: int, title: str, *,
                           album_type: str, spotify_album_id: Optional[str] = None,
                           source: Optional[str] = None,
                           monitored: Optional[int] = None,
-                          release_mbid: Optional[str] = None) -> int:
+                          release_mbid: Optional[str] = None,
+                          release_year: Any = None,
+                          file_folder: Optional[str] = None) -> int:
     """``release_mbid``: the MusicBrainz release the file's own tags name
     (MUSICBRAINZ_ALBUMID). Two releases of one name (a standard and a "baby
     punk version") stay two albums, as 3.6.1's standalone scan kept them
-    (#1299); a same-titled row with no release id yet takes this one."""
+    (#1299); a same-titled row with no release id yet takes this one.
+
+    ``release_year`` / ``file_folder``: the tagged year and folder of a file
+    known only by its tags. A same-titled row whose files all sit in other
+    folders under another year is another release (#2110)."""
     release_mbid = str(release_mbid or "").strip() or None
+    release_year = tag_year(release_year)
     provider_id = _clean_provider_id(spotify_album_id)
     namespace = _provider_namespace(provider_id, source)
     key = release_title_key(title)
@@ -360,6 +383,8 @@ def _find_or_create_album(conn, artist_id: int, title: str, *,
                 continue  # Same title does not make two provider editions identical.
             if release_mbid and _row_release_mbid(row) not in ("", release_mbid):
                 continue  # another MusicBrainz release of the same name (#1299)
+            if is_other_release_by_year(conn, row["id"], release_year, file_folder):
+                continue  # same name, another year, another folder (#2110)
             if release_mbid:
                 _adopt_release_mbid(conn, row["id"], release_mbid)
             if namespace is not None and namespace != "spotify" and provider_id:
@@ -378,11 +403,12 @@ def _find_or_create_album(conn, artist_id: int, title: str, *,
                      if namespace not in (None, "spotify") else "{}")
     cur = conn.execute(
         """INSERT INTO lib2_albums(primary_artist_id, title, album_type, spotify_id,
-               external_ids, quality_profile_id, monitored)
-           VALUES(?,?,?,?,?,?, COALESCE(?, 1))""",
+               external_ids, quality_profile_id, monitored, year)
+           VALUES(?,?,?,?,?,?, COALESCE(?, 1), ?)""",
         (artist_id, title, album_type,
          provider_id if namespace == "spotify" else None,
-         external_json, profile_id, monitored),
+         external_json, profile_id, monitored,
+         int(release_year) if release_year else None),
     )
     album_id = cur.lastrowid
     if release_mbid:
@@ -391,6 +417,37 @@ def _find_or_create_album(conn, artist_id: int, title: str, *,
         "INSERT OR IGNORE INTO lib2_album_artists(album_id, artist_id, role) "
         "VALUES(?,?, 'primary')", (album_id, artist_id))
     return album_id
+
+
+def _download_album_image(*albums: Any) -> Optional[str]:
+    """The cover the download itself came with, as a link anyone can load."""
+    from core.metadata.artwork import usable_remote_image_url
+    for album in albums:
+        if not isinstance(album, dict):
+            continue
+        images = album.get("images") if isinstance(album.get("images"), (list, tuple)) else []
+        for candidate in (album.get("image_url"), *(
+                entry.get("url") if isinstance(entry, dict) else entry for entry in images)):
+            url = usable_remote_image_url(candidate if isinstance(candidate, str) else None)
+            if url:
+                return url
+    return None
+
+
+def _adopt_album_image(conn, album_id: Optional[int], image_url: Optional[str]) -> None:
+    """An album with no picture takes the one its download was matched with.
+
+    The album row was made without one and left for enrichment to fill, so the
+    tag check that runs right after the import saw "artwork_database: missing"
+    and filed a re-tag finding for every track of every new album (#2058).
+    A picture already there, or one the user locked, is left alone.
+    """
+    if not album_id or not image_url:
+        return
+    conn.execute(
+        "UPDATE lib2_albums SET image_url=?, updated_at=CURRENT_TIMESTAMP "
+        "WHERE id=? AND COALESCE(image_url,'')='' AND COALESCE(art_locked,0)=0",
+        (image_url, int(album_id)))
 
 
 def _adopt_release_mbid(conn, album_id: int, release_mbid: str) -> None:
@@ -447,11 +504,25 @@ def _find_or_create_track(conn, album_id: int, artist_id: int, title: str, *,
                 )
             return row["id"]
     if track_number is not None:
+        # a title the catalogue spells differently still finds its position,
+        # but only an empty one, and never a different version: "Song E -
+        # Radio Edit" at #5 is not the owned "Song E" at #5 (it became that
+        # track's primary file and could cost the album cut in a dedup).
+        # 3.6.1 gave every download its own row.
+        from core.library2.version_words import versions_differ
         wanted_disc = disc_number if disc_number is not None else 1
         for row in rows:
             row_disc = row["disc_number"] if row["disc_number"] is not None else 1
-            if row["track_number"] == track_number and row_disc == wanted_disc:
-                return row["id"]
+            if row["track_number"] != track_number or row_disc != wanted_disc:
+                continue
+            if versions_differ(row["title"] or "", title or ""):
+                continue
+            if conn.execute(
+                    "SELECT 1 FROM lib2_track_files WHERE track_id=? "
+                    "AND COALESCE(file_state,'active') NOT IN ('deleted','missing_confirmed') LIMIT 1",
+                    (row["id"],)).fetchone():
+                continue
+            return row["id"]
     from core.library2.profile_lookup import default_quality_profile_id
     album_profile = conn.execute(
         "SELECT quality_profile_id FROM lib2_albums WHERE id=?", (album_id,)
@@ -596,6 +667,10 @@ def _fallback_identity(context: Dict[str, Any],
         logger.debug("fallback tag read failed (%s): %s", file_path, exc)
     title = str(tags.get("title") or "").strip()
     artist = str(tags.get("artist") or tags.get("album_artist") or "").strip()
+    # the release belongs to its album artist ("Various Artists" for a
+    # compilation), the performer is the track's credit: 3.6.1 grouped a
+    # rescanned folder by album artist, so a compilation stayed one album
+    album_artist = str(tags.get("album_artist") or "").strip()
     album = str(tags.get("album") or "").strip()
 
     if not title or not artist:
@@ -621,8 +696,10 @@ def _fallback_identity(context: Dict[str, Any],
     return {
         "title": title,
         "artist": artist,
+        "album_artist": album_artist or None,
         "album": album or None,
         "release_mbid": release_mbid or None,
+        "year": tags.get("year"),
         "track_number": tags.get("track_number"),
         "disc_number": tags.get("disc_number"),
         "isrc": tags.get("isrc"),
@@ -742,7 +819,7 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
             get_import_context_album,
             get_import_context_artist,
             get_import_source,
-            get_import_source_ids,
+            get_provider_source_ids,
         )
 
         raw_track_info = context.get("track_info")
@@ -752,7 +829,7 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
             ti = {}
         canonical_album = get_import_context_album(context)
         canonical_artist = get_import_context_artist(context)
-        source_ids = get_import_source_ids(context)
+        source_ids = get_provider_source_ids(context)
 
         # A grab that started from Library v2 carries the server-resolved
         # entity (audit P1-16) — the file links to that exact row, no
@@ -900,18 +977,38 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
                 # send the pipeline hunting for it. Matching an existing row
                 # leaves that row's own monitoring untouched.
                 derived_monitored = 0 if fallback or context.get("_scan_discovered") else None
+                release_artist_id = artist_id
+                album_artist_name = fallback.get("album_artist") if fallback else None
+                if (album_artist_name and normalize_name(album_artist_name)
+                        != normalize_name(artist_name or "")):
+                    release_artist_id = _find_or_create_artist(
+                        conn, album_artist_name, spotify_id=None,
+                        source=identity_source) or artist_id
+                # a file known only by its tags (a scan, a simple download)
+                # brings its year and folder: weezer's three self-titled
+                # albums share a name and nothing else (#2110)
+                tag_identity = fallback or (ti if context.get("_scan_discovered") else {})
                 album_id = _find_or_create_album(
-                    conn, artist_id, album_name,
+                    conn, release_artist_id, album_name,
                     album_type=album_type, spotify_album_id=spotify_album_id,
                     source=identity_source, monitored=derived_monitored,
-                    release_mbid=fallback.get("release_mbid"))
+                    release_mbid=tag_identity.get("release_mbid"),
+                    release_year=tag_identity.get("year"),
+                    file_folder=os.path.dirname(str(file_path)))
                 track_id = _find_or_create_track(
                     conn, album_id, artist_id, title,
                     track_number=track_number, spotify_track_id=spotify_track_id,
                     disc_number=disc_number, source=track_identity_source,
                     monitored=derived_monitored)
+                if release_artist_id != artist_id and track_id:
+                    # the performer of a compilation track, as the rows the
+                    # player, stats and presence checks read show it
+                    conn.execute(
+                        "UPDATE lib2_tracks SET track_artist=COALESCE(NULLIF(track_artist,''), ?) "
+                        "WHERE id=?", (artist_name, track_id))
 
             if not fallback:
+                _adopt_album_image(conn, album_id, _download_album_image(canonical_album, album_raw))
                 # how this download filed the release, for a later reorganize
                 from core.library2.reorganize_plan import record_filed_release
                 record_filed_release(conn, album_id, context)
@@ -976,10 +1073,15 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
             )
             main_file_role = "derivative" if destructive_retention else "master"
 
+            # any spelling of the path: the same file must not get a second row
+            from core.library2.track_files import path_spellings
+            _forms = path_spellings(file_path)
             existing = conn.execute(
                 "SELECT id, COALESCE(file_state,'active') AS file_state"
-                "  FROM lib2_track_files WHERE track_id=? AND path=?",
-                (track_id, file_path),
+                "  FROM lib2_track_files WHERE track_id=?"
+                f" AND path IN ({','.join('?' * len(_forms))})"
+                " ORDER BY (COALESCE(file_state,'active')='deleted'), id LIMIT 1",
+                (track_id, *_forms),
             ).fetchone()
             if existing:
                 conn.execute(
@@ -1026,7 +1128,7 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
                         " WHERE id=?", (file_id,))
                     set_file_state(conn, int(file_id), "active")
                     logger.info(
-                        "Library v2: reactivated file row %s for re-imported "
+                        "Library: reactivated file row %s for re-imported "
                         "path %s (was %s)",
                         file_id, file_path, existing["file_state"])
             else:
@@ -1120,11 +1222,11 @@ def link_download_into_library_v2(context: Dict[str, Any], *,
             _warm_new_artwork(db, conn, album_id)
             from core.library2.validation import refresh_imported_metadata
             context['_metadata_status'] = refresh_imported_metadata(db, [file_path, *(context.get('_companion_file_paths') or [])])
-            logger.info("Library v2 auto-linked download: %s → track %s (file %s)",
+            logger.info("Library auto-linked download: %s → track %s (file %s)",
                         os.path.basename(str(file_path)), track_id, file_id)
             return file_id
     except Exception as e:  # noqa: BLE001
-        logger.debug("library v2 autolink failed: %s", e)
+        logger.debug("library autolink failed: %s", e)
         if raise_on_error:
             raise
         return None

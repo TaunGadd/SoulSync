@@ -31,6 +31,7 @@ from core.edition_grouping import (
     EDITION_PREFERENCE_ONE_COMPLETE,
     EDITION_PREFERENCE_ONE_STANDARD,
     EDITION_PREFERENCE_VALUES,
+    drop_clean_twins,
     edition_group_key,
     reduce_edition_group,
 )
@@ -261,6 +262,16 @@ def is_live_version(track_name: str, album_name: str = "") -> bool:
             return True
 
     return False
+
+def is_live_album(album_name: str) -> bool:
+    """Is the release itself a live recording, going by its title?
+
+    "MTV Unplugged", "Live at Wembley", "Alive in Concert". A studio album
+    with one "(Live)" bonus track is not: that is a live track (#2082), which
+    ``is_live_version(track_name)`` on the track's own title answers.
+    """
+    return bool(album_name) and is_live_version(album_name)
+
 
 def is_remix_version(track_name: str, album_name: str = "") -> bool:
     """
@@ -574,9 +585,11 @@ def library_artist_genres(conn) -> Dict[str, set]:
 def library_owned_and_seed_ids(conn, seed_names) -> Tuple[set, List[str], Dict[str, str]]:
     """``(owned names, the seeds' provider ids, provider id → name)``.
 
-    ``owned`` is every artist the library holds — a v2 artist row exists
-    because the user has them, downloaded them, or asked to follow them, and
-    all three are reasons not to recommend them back.
+    ``owned`` is the artists you have music by, as 3.6.1's media-server
+    artists were. lib2_artists also holds featured guests, discography rows
+    and artists from one wishlisted song; calling those owned meant Bon Iver
+    (a verse on folklore) was never recommended (139ba4181 fixed the same for
+    the taste map). The seed ids still come from every row.
 
     The ids are PROVIDER ids because that is what ``similar_artists``' graph is
     keyed by (``similar_artists_worker.pick_source_artist_id``), never a
@@ -589,15 +602,19 @@ def library_owned_and_seed_ids(conn, seed_names) -> Tuple[set, List[str], Dict[s
     owned: set = set()
     seed_source_ids: List[str] = []
     seed_id_to_name: Dict[str, str] = {}
+    from core.library2.sql_util import owned_sql
+
     for row in conn.execute(
-        "SELECT name, spotify_id, musicbrainz_id, external_ids FROM lib2_artists "
-        "WHERE name IS NOT NULL AND name <> ''"
+        "SELECT a.name, a.spotify_id, a.musicbrainz_id, a.external_ids, "
+        f"       ({owned_sql('artist', 'a')}) AS has_music FROM lib2_artists a "
+        "WHERE a.name IS NOT NULL AND a.name <> ''"
     ).fetchall():
         name = row["name"]
         lowered = str(name or '').lower()
         if not lowered:
             continue
-        owned.add(lowered)
+        if row["has_music"]:
+            owned.add(lowered)
         if lowered not in seed_names:
             continue
         known = parse_external_ids(row["external_ids"])
@@ -721,6 +738,19 @@ def _group_albums_by_edition(albums):
             index_by_key[key] = len(groups)
             groups.append([album])
     return groups
+
+
+def _without_clean_twins(albums, prefer_explicit_edition: bool):
+    """Every edition, less the clean copy of an album that is listed
+    uncensored too (#2081: "prefer explicit" only chose between editions once
+    one edition per album was on, so with All editions the "(Clean)" twin was
+    wished for next to the explicit one). Provider order is kept."""
+    albums = list(albums or [])
+    if not prefer_explicit_edition:
+        return albums
+    kept = {id(album) for group in _group_albums_by_edition(albums)
+            for album in drop_clean_twins(group)}
+    return [album for album in albums if id(album) in kept]
 
 
 def _edition_explicit_flag(album_data, tracks) -> bool:
@@ -1888,7 +1918,8 @@ class WatchlistScanner:
                 if edition_preference != EDITION_PREFERENCE_ALL:
                     album_units = _group_albums_by_edition(albums)
                 else:
-                    album_units = [[album] for album in albums]
+                    album_units = [[album] for album in _without_clean_twins(
+                        albums, prefer_explicit_edition)]
 
                 absolute_index = artist_index_offset + i + 1
                 if scan_state is not None:
@@ -1960,13 +1991,16 @@ class WatchlistScanner:
                         if self._has_placeholder_tracks(tracks):
                             logger.info("Skipping album with placeholder tracks: %s", album_name)
                             continue
-                        if not self._should_include_release(len(tracks), artist):
+                        from core.metadata.release_type import release_type_from_shape, tracklist_runtime_ms
+                        _runtime = tracklist_runtime_ms(list(tracks or []))
+                        if not self._should_include_release(len(tracks), artist, _runtime):
                             # Make the type-filter skip visible — otherwise a user
                             # with "Albums" toggled off just sees missing tracks
                             # with no explanation (Sokhi #815-adjacent: 14 singles,
                             # 0 albums because include_albums was off).
                             _n = len(tracks)
-                            _kind = 'album' if _n >= 7 else ('EP' if _n >= 4 else 'single')
+                            _kind = release_type_from_shape(_n, _runtime)
+                            _kind = 'EP' if _kind == 'ep' else _kind
                             logger.info(
                                 "Skipping %s '%s' (%d tracks) — release type filter "
                                 "(albums=%s, eps=%s, singles=%s) excludes it",
@@ -2725,14 +2759,15 @@ class WatchlistScanner:
         # (some albums legitimately have a track called "Track X" but not most of them)
         return placeholder_count > len(tracks) / 2
 
-    def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist) -> bool:
+    def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist,
+                                total_ms: Optional[int] = None) -> bool:
         """
         Check if a release should be included based on user's preferences.
 
-        Categorization:
-        - Singles: 1-3 tracks
-        - EPs: 4-6 tracks
-        - Albums: 7+ tracks
+        Categorization (the store rule):
+        - Singles: 1-3 tracks under 30 minutes
+        - EPs: 4-6 tracks under 30 minutes
+        - Albums: 7+ tracks, or 30 minutes and up (runtime unknown: count alone)
 
         Args:
             track_count: Number of tracks in the release
@@ -2747,16 +2782,14 @@ class WatchlistScanner:
             include_eps = getattr(watchlist_artist, 'include_eps', True)
             include_singles = getattr(watchlist_artist, 'include_singles', True)
 
-            # Determine release type based on track count
-            if track_count >= 7:
-                # This is an album
+            from core.metadata.release_type import release_type_from_shape
+            kind = (release_type_from_shape(track_count, total_ms)
+                    if (track_count or 0) > 0 else 'single')
+            if kind == 'album':
                 return include_albums
-            elif track_count >= 4:
-                # This is an EP (4-6 tracks)
+            if kind == 'ep':
                 return include_eps
-            else:
-                # This is a single (1-3 tracks)
-                return include_singles
+            return include_singles
 
         except Exception as e:
             logger.warning(f"Error checking release inclusion: {e}")
@@ -2814,27 +2847,20 @@ class WatchlistScanner:
                     logger.debug(f"Skipping compilation album: {album_name}")
                     return False
 
-            # Check track content type filters
-            if not include_live:
-                if is_live_version(track_name, album_name):
-                    logger.debug(f"Skipping live version: {track_name}")
-                    return False
-
-            if not include_remixes:
-                if is_remix_version(track_name, album_name):
-                    logger.debug(f"Skipping remix: {track_name}")
-                    return False
-
-            if not include_acoustic:
-                if is_acoustic_version(track_name, album_name):
-                    logger.debug(f"Skipping acoustic version: {track_name}")
-                    return False
-
-            # Check instrumental versions
-            if not include_instrumentals:
-                if is_instrumental_version(track_name, album_name):
-                    logger.debug(f"Skipping instrumental version: {track_name}")
-                    return False
+            # Check track content type filters. one rule set for the scanner,
+            # the Library's auto add and Download Discography (#2082: a live
+            # album and a live track on a studio album are two rules)
+            from core.metadata.discography_filters import content_type_skip_reason
+            skip_reason = content_type_skip_reason(track_name, album_name, {
+                'include_live': include_live,
+                'include_live_tracks': getattr(watchlist_artist, 'include_live_tracks', None),
+                'include_remixes': include_remixes,
+                'include_acoustic': include_acoustic,
+                'include_instrumentals': include_instrumentals,
+            })
+            if skip_reason:
+                logger.debug(f"Skipping {skip_reason} version: {track_name}")
+                return False
 
             # Check custom exclusion terms
             try:
@@ -2898,7 +2924,27 @@ class WatchlistScanner:
         if not names:
             logger.debug("track has no artist credits; including (fail open)")
             return True
-        return track_artist_matches(names, artist_name)
+        if track_artist_matches(names, artist_name):
+            return True
+        return self._deezer_credits_watched_artist(track, album_data, artist_name)
+
+    @staticmethod
+    def _deezer_credits_watched_artist(track, album_data, artist_name) -> bool:
+        """Deezer's tracklist names only a track's first artist, so a release
+        the watched artist co-leads read as someone else's. Ask the album's
+        and the track's own credits before dropping it (#2104)."""
+        def _field(obj, key):
+            return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+        if 'deezer' not in (_field(track, '_source'), _field(album_data, '_source')):
+            return False
+        try:
+            from core.metadata import deezer_credits
+            return deezer_credits.credits_artist(
+                artist_name, album_id=_field(album_data, 'id'), track_id=_field(track, 'id'))
+        except Exception as e:
+            logger.debug(f"deezer credits check failed ({e}); track stays dropped")
+            return False
 
     def is_track_missing_from_library(self, track, album_name: str = None,
                                       edition_preference: str = None) -> bool:

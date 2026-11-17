@@ -109,6 +109,7 @@ class ConfigManager:
         # Download sources
         'soulseek.api_key',
         'deezer_download.arl',
+        'soundcloud_download.oauth_token',
         'lidarr_download.api_key',
         'prowlarr.api_key',
         'torrent_client.password',
@@ -547,6 +548,9 @@ class ConfigManager:
                 "token": "",
                 # instance id of the Local files / SMB source the scan reads
                 "source_instance": "",
+                # the folder that source reads, as music assistant sees it. only
+                # used when music assistant won't say (2.10.9 keeps it private)
+                "source_folder": "",
                 "auto_detect": True,
                 "request_timeout_seconds": 30
             },
@@ -656,6 +660,11 @@ class ConfigManager:
             },
             "tidal_download": {
                 "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
+                # #2069: seconds between two download requests (search or
+                # manifest). Downloads are one at a time already; this spaces
+                # the requests one track makes as it steps down the quality
+                # chain. 0 turns it off.
+                "min_request_gap_seconds": 1.0,
                 "session": {
                     "token_type": "",
                     "access_token": "",
@@ -687,6 +696,12 @@ class ConfigManager:
             # soulsync answering as lidarr for request apps (#1799). off by
             # default, requests land on profile_id's wishlist
             "lidarr_compat": {
+                "enabled": False,
+                "profile_id": 1,
+            },
+            # soulsync answering as seerr for video request apps (#2151). off
+            # by default. requests from jellyfin users with no profile go to profile_id
+            "seerr_compat": {
                 "enabled": False,
                 "profile_id": 1,
             },
@@ -740,6 +755,10 @@ class ConfigManager:
                 "password": "",
                 "category": "soulsync",
                 "save_path": "",
+                # qBittorrent only (#2087): start what SoulSync adds even when the
+                # client is set to add torrents stopped, or to stop them once the
+                # metadata is in. Off = the client's own setting decides.
+                "start_torrents": False,
                 # Seeding lifecycle (mirror of the video side): seed a completed
                 # music torrent grab until the ratio/time goal is met, then remove
                 # it from the client. BOTH goals default 0 = sweep OFF = grabs seed
@@ -775,11 +794,11 @@ class ConfigManager:
                 "remove_completed": "off",
             },
             "soundcloud_download": {
-                # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
-                # added later, with credentials living under a "session" subkey
-                # alongside Tidal/Qobuz. No quality knob: anonymous SoundCloud
-                # caps at the upload's transcoding (typically 128 kbps MP3 or
-                # AAC). yt-dlp resolves bestaudio at download time.
+                # a free account's oauth_token cookie. with it, a track whose
+                # uploader turned on the free download comes as the original
+                # file instead of the ~128 kbps stream (#2116). empty stays
+                # anonymous. never go+, that needs a paid account.
+                "oauth_token": "",
             },
             "listenbrainz": {
                 "base_url": "",
@@ -965,6 +984,8 @@ class ConfigManager:
                 # import creates it. Jellyfin/Kodi/Emby use it to identify
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
+                # #2138: the same switch writes poster.jpg / background.jpg
+                # beside it when the artist folder has no artwork.
                 "write_artist_nfo": False,
                 # Library v2: a monitored track whose file was deleted outside
                 # SoulSync is downloaded again (Lidarr behaviour). Off, the

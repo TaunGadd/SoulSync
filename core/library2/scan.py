@@ -285,6 +285,7 @@ def rescan_files(
     manual: bool = False,
     source='scan',
     on_presence_change: Optional[Callable[[List[int]], None]] = None,
+    confirmed_gone: bool = False,
 ) -> Dict[str, int]:
     """Probe the files in scope and persist their measured audio properties.
 
@@ -306,6 +307,13 @@ def rescan_files(
     deliberate — see ``_reconcile_drifted_paths`` and
     ``_persist_missing_observation``.
 
+    ``confirmed_gone=True`` is a person answering the question the outage
+    guards cannot: "most of the library is unreachable" is a dropped mount or
+    a library deleted on purpose, and only they know which (#2005). A file
+    that still does not resolve is confirmed missing on this pass, whatever
+    the share of the library and whatever its root looks like. A file that is
+    there is still read as there, and a rename is still repointed first.
+
     Returns a stats dict: ``scanned``/``updated`` for files that were there,
     ``missing`` for paths that did not resolve, ``path_drift``/``path_repointed``
     for renames spotted and repaired, ``missing_suspected``/``missing_confirmed``
@@ -322,7 +330,7 @@ def rescan_files(
     stats = {
         "scanned": 0, "updated": 0, "missing": 0, "path_drift": 0,
         "path_repointed": 0, "missing_suspected": 0, "missing_confirmed": 0,
-        "recovered": 0,
+        "recovered": 0, "moved_records": 0,
     }
     with closing(database._get_connection()) as conn:
         # sqlite3.Row values remain tied to the result shape, so materialize
@@ -338,8 +346,8 @@ def rescan_files(
     presence: List[int] = []
     confirmed: List[int] = []
     _rescan_loop(database, rows, total, progress=progress, stats=stats,
-                 manual=manual, presence=presence, source=source,
-                 confirmed=confirmed)
+                 manual=manual or confirmed_gone, presence=presence, source=source,
+                 confirmed=confirmed, confirmed_gone=confirmed_gone)
     if confirmed and not _redownload_externally_deleted():
         # Before the presence consumer: it mirrors the wanted projection, so
         # it has to see the track already released.
@@ -349,9 +357,10 @@ def rescan_files(
             logger.error("releasing externally deleted tracks failed: %s",
                          exc, exc_info=True)
     logger.info(
-        "Library v2 file rescan: %(scanned)d probed, %(updated)d updated, "
+        "Library file rescan: %(scanned)d probed, %(updated)d updated, "
         "%(missing)d paths absent, %(path_repointed)d repointed, "
-        "%(missing_confirmed)d confirmed missing, %(recovered)d recovered",
+        "%(missing_confirmed)d confirmed missing, %(recovered)d recovered, "
+        "%(moved_records)d old records of moved files settled",
         stats,
     )
     if presence and on_presence_change:
@@ -419,7 +428,8 @@ def _flush_observations(database, pending, stats, presence=None,
 
 
 def _rescan_loop(database, rows, total, *, progress, stats, manual: bool = False,
-                 presence=None, source='scan', confirmed=None) -> None:
+                 presence=None, source='scan', confirmed=None,
+                 confirmed_gone: bool = False) -> None:
     """The per-file body of :func:`rescan_files`, in three ordered phases.
 
     The order is the behaviour, not an implementation detail:
@@ -450,7 +460,8 @@ def _rescan_loop(database, rows, total, *, progress, stats, manual: bool = False
         _probe_rows(database, repointed, len(repointed), progress=None, stats=stats,
                     presence=presence, source=source)
     _observe_missing(database, still_missing, stats=stats, manual=manual,
-                     ambiguous=ambiguous, presence=presence, confirmed=confirmed)
+                     ambiguous=ambiguous, presence=presence, confirmed=confirmed,
+                     confirmed_gone=confirmed_gone)
 
 
 def _probe_rows(database, rows, total, *, progress, stats,
@@ -570,18 +581,36 @@ def _reconcile_drifted_paths(database, rows, *, stats, repair: bool):
 
 
 def _observe_missing(database, rows, *, stats, manual: bool, ambiguous,
-                     presence=None, confirmed=None) -> None:
+                     presence=None, confirmed=None, confirmed_gone: bool = False) -> None:
     """Phase 3: what survived the drift check is genuinely absent."""
     from core.library2.paths import missing_path_root_is_healthy
 
-    mass = (len(rows) >= MASS_MISSING_MIN
-            and len(rows) > MASS_MISSING_SHARE * (stats["scanned"] + len(rows)))
+    # a file already confirmed missing is a known miss, not news of an outage:
+    # a library someone emptied and confirmed would otherwise read as a
+    # dropped mount on every scan after it (#2005)
+    fresh = sum(1 for row in rows if row.get("file_state") != "missing_confirmed")
+    mass = (not confirmed_gone and fresh >= MASS_MISSING_MIN
+            and fresh > MASS_MISSING_SHARE * (stats["scanned"] + len(rows)))
     if mass:
         stats["mass_missing_deferred"] = len(rows)
         logger.warning(
-            "Library v2 scan: %d of %d files unreachable at once - treating it as "
+            "Library scan: %d of %d files unreachable at once - treating it as "
             "a storage outage, no file is marked missing", len(rows),
             stats["scanned"] + len(rows))
+    elif rows:
+        # a record of where a file used to be, when the same file is on disk
+        # under another record: settled now, not after the two-scan wait, and
+        # never handed on as "this song is gone" (core/library2/moved_file_records)
+        try:
+            from core.library2.moved_file_records import settle_absent_rows
+            settled = settle_absent_rows(database, rows)
+        except Exception as exc:  # noqa: BLE001 - the ordinary lifecycle still runs
+            logger.error("moved-file settle failed during rescan: %s", exc, exc_info=True)
+            settled = {}
+        if settled:
+            stats["moved_records"] = stats.get("moved_records", 0) + len(settled)
+            stats["missing"] += len(settled)
+            rows = [row for row in rows if int(row["id"]) not in settled]
     pending: list = []
     for row in rows:
         stats["missing"] += 1
@@ -590,7 +619,8 @@ def _observe_missing(database, rows, *, stats, manual: bool, ambiguous,
         # makes absence credible; on an unmounted library nothing advances.
         pending.append(("missing", row.get("track_id"), {
             "file_id": row["id"],
-            "root_healthy": not mass and missing_path_root_is_healthy(row["path"]),
+            "root_healthy": confirmed_gone or (
+                not mass and missing_path_root_is_healthy(row["path"])),
             "allow_confirm": int(row["id"]) not in ambiguous,
             "force_confirm": bool(manual),
         }))
@@ -663,7 +693,7 @@ def release_externally_deleted(database, file_ids: List[int]) -> int:
             released += len(track_ids)
         conn.commit()
     if released:
-        logger.info("Library v2 scan: %d track(s) deleted outside SoulSync "
+        logger.info("Library scan: %d track(s) deleted outside SoulSync "
                     "will not be downloaded again", released)
     return released
 

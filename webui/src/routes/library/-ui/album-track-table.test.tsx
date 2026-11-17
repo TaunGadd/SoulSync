@@ -308,6 +308,41 @@ describe('library v2 album track table', () => {
     expect(await screen.findByText('Downloading 55%')).toBeInTheDocument();
   });
 
+  it('flames only the tracks the server marked popular (#2144)', async () => {
+    server.use(
+      http.get('/api/library/v2/albums/42', () =>
+        HttpResponse.json({
+          success: true,
+          album: album([
+            track({ id: 7, title: 'Back In Black', track_number: 6, popular: true }),
+            track({ id: 8, title: 'Shake a Leg', track_number: 9, popular: false }),
+            track({ id: 9, title: 'Have a Drink on Me', track_number: 8 }),
+          ]),
+        }),
+      ),
+      http.get('/api/library/v2/albums/42/match-status', () =>
+        HttpResponse.json({ success: true, album: [], tracks: {} }),
+      ),
+      http.get('/api/library/v2/quality-profiles', () =>
+        HttpResponse.json({ success: true, profiles: [] }),
+      ),
+      http.get('/api/library/v2/albums/42/queue-status', () =>
+        HttpResponse.json({ tracks: {}, albums: {} }),
+      ),
+    );
+
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AlbumTrackTable albumId={42} onAction={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    const marks = await screen.findAllByRole('img', { name: /most played tracks on this album/ });
+    expect(marks).toHaveLength(1);
+    expect(marks[0]).toHaveAttribute('title', expect.stringContaining('Last.fm'));
+    expect(marks[0].closest('tr')).toContainElement(screen.getByText('Back In Black'));
+  });
+
   it('shows media-server recognition in its own column', async () => {
     server.use(
       http.get('/api/library/v2/albums/42', () =>
@@ -871,7 +906,18 @@ describe('library v2 album track table', () => {
     expect(within(dialog).getByText('Quality column')).toBeInTheDocument();
     expect(within(dialog).getByText('Track editor')).toBeInTheDocument();
     expect(within(dialog).getByText('Match providers')).toBeInTheDocument();
-    expect(within(dialog).getByText('Check')).toBeInTheDocument();
+    expect(within(dialog).getByRole('checkbox', { name: 'Check' })).toBeInTheDocument();
+    // the table as these settings make it: the visible columns, in order
+    const preview = within(dialog).getByLabelText('How the track table looks with these settings');
+    const heads = Array.from(preview.querySelectorAll('th'), (th) => th.textContent ?? '');
+    expect(heads[0]).toBe('Title');
+    expect(heads).toContain('Quality');
+    // the artist page's settings sit behind their own pill
+    expect(within(dialog).queryByText('Artist toolbar')).not.toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('tab', { name: /Artist page/ }));
+    expect(within(dialog).getByText('Artist toolbar')).toBeInTheDocument();
+    expect(within(dialog).queryByText('Visible columns')).not.toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('tab', { name: /Track table/ }));
     expect(within(dialog).getByRole('checkbox', { name: /Title/ })).toBeChecked();
     expect(within(dialog).getByRole('checkbox', { name: /Title/ })).toBeDisabled();
     expect(within(dialog).getByLabelText('Drag to reorder Title')).toBeInTheDocument();

@@ -34,7 +34,7 @@ from core.webui.mimetypes_fix import corrected_script_content_type, ensure_web_m
 ensure_web_mimetypes()
 from flask import Flask, abort, render_template, request, jsonify, redirect, send_file, send_from_directory, Response, session, g
 from flask_socketio import SocketIO, emit, join_room, leave_room
-from utils.logging_config import app_log_path, get_logger, setup_logging
+from utils.logging_config import SafeFormatter as _SafeFormatter, app_log_path, get_logger, redact as _redact_log_line, setup_logging
 from utils.async_helpers import run_async
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 
 # App version — single source of truth for backup metadata, system-info, update check, etc.
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
-_SOULSYNC_BASE_VERSION = "3.6.3"
+_SOULSYNC_BASE_VERSION = "3.6.7"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -80,7 +80,7 @@ if not source_reuse_logger.handlers:
     _sr_handler = _logging_handlers.RotatingFileHandler(
         _log_dir / "source_reuse.log", encoding="utf-8", maxBytes=5*1024*1024, backupCount=2
     )
-    _sr_handler.setFormatter(_logging.Formatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _sr_handler.setFormatter(_SafeFormatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     source_reuse_logger.addHandler(_sr_handler)
     source_reuse_logger.propagate = False
 
@@ -91,7 +91,7 @@ if not pp_logger.handlers:
     _pp_handler = _logging_handlers.RotatingFileHandler(
         _log_dir / "post_processing.log", encoding="utf-8", maxBytes=5*1024*1024, backupCount=2
     )
-    _pp_handler.setFormatter(_logging.Formatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _pp_handler.setFormatter(_SafeFormatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     pp_logger.addHandler(_pp_handler)
     pp_logger.propagate = False
 from core.api_validation import parse_strict_bool, parse_strict_id, parse_strict_int
@@ -165,7 +165,7 @@ from core.wishlist.state import (
 )
 from core.imports.album_naming import resolve_album_group as _resolve_album_group
 from core.imports.paths import artist_letter as _shared_artist_letter
-from core.imports.collab_artist import first_listed_artist, listed_primary_of
+from core.imports.collab_artist import collab_primary, library_has_artist, library_has_identified_artist
 from core.imports.album import build_album_import_match_payload
 from core.imports.filename import extract_track_number_from_filename, parse_filename_metadata
 from core.imports.staging import (
@@ -289,7 +289,9 @@ if os.path.exists(config_path):
             config_manager._load_config()
         logger.info("Web server configuration loaded successfully.")
 else:
-    logger.warning(f"config.json not found at {config_path}. Using default settings.")
+    # settings live in the database now. the file is only read when someone
+    # still has one, so its absence is the normal case, not a warning
+    logger.debug(f"No config.json at {config_path}: settings are read from the database.")
 # Correctly point to the 'webui' directory for templates and static files
 app = Flask(
     __name__,
@@ -394,7 +396,7 @@ def _hold_catalogue_jobs_during_upgrade():
         from core.library2.migration_gate import migration_required
         blocked = migration_required(get_database())
     except Exception as exc:  # fail closed: a half-known migration state is not writable
-        logger.warning("Could not verify Library v2 upgrade barrier: %s", exc)
+        logger.warning("Could not verify Library upgrade barrier: %s", exc)
         blocked = True
     if blocked:
         return jsonify({
@@ -1342,6 +1344,10 @@ def _register_matched_download_context(context_key: str, context: dict) -> None:
         context['library_owner_id'] = _selected_library_owner()
     with matched_context_lock:
         matched_downloads_context[context_key] = context
+    # a new grab of a file we already processed once (same deezer id, same
+    # name) is a new download. the key stayed in the processed set until a
+    # restart, so the poll skipped it and the file sat in downloads (#1983)
+    processed_download_ids.discard(context_key)
 
 
 IS_SHUTTING_DOWN = False
@@ -1441,6 +1447,9 @@ try:
         persistent_reconciler_runner=lambda: (
             _run_persistent_acquisition_reconciliation(dry_run=False)
         ),
+        # review 5 W2-WC-2: a job gone from the client ages out on the same clock
+        missing_ttl_getter=lambda: config_manager.get(
+            "acquisition.reconciliation_evidence_ttl_seconds", 24 * 60 * 60),
     )
     logger.info("  Usenet acquisition monitor initialized")
 except Exception as e:
@@ -1798,12 +1807,10 @@ def _register_automation_handlers():
             return None
 
     def _itunes_link_parser_for_registry(url):
-        # ``parse_itunes_link_endpoint`` is a Flask route handler; the
-        # actual parsing work needs the underlying helpers. For now
-        # we punt — Phase 2 will lift the parsing into a pure helper
-        # the adapter can call directly. Refresh of itunes_link
-        # mirrors is not yet wired (current handler skips them).
-        return None
+        # the same parse the paste route runs. this was a stub returning
+        # None, so an Apple Music mirror never refreshed (#2147)
+        from core.playlists.itunes_link import fetch_itunes_link
+        return fetch_itunes_link(url, _get_itunes_client)
 
     # Discovery callable for the LB / Last.fm adapters' ``discover_tracks``.
     # Wraps the pure ``match_mb_tracks`` helper with the live matching
@@ -3762,6 +3769,9 @@ def _regenerate_batch_m3u(batch, tracks):
         active_server = config_manager.get_active_media_server()
         transfer_dir = docker_resolve_path(config_manager.get('soulseek.transfer_path', './Transfer'))
         m3u_folder = _compute_m3u_folder(transfer_dir, 'playlist', playlist_name, '', '', '')
+        # the batch only has what it downloaded, a mirror's m3u is the whole playlist (#2111)
+        from core.playlists.batch_m3u import playlist_m3u_tracks
+        tracks = playlist_m3u_tracks(batch, tracks, db)
 
         # Resolve file paths from library DB
         from collections import defaultdict
@@ -4077,7 +4087,7 @@ def _build_system_stats():
     # survives Docker/container restarts and streaming downloads that leave
     # the in-memory task tracker after post-processing.
     try:
-        persistent_finished = int(get_database().get_library_history_stats().get('downloads', 0) or 0)
+        persistent_finished = get_database().count_library_history_downloads()
         with session_stats_lock:
             finished_downloads = max(persistent_finished, session_completed_downloads)
     except Exception:
@@ -4195,6 +4205,7 @@ def get_debug_info():
 # active, which is why it never runs by default.
 
 @app.route('/api/debug/memory/start')
+@admin_only
 def debug_memory_start():
     try:
         from core.diagnostics.memory_tracker import start_tracking
@@ -4204,6 +4215,7 @@ def debug_memory_start():
 
 
 @app.route('/api/debug/memory/report')
+@admin_only
 def debug_memory_report():
     try:
         from core.diagnostics.memory_tracker import report
@@ -4214,6 +4226,7 @@ def debug_memory_report():
 
 
 @app.route('/api/debug/memory/stop')
+@admin_only
 def debug_memory_stop():
     try:
         from core.diagnostics.memory_tracker import stop_tracking
@@ -4223,6 +4236,7 @@ def debug_memory_stop():
 
 
 @app.route('/api/debug/memory/objects')
+@admin_only
 def debug_memory_objects():
     """One-shot memory breakdown by live object type (plain gc — NO tracemalloc, so it
     won't lock up a loaded app). Hit this once when RSS is high to see which type/cache
@@ -4482,7 +4496,8 @@ def handle_settings():
                         reset_own_library_fallback_notifications()
                     except Exception as _inv_err:
                         logger.debug("scope cache invalidation failed: %s", _inv_err)
-                    if new_server not in _media_specs.names_where(supports_own_libraries=True):
+                    from core.library_scope import own_libraries_supported_on
+                    if not own_libraries_supported_on(new_server):
                         try:
                             own_profs = get_database().get_own_library_profiles()
                             if own_profs:
@@ -4510,7 +4525,7 @@ def handle_settings():
                     for key, value in _experimental_in.items():
                         config_manager.set(f'experimental.{key}', value)
 
-                for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'music_assistant', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi', 'hifi_download', 'soundcloud_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'lrclib', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'pollinations', 'fanart', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'concerts', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'podcasts', 'audiobooks', 'experimental', 'image_cache', 'beatport', 'lidarr_compat', 'mcp']:
+                for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'music_assistant', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi', 'hifi_download', 'soundcloud_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'lrclib', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'pollinations', 'fanart', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'concerts', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'podcasts', 'audiobooks', 'experimental', 'image_cache', 'beatport', 'lidarr_compat', 'seerr_compat', 'mcp']:
                     if service in new_settings:
                         if service == 'experimental' and isinstance(_experimental_in, dict):
                             continue
@@ -4563,10 +4578,9 @@ def handle_settings():
 
             logger.info("Settings saved successfully via Web UI.")
 
-            # Add activity for settings save
-            changed_services = list(new_settings.keys())
-            services_text = ", ".join(changed_services)
-            add_activity_item("", "Settings Updated", f"{services_text} configuration saved", "Now")
+            # the page sends every section on each save, so naming them was a wall
+            # of text. no toast either: the save button already says saved
+            add_activity_item("", "Settings Updated", "Configuration saved", "Now", show_toast=False)
 
             # Reload service clients with new settings (guard against None from partial init)
             if spotify_client:
@@ -4840,7 +4854,9 @@ def get_log_tail():
                         continue
                 if search and search not in stripped.lower():
                     continue
-                result_lines.append(stripped)
+                # lines written before the formatters blanked credentials are
+                # still on disk: never hand one to the page as it was
+                result_lines.append(_redact_log_line(stripped))
             # Trim to requested count after filtering
             result_lines = result_lines[-lines:]
         except Exception as e:
@@ -6503,7 +6519,7 @@ def search_music():
     from core.library2.grab_context import resolve_lib2_grab_context
     _lib2_state, _lib2_ctx = resolve_lib2_grab_context(get_database(), data)
     if _lib2_state == 'invalid':
-        return jsonify({"error": "Unknown Library v2 entity for this search."}), 400
+        return jsonify({"error": "Unknown Library entity for this search."}), 400
     # A Library-v2 Interactive Search sends no text: it asks the sources what
     # an automatic download would ask, and every hit carries the verdict.
     queries = [query] if query else (
@@ -7377,7 +7393,7 @@ def start_download():
         _lib2_state, _lib2_ctx = resolve_lib2_grab_context(
             get_database(), raw_data)
         if _lib2_state == 'invalid':
-            return jsonify({"error": "Unknown Library v2 entity for this grab."}), 400
+            return jsonify({"error": "Unknown Library entity for this grab."}), 400
         from core.imports.upgrade_intent import (
             attach_upgrade_intent,
             issue_upgrade_intent,
@@ -7393,7 +7409,7 @@ def start_download():
                 "success": False,
                 "error": (
                     "Album results cannot be grabbed for a track-scoped "
-                    "Library v2 search. Select one track result instead."
+                    "Library search. Select one track result instead."
                 ),
             }), 400
 
@@ -7768,8 +7784,12 @@ def start_download():
                         context_key, data.get('title'), data.get('artist'),
                         _skip_checks, _requesting_profile)
 
-                # Extract track name from filename for activity
-                track_name = filename.split('/')[-1] if '/' in filename else filename.split('\\')[-1] if '\\' in filename else filename
+                # Extract track name from filename for activity. a streaming
+                # 'id||name' isn't a path, a '/' in its title would cut it (#1983)
+                if '||' in filename:
+                    track_name = filename.split('||', 1)[1]
+                else:
+                    track_name = filename.split('/')[-1] if '/' in filename else filename.split('\\')[-1] if '\\' in filename else filename
                 _track_quick_download(
                     download_id,
                     title=data.get('title') or track_name,
@@ -8321,6 +8341,7 @@ from core.downloads import cancel as _downloads_cancel
 
 
 @app.route('/api/downloads/cancel', methods=['POST'])
+@admin_only
 def cancel_download():
     """Cancel a specific download transfer, matching GUI functionality."""
     data = request.get_json()
@@ -8344,6 +8365,7 @@ def cancel_download():
 
 
 @app.route('/api/downloads/cancel-all', methods=['POST'])
+@admin_only
 def cancel_all_downloads():
     """Cancel all active downloads from slskd, then clear completed ones."""
     try:
@@ -8359,6 +8381,7 @@ def cancel_all_downloads():
 
 
 @app.route('/api/downloads/clear-finished', methods=['POST'])
+@admin_only
 def clear_finished_downloads():
     """Clear all terminal (completed, cancelled, failed) downloads from slskd."""
     try:
@@ -8557,6 +8580,7 @@ def get_task_candidates(task_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/downloads/task/<task_id>/download-candidate', methods=['POST'])
+@admin_only
 def download_selected_candidate(task_id):
     """Restart a not_found/failed task by downloading a user-selected candidate."""
     dl_err = check_download_permission()
@@ -8773,6 +8797,7 @@ def _resolve_link_track_query(source: str, entity_id: str, kind: str = 'track',
 
 
 @app.route('/api/downloads/task/<task_id>/manual-search', methods=['POST'])
+@admin_only
 def manual_search_for_task(task_id):
     """Run a user-driven search against one (or all) configured download
     sources and stream candidate results as NDJSON — one JSON object per
@@ -9019,6 +9044,7 @@ def get_scan_status():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/searches/clear-all', methods=['POST'])
+@admin_only
 def clear_all_searches():
     """
     Clear all searches from slskd search history.
@@ -9077,6 +9103,7 @@ def get_download_origins():
 
 
 @app.route('/api/download-origins/delete', methods=['POST'])
+@admin_only
 def delete_download_origins():
     """Delete origin-history entries; optionally (default) also delete the
     files on disk and their library track rows."""
@@ -9115,7 +9142,8 @@ def delete_download_origins():
                     failed_ids.add(row['id'])
                     continue
                 files_missing += 1  # already gone — still clean up the rows
-            db.delete_track_by_file_path(raw_path)
+            db.delete_track_by_file_path(raw_path, release_wish=True,
+                                         profile_id=get_current_profile_id() or 1)
         removed = db.delete_library_history_rows(
             [r['id'] for r in rows if r['id'] not in failed_ids])
         return jsonify({
@@ -9803,8 +9831,8 @@ def reidentify_apply():
             return jsonify({"success": False, "error": "library_track_id, source and track_id are required"}), 400
 
         from core.imports.rematch_search import resolve_hint_fields
-        from core.imports.rematch_apply import stage_file_for_reidentify, build_reidentify_hint
-        from core.imports.rematch_hints import create_hint
+        from core.imports.rematch_apply import build_reidentify_hint, stage_with_committed_hint
+        from core.library2.sql_util import owner_clause
 
         # 1) Resolve the picked release → the IDs the hint needs (album_id critically).
         hint_fields = resolve_hint_fields(source, track_id)
@@ -9816,10 +9844,14 @@ def reidentify_apply():
         try:
             cur = conn.cursor()
             # Library v2 owns the files: the path lives on lib2_track_files, and
-            # a track can carry several, so this takes the primary active one.
+            # a track can carry several, so this takes the primary active one
+            # of the library being worked in. the primary flag spans every
+            # library, so unscoped it staged another library's copy (review 5
+            # W2-WD-3)
             cur.execute(
-                "SELECT f.path AS file_path FROM lib2_track_files f "
-                "WHERE f.track_id = ? AND COALESCE(f.file_state, 'active') = 'active' "
+                "SELECT f.id AS file_id, f.path AS file_path FROM lib2_track_files f "
+                "WHERE f.track_id = ? AND COALESCE(f.file_state, 'active') = 'active'"
+                f"{owner_clause(column='f.owner_profile_id')} "
                 "ORDER BY f.is_primary DESC, f.id ASC LIMIT 1",
                 (str(library_track_id),))
             row = cur.fetchone()
@@ -9828,6 +9860,7 @@ def reidentify_apply():
         if not row or not row['file_path']:
             return jsonify({"success": False, "error": "Library track has no file on disk"}), 404
         stored_path = row['file_path']
+        replace_file_id = row['file_id']
 
         # Resolve the stored DB path to a file THIS process can actually read, using
         # the SAME strong resolver the rest of the app uses (transfer/download/library/
@@ -9851,20 +9884,16 @@ def reidentify_apply():
                 f"Searched: {searched}.\nIf the file lives on a media server SoulSync can't read directly "
                 f"(or the stored path is stale), re-identify isn't available for it.")}), 404
 
-        # 3) Copy into staging + fingerprint the copy.
+        # 3) + 4) Copy into staging under a hidden name, commit the single-use
+        # hint, then put the copy in place: no copy inside an open hint
+        # transaction, and auto-import never meets a staged file without its
+        # hint (it would file it as a new track). review 5 R5-D-3
         staging_dir = docker_resolve_path(config_manager.get('import.staging_path', './Staging'))
-        staged = stage_file_for_reidentify(real_path, staging_dir, library_track_id)
-
-        # 4) Persist the single-use hint.
-        hint = build_reidentify_hint(library_track_id, hint_fields,
-                                     staged['staged_path'], staged['content_hash'], replace=replace)
-        conn = database._get_connection()
-        try:
-            cur = conn.cursor()
-            hint_id = create_hint(cur, hint)
-            conn.commit()
-        finally:
-            conn.close()
+        hint_id, hint, staged = stage_with_committed_hint(
+            database._get_connection, real_path, staging_dir, library_track_id,
+            lambda staged_path, content_hash: build_reidentify_hint(
+                library_track_id, hint_fields, staged_path, content_hash,
+                replace=replace, replace_file_id=replace_file_id))
 
         # 5) Nudge the worker so it doesn't wait for the next timer tick.
         try:
@@ -10071,9 +10100,9 @@ def _reconcile_after_scan(worker):
                 server_source=getattr(worker, 'server_type', None))
             logger.info(
                 "[Reconcile] Post-scan: filled %d id(s) across %d row(s) from %d newly "
-                "mapped track(s) (%d unreadable, %d conflicts)",
+                "mapped track(s) (%d unreadable, %d conflicts, %d errors)",
                 totals.ids_filled, totals.entities_updated, totals.processed,
-                totals.unreadable, totals.conflicts,
+                totals.unreadable, totals.conflicts, totals.errors,
             )
         finally:
             conn.close()
@@ -10125,6 +10154,7 @@ def reconcile_embedded_ids():
                             'ids_filled': totals.ids_filled,
                             'conflicts': totals.conflicts,
                             'unreadable': totals.unreadable,
+                            'errors': totals.errors,
                             'current': title,
                         })
 
@@ -10503,7 +10533,9 @@ def _resolve_library_file_path(file_path):
     # which is why the same library resolved from a repair job and failed here.
     try:
         from core.library.path_resolver import resolve_via_last_resort_fallbacks
-        interior = resolve_via_last_resort_fallbacks(clean_rel, abs_bases)
+        # the path as stored, not clean_rel: the fallback asks whether another
+        # record holds the file it finds, and looks this one up by stored path
+        interior = resolve_via_last_resort_fallbacks(file_path, abs_bases)
         if interior:
             logger.debug("[PathResolve] interior-segment fallback: %r → %r", file_path, interior)
             return interior
@@ -10625,22 +10657,22 @@ def library_play_track():
             # Not on disk. For a streaming server (Navidrome/Subsonic) we can
             # play it through the server's own stream API instead of requiring
             # the library to be mounted into the SoulSync container (#809).
-            server_track_id = (
-                data.get('server_track_id') or data.get('legacy_track_id')
-                or (None if data.get('lib2_track_id') else data.get('track_id'))
-            )
-            if not server_track_id and data.get('lib2_track_id'):
+            # the active server's own id for a catalogue track wins: the
+            # sent id can be a 3.6.1 id from another server (a plex
+            # ratingKey after a move to navidrome) or a pre-rekey id, and
+            # streamed nothing. review 5 R5-X3-3
+            server_track_id = None
+            if data.get('lib2_track_id'):
                 active_server = config_manager.get_active_media_server()
                 from core.library2.media_mappings import is_media_server_source
                 if is_media_server_source(active_server):
-                    with get_database()._get_connection() as conn:
-                        row = conn.execute(
-                            "SELECT server_id FROM lib2_media_server_mappings "
-                            "WHERE entity_type='track' AND entity_id=? "
-                            "AND server_source=? LIMIT 1",
-                            (data.get('lib2_track_id'), active_server),
-                        ).fetchone()
-                    server_track_id = row[0] if row else None
+                    server_track_id = get_database().server_track_id(
+                        data.get('lib2_track_id'), active_server)
+            if not server_track_id:
+                server_track_id = (
+                    data.get('server_track_id') or data.get('legacy_track_id')
+                    or (None if data.get('lib2_track_id') else data.get('track_id'))
+                )
             stream_url = _build_library_stream_url(server_track_id, file_path)
             if not stream_url:
                 return jsonify({"success": False, "error": _get_file_not_found_error(file_path)}), 404
@@ -11074,6 +11106,9 @@ def _library_match_request(clear: bool):
                                       watchlist_row_id=data.get('watchlist_row_id'),
                                       profile_id=get_current_profile_id())
         conn.commit()
+        # the enrichment modal's unmatched list (review 5 R5-D-1)
+        from core.enrichment.unmatched import invalidate_unmatched_snapshots
+        invalidate_unmatched_snapshots()
     except WatchlistMismatch as e:
         conn.rollback()
         return jsonify({"success": False, "error": str(e)}), 409
@@ -11225,7 +11260,8 @@ def remove_from_blacklist(blacklist_id):
 # TRACK REDOWNLOAD — Search metadata, search download sources, start redownload
 # ==================================================================================
 
-def _inspect_sources_stream(track_obj, quality_profile_id, *, log_tag='Inspector', upgrade=False):
+def _inspect_sources_stream(track_obj, quality_profile_id, *, log_tag='Inspector', upgrade=False,
+                            bind_profile=False):
     """Search every configured download source for one track and stream the
     verdicts: NDJSON, one line per source as it answers, then {"done": true}.
 
@@ -11289,6 +11325,14 @@ def _inspect_sources_stream(track_obj, quality_profile_id, *, log_tag='Inspector
         from core.quality.upgrades import apply_upgrade_bar, upgrade_bar
         bar = upgrade_bar(quality_profile_id)
 
+    # The inspector's picks go back through /download-candidate, which grabs
+    # as the CALLER. tokens minted on these pool threads (outside the request)
+    # were profile 1's, so a household member's torrent/usenet pick was
+    # refused. captured here, while the request is still the context.
+    from contextlib import nullcontext
+    from core.download_plugins.candidate_store import candidate_binding
+    _bind_to = get_current_profile_id() if bind_profile else None
+
     def _search_one_source(source_name, client):
         evaluated = []
         for q in search_queries:
@@ -11297,7 +11341,8 @@ def _inspect_sources_stream(track_obj, quality_profile_id, *, log_tag='Inspector
                 # orchestrator, so nothing else would enter the item's profile
                 # context and quality_tier_for_source would ask each source for
                 # the tier the APP default wants.
-                with quality_profile_context(quality_profile_id):
+                with quality_profile_context(quality_profile_id), \
+                        (candidate_binding(_bind_to) if _bind_to is not None else nullcontext()):
                     tracks_result, _ = run_async(client.search(q, timeout=20))
                 if not tracks_result:
                     continue
@@ -11413,6 +11458,7 @@ def redownload_start(track_id):
 # download or a wishlist item instead of a library track.
 
 @app.route('/api/downloads/task/<task_id>/inspect', methods=['POST'])
+@admin_only
 def inspect_task_sources(task_id):
     """Every source's hits for a download task's track, with the verdicts.
     A pick goes back through /download-candidate."""
@@ -11427,7 +11473,7 @@ def inspect_task_sources(task_id):
         return _inspect_sources_stream(
             _pinned_batch.track_object(track_info),
             track_info.get('quality_profile_id'),
-            log_tag='Inspector',
+            log_tag='Inspector', bind_profile=True,
         )
     except Exception as e:
         logger.error(f"Error in task source inspection: {e}", exc_info=True)
@@ -11483,7 +11529,7 @@ def inspect_wishlist_sources():
         track = _wishlist_search_override(track, data)
         return _inspect_sources_stream(
             _pinned_batch.track_object(track), track.get('quality_profile_id'),
-            log_tag='Inspector',
+            log_tag='Inspector', bind_profile=True,
         )
     except Exception as e:
         logger.error(f"Error in wishlist source inspection: {e}", exc_info=True)
@@ -13684,7 +13730,10 @@ def parse_youtube_playlist(url):
             # 100 -> 200+ on a large playlist. Remove once the upstream fix (PR #16948) ships.
             'extractor_args': {'youtubetab': {'skip': ['webpage']}},
         }
-        ydl_opts.update(_youtube_cookie_opts())
+        cookie_opts = _youtube_cookie_opts()
+        ydl_opts.update(cookie_opts)
+        from core.youtube_cookies import youtube_tab_skips
+        ydl_opts['extractor_args']['youtubetab']['skip'] = youtube_tab_skips(cookie_opts)
 
         tracks = []
 
@@ -13752,6 +13801,11 @@ def parse_youtube_playlist(url):
             #
             # music.youtube.com does NOT have that problem: its entries carry a
             # per-track channel, so `allow_channel_artist` resolves them inline.
+
+            from core.youtube_cookies import empty_signed_in_parse_warning
+            _empty_warning = empty_signed_in_parse_warning(url, cookie_opts, len(tracks))
+            if _empty_warning:
+                logger.warning(_empty_warning)
 
             # Create playlist object matching GUI structure
             playlist_data = {
@@ -13944,6 +13998,8 @@ def _get_file_path_from_template_raw(template: str, context: dict) -> tuple:
         cleaned_folders = []
         for part in folder_parts:
             part = part.replace('$quality', '')
+            # the always-on pair starts with $disc: strip it whole first (#2044)
+            part = part.replace('$discnumalways', '').replace('$discalways', '')
             part = part.replace('$discnum', '')
             part = part.replace('$disc', '')
             part = re.sub(r'\s*\[\s*\]', '', part)
@@ -14061,7 +14117,9 @@ def _apply_path_template(template: str, context: dict) -> str:
     # (e.g., $albumartist must be replaced before $album to prevent "Scorpionartist" from typo "$albumartis")
 
     # Longest variables first
-    album_artist_value = clean_context.get('albumartist', clean_context.get('artist', 'Unknown Artist'))
+    # an empty name is no name, same as core/imports/paths.py (#2023)
+    artist_value = clean_context.get('artist') or 'Unknown Artist'
+    album_artist_value = clean_context.get('albumartist') or artist_value
     # Collaborative album artist handling: "first" uses only the primary artist for folder names
     collab_mode = config_manager.get('file_organization.collab_artist_mode', 'first')
     if collab_mode == 'first' and album_artist_value:
@@ -14072,9 +14130,10 @@ def _apply_path_template(template: str, context: dict) -> str:
         # same rule as core/imports/paths.py: a lone listed name counts when
         # the album artist is that name plus collaborators
         _raw_album_artist = str(context.get('albumartist') or context.get('artist') or album_artist_value)
-        primary = first_listed_artist(_raw_album_artist, artists_list)
-        if not primary and context.get('_track_artists_list'):
-            primary = listed_primary_of(_raw_album_artist, context['_track_artists_list'][0])
+        primary = collab_primary(
+            _raw_album_artist, artists_list, context.get('_track_artists_list'),
+            known_names=context.get('_collab_known_names') or (),
+            library_has=library_has_artist, library_knows=library_has_identified_artist)
         if primary:
             # raw list name: sanitize like every other value (#1954)
             album_artist_value = _sanitize_filename(primary)
@@ -14126,7 +14185,7 @@ def _apply_path_template(template: str, context: dict) -> str:
         'atypes': clean_context.get('atypes', ''),
         'playlist': clean_context.get('playlist_name', ''),
         'artistletter': artist_letter_value,
-        'artist': clean_context.get('artist', 'Unknown Artist'),
+        'artist': artist_value,
         'album': clean_context.get('album', 'Unknown Album'),
         'title': clean_context.get('title', 'Unknown Track'),
         'track': f"{clean_context.get('track_number', 1):02d}",
@@ -14156,7 +14215,7 @@ def _apply_path_template(template: str, context: dict) -> str:
 
     # Medium length variables
     result = result.replace('$artistletter', artist_letter_value)
-    result = result.replace('$artist', clean_context.get('artist', 'Unknown Artist'))
+    result = result.replace('$artist', artist_value)
     result = result.replace('$album', clean_context.get('album', 'Unknown Album'))
     result = result.replace('$title', clean_context.get('title', 'Unknown Track'))
     # $track_disambiguation must replace before $track: it starts with $track,
@@ -14230,6 +14289,8 @@ def _get_file_path_from_template(context: dict, template_type: str = 'album_path
         cleaned_folders = []
         for part in folder_parts:
             part = part.replace('$quality', '')
+            # the always-on pair starts with $disc: strip it whole first (#2044)
+            part = part.replace('$discnumalways', '').replace('$discalways', '')
             part = part.replace('$discnum', '')
             part = part.replace('$disc', '')
             part = re.sub(r'\s*\[\s*\]', '', part)   # empty []
@@ -14415,11 +14476,18 @@ def _post_process_matched_download_with_verification(context_key, context, file_
         attach_recovered_staging_context,
         record_recovered_staging_result,
     )
-    recovered_context = attach_recovered_staging_context(
-        get_database()._get_connection, file_path, context,
-    )
-    context.clear()
-    context.update(recovered_context)
+    # recovery bookkeeping only: an error here (a locked db, a bad recovery
+    # row) must not abort the import of an ordinary download
+    try:
+        recovered_context = attach_recovered_staging_context(
+            get_database()._get_connection, file_path, context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("staging recovery lookup failed, importing as is: %s", exc)
+        recovered_context = None
+    if recovered_context is not None:
+        context.clear()
+        context.update(recovered_context)
     from core.imports.pipeline import (
         import_rejection_reason,
         post_process_matched_download_with_verification,
@@ -14569,11 +14637,18 @@ def _post_process_matched_download(context_key, context, file_path):
         attach_recovered_staging_context,
         record_recovered_staging_result,
     )
-    recovered_context = attach_recovered_staging_context(
-        get_database()._get_connection, file_path, context,
-    )
-    context.clear()
-    context.update(recovered_context)
+    # recovery bookkeeping only: an error here (a locked db, a bad recovery
+    # row) must not abort the import of an ordinary download
+    try:
+        recovered_context = attach_recovered_staging_context(
+            get_database()._get_connection, file_path, context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("staging recovery lookup failed, importing as is: %s", exc)
+        recovered_context = None
+    if recovered_context is not None:
+        context.clear()
+        context.update(recovered_context)
     from core.imports.pipeline import import_rejection_reason, post_process_matched_download
     result = post_process_matched_download(
         context_key,
@@ -14728,14 +14803,20 @@ def notification_history():
     pid = get_current_profile_id()
     if request.method == 'DELETE':
         return jsonify({'success': True, 'removed': db.clear_notification_history(pid)})
+    type_filter = request.args.get('type')
+    search = request.args.get('q')
     rows = db.get_notification_history(
         pid,
-        type_filter=request.args.get('type'),
-        search=request.args.get('q'),
+        type_filter=type_filter,
+        search=search,
         limit=request.args.get('limit', default=100, type=int) or 100,
         offset=request.args.get('offset', default=0, type=int) or 0,
     )
-    return jsonify({'success': True, 'notifications': rows})
+    # how many of each kind match the search (the filter chips), and how many
+    # this request pages through ("Showing 100 of 1,204")
+    counts = db.get_notification_counts(pid, search=search)
+    total = counts.get(type_filter, 0) if type_filter in counts else sum(counts.values())
+    return jsonify({'success': True, 'notifications': rows, 'counts': counts, 'total': total})
 
 
 def _simple_monitor_task():
@@ -15450,6 +15531,9 @@ def _tracks_with_mirrored_quality_profile(
                 track = dict(track)
                 if explicit or track.get('quality_profile_id') is None:
                     track['quality_profile_id'] = quality_profile_id
+                    # only a dialog pick pins the imported track, never a
+                    # mirror's assignment (review 5 W2-WD-1)
+                    track['quality_profile_explicit'] = explicit
             enriched.append(track)
         return enriched, quality_profile_id
     except Exception as exc:
@@ -16195,6 +16279,7 @@ def get_batch_history():
 
 
 @app.route('/api/downloads/clear-completed', methods=['POST'])
+@admin_only
 def clear_completed_downloads():
     """Clear finished rows from the Downloads page.
 
@@ -16238,6 +16323,7 @@ _REMOVE_REFUSALS = {
 
 
 @app.route('/api/downloads/remove', methods=['POST'])
+@admin_only
 def remove_download_from_list():
     """Take one failed / not-found / cancelled row off the Downloads page.
 
@@ -16259,6 +16345,7 @@ def remove_download_from_list():
 
 
 @app.route('/api/downloads/task/download-next', methods=['POST'])
+@admin_only
 def prioritize_download_task_next():
     """Move one queued task to the next unstarted slot in its batch."""
     data = request.get_json(silent=True) or {}
@@ -16286,6 +16373,7 @@ def prioritize_download_task_next():
 
 
 @app.route('/api/downloads/batch/download-next', methods=['POST'])
+@admin_only
 def prioritize_download_batch_next():
     """Run a batch next after already-active workers elsewhere drain."""
     data = request.get_json(silent=True) or {}
@@ -16309,6 +16397,28 @@ def prioritize_download_batch_next():
         logger.error(f"Error prioritizing download batch: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def _download_owner_profile(*, task_id=None, batch_id=None):
+    """The profile that started a download task or batch, or None when it
+    isn't recorded (the task's own stamp, else its batch's)."""
+    with tasks_lock:
+        task = download_tasks.get(task_id) if task_id else None
+        if task is not None:
+            if task.get('profile_id') is not None:
+                return task.get('profile_id')
+            batch_id = batch_id or task.get('batch_id')
+        batch = download_batches.get(batch_id) if batch_id else None
+        return batch.get('profile_id') if batch else None
+
+
+def _cancel_refused(owner_profile_id):
+    """A 403 unless the caller is an admin or cancelling a download their own
+    profile started (core/permissions.may_cancel_download)."""
+    from core.permissions import may_cancel_download
+    if may_cancel_download(owner_profile_id, get_current_profile_id(), is_admin_request()):
+        return None
+    return jsonify({"success": False, "error": "Admin access required"}), 403
+
+
 @app.route('/api/downloads/cancel_task', methods=['POST'])
 def cancel_download_task():
     """
@@ -16320,6 +16430,9 @@ def cancel_download_task():
     task_id = data.get('task_id')
     if not task_id:
         return jsonify({"success": False, "error": "Missing task_id"}), 400
+    refused = _cancel_refused(_download_owner_profile(task_id=task_id))
+    if refused:
+        return refused
 
     try:
         with tasks_lock:
@@ -16610,6 +16723,12 @@ def cancel_task_v2():
             "error": "Missing playlist_id or track_index"
         }), 400
 
+    with tasks_lock:
+        _owned_task_id, _ = _find_task_by_playlist_track(playlist_id, track_index)
+    refused = _cancel_refused(_download_owner_profile(task_id=_owned_task_id))
+    if refused:
+        return refused
+
     if playlist_id == 'audiobooks':
         from core.audiobook_download_monitor import cancel_downloads as cancel_audiobooks
         with tasks_lock:
@@ -16815,6 +16934,9 @@ def cancel_batch(batch_id):
     Cancels an entire batch - useful for cancelling during analysis phase
     or cancelling all downloads at once.
     """
+    refused = _cancel_refused(_download_owner_profile(batch_id=batch_id))
+    if refused:
+        return refused
     if batch_id == 'audiobooks':
         from core.audiobook_download_monitor import cancel_downloads as cancel_audiobooks
         try:
@@ -18420,12 +18542,15 @@ def library_search_tracks():
 # a manual match overrides it. this is that view, and changing a pick stores
 # the same durable match the server editor stores, so the first sync uses it.
 
-def _presync_track_rows(database, active_server, ids):
+def _presync_track_rows(database, active_server, ids, catalogue_ids=()):
     """{id: {id, title, artist, thumb, duration}} for the library tracks the
     mirror rows point at. the active server's track id first (what the check
-    stamps and the sync matches by), the catalogue id for a manual match that
-    named one."""
+    stamps and the sync matches by), the catalogue id only for a stamp that
+    says it is one (``catalogue_ids``). a server id and a catalogue id share
+    one numeric range, so a gone server track read as a catalogue id showed
+    an unrelated song as matched (review 5 W2-WB-2)."""
     ids = [str(i) for i in dict.fromkeys(ids) if i]
+    catalogue_ids = {str(i) for i in catalogue_ids if i}
     out = {}
     if not ids:
         return out
@@ -18449,7 +18574,7 @@ def _presync_track_rows(database, active_server, ids):
             for sql, params in queries:
                 for row in conn.execute(sql, params).fetchall():
                     out.setdefault(str(row['key']), row)
-        rest = [i for i in ids if i not in out and i.isdigit()]
+        rest = [i for i in ids if i not in out and i in catalogue_ids and i.isdigit()]
         for i in range(0, len(rest), 400):
             chunk = rest[i:i + 400]
             ph = ','.join('?' * len(chunk))
@@ -18502,7 +18627,9 @@ def mirrored_presync_matches(playlist_id):
             logger.debug(f"[PreSync] manual matches unavailable: {e}")
         library = _presync_track_rows(
             database, active_server,
-            [e.get('library_track_id') for e in extras if e.get('in_library')])
+            [e.get('library_track_id') for e in extras if e.get('in_library')],
+            catalogue_ids=[e.get('library_track_id') for e in extras
+                           if e.get('in_library') and e.get('library_track_id_kind') == 'lib2'])
         tracks = []
         unchecked = 0
         for row, extra in zip(rows, extras, strict=True):
@@ -18569,8 +18696,9 @@ def mirrored_presync_set_match(playlist_id):
             source_track_id, active_server, track_id, data.get('track_title', ''),
             row.get('track_name') or '', row.get('artist_name') or '',
             source=playlist.get('source') or 'spotify')
+        # the library search answers with the server's id (review 5 W2-WB-2)
         database.update_mirrored_track_extra_data(row['id'], {
-            'in_library': True, 'library_track_id': track_id,
+            'in_library': True, 'library_track_id': track_id, 'library_track_id_kind': 'server',
             'library_checked_at': int(time.time()), 'library_checked_via': 'manual'})
         return jsonify({"success": True, "message": "Match saved, the next sync uses it"})
     except Exception as e:
@@ -18599,7 +18727,7 @@ def mirrored_presync_unmatch(playlist_id):
                                 source_track_id, track_id):
                 return jsonify({"success": False, "error": "Could not save the unmatch"}), 500
         database.update_mirrored_track_extra_data(row['id'], {
-            'in_library': False, 'library_track_id': None,
+            'in_library': False, 'library_track_id': None, 'library_track_id_kind': None,
             'library_checked_at': int(time.time()), 'library_checked_via': 'manual'})
         return jsonify({"success": True, "message": "Match removed"})
     except Exception as e:
@@ -18902,12 +19030,12 @@ def start_missing_tracks_process(playlist_id):
                 _lib2_conn.close()
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
-    except Exception as exc:
-        logger.exception("Confirmed Search intent materialization failed")
-        return jsonify({
-            "success": False,
-            "error": f"Could not prepare Library v2 search intent: {exc}",
-        }), 500
+    except Exception:
+        # the library v2 intent is bookkeeping on top of the download (3.6.1
+        # had no such step). a locked db or odd metadata here must not refuse
+        # the download the admin asked for: it goes ahead without the intent
+        logger.exception("Confirmed Search intent materialization failed; "
+                         "starting the download without it")
 
     with tasks_lock:
         download_batches[batch_id] = {
@@ -20605,7 +20733,7 @@ def _autostart_library_v2_bootstrap_import():
         settled = reconcile_incomplete_deletes(get_database())
         if settled:
             logger.info(
-                "Library v2 delete journal: settled %d item(s) left by an "
+                "Library delete journal: settled %d item(s) left by an "
                 "interrupted delete", settled,
             )
     except Exception as e:
@@ -20623,7 +20751,7 @@ def _autostart_library_v2_bootstrap_import():
     try:
         lib2_bootstrap.run_deferred_backfills(get_database())
     except Exception as e:
-        logger.warning(f"Library v2 convergence pass failed (retries next start): {e}")
+        logger.warning(f"Library convergence pass failed (retries next start): {e}")
 
     # iss29-A06: the backoff must describe how long we have been waiting for
     # something to happen, not how many times we have looked.
@@ -22544,6 +22672,17 @@ def _build_status_payload():
     except Exception as e:
         logger.debug("active download count failed: %s", e)
 
+    # files waiting in quarantine, for the downloads nav badge when nothing is
+    # downloading. a listdir, no sidecar reads (#2001: nothing said a file
+    # had been downloaded and was waiting)
+    quarantined = 0
+    try:
+        from api.quarantine import _get_quarantine_dir
+        from core.imports.quarantine import count_quarantine_entries
+        quarantined = count_quarantine_entries(_get_quarantine_dir())
+    except Exception as e:
+        logger.debug("quarantine count failed: %s", e)
+
     return {
         'metadata_source': metadata_status['metadata_source'],
         'spotify': _spotify_status_with_availability(metadata_status['spotify']),
@@ -22552,6 +22691,7 @@ def _build_status_payload():
         'active_media_server': config_manager.get_active_media_server(),
         'enrichment': _get_enrichment_status(),
         'active_downloads': active_dl_count,
+        'quarantined': quarantined,
     }
 
 def _build_watchlist_count_payload(profile_id=1):
@@ -23780,6 +23920,7 @@ _cfg_mpl(
     _spotify_client=lambda: spotify_client,
     _matching_engine=lambda: matching_engine,
     _get_automation_deps=lambda: _automation_deps,
+    _repair_worker=lambda: repair_worker,
 )
 app.register_blueprint(_bp_mpl())
 
@@ -23791,6 +23932,10 @@ app.register_blueprint(_bp_upl())
 from api.metasync_charts import configure as _cfg_msc, create_blueprint as _bp_msc
 _cfg_msc(get_database=get_database)
 app.register_blueprint(_bp_msc())
+# MetaSync metadata depot: status + reconcile for the UI (the
+# node-facing push routes live on the v1 blueprint, api/metasync_depot)
+from api.metasync_depot import create_blueprint as _bp_msd
+app.register_blueprint(_bp_msd())
 # your own playlists identify themselves in the background after every edit,
 # so they are always ready to sync (core/playlists/auto_identify)
 from core.playlists import auto_identify as _auto_identify
@@ -23895,6 +24040,12 @@ app.register_blueprint(_bp_mr())
 from api.lidarr_compat import configure as _cfg_lc, create_blueprint as _bp_lc
 _cfg_lc(get_database=get_database, config_manager=config_manager)
 app.register_blueprint(_bp_lc())
+
+# seerr compatible api: seerr request apps (litefin's jellyfin plugin) can use
+# soulsync's video side as their seerr (#2151)
+from api.seerr_compat import configure as _cfg_sc, create_blueprint as _bp_sc
+_cfg_sc(get_database=get_database, config_manager=config_manager)
+app.register_blueprint(_bp_sc())
 
 # mcp: an ai client drives soulsync through /mcp with an api key
 from api.mcp import configure as _cfg_mcp, create_blueprint as _bp_mcp
@@ -24070,6 +24221,15 @@ try:
     _ensure_video_download_monitor(_get_video_db)
 except Exception:
     logger.warning("could not start the video download monitor at boot", exc_info=True)
+
+# the video import folder's automatic pass (#2129). it checks its own setting
+# every pass, so it costs a sleep when the folder isn't set up.
+try:
+    from core.video.import_folder import ensure_started as _ensure_video_import_folder
+    from api.video import get_video_db as _get_video_db_for_import
+    _ensure_video_import_folder(_get_video_db_for_import)
+except Exception:
+    logger.warning("could not start the video import folder worker", exc_info=True)
 
 # Library Manager v2 — the UI-facing API mounted on /api/library/v2/*.
 # NOT opt-in: the cutover happened, lib2_* is the maintained catalogue, and
@@ -24341,8 +24501,11 @@ def _library_v2_media_server_state():
     }
 
 
-def _run_library_v2_integrity_report(*, max_findings=1000):
-    """One read-only cross-index snapshot; no schema ensure or repair writes."""
+def _run_library_v2_integrity_report(*, max_findings=1000, progress=None):
+    """One read-only cross-index snapshot; no schema ensure or repair writes.
+
+    Slow by nature (it checks every library file on disk), so the route runs
+    it as a background job and ``progress(current, total)`` feeds that job."""
     from api.quarantine import _get_quarantine_dir
     from core.acquisition.reconciler import reconcile_persistent_grabs
     from core.library2.integrity_reconciler import build_integrity_report
@@ -24385,6 +24548,7 @@ def _run_library_v2_integrity_report(*, max_findings=1000):
             media_server=_library_v2_media_server_state(),
             config_manager=config_manager,
             max_findings=max_findings,
+            progress=progress,
         )
         # A read endpoint owns no commit boundary, even if a future path helper
         # accidentally begins a transaction.
@@ -24525,8 +24689,8 @@ def _emit_rate_monitor_loop():
 # Idle-worker stats cache for the enrichment socket loop: name → (monotonic,
 # status). Emits still happen every 2s (the UI heartbeat is untouched) — this
 # only spaces out the DATABASE reads behind them for workers that are idle.
-_enrich_stats_cache: dict = {}
-_ENRICH_IDLE_STATS_TTL = 30.0
+from core.enrichment.status_cache import WorkerStatsCache as _WorkerStatsCache  # noqa: E402
+_enrich_stats = _WorkerStatsCache()
 
 
 def _emit_enrichment_status_loop():
@@ -24610,26 +24774,16 @@ def _emit_enrichment_status_loop():
                 # Idle workers don't earn fresh aggregates every 2s: each
                 # get_stats() is ~6 whole-table scans of the (10 GB) library
                 # db, and 18 workers made this loop ~108 scans per tick,
-                # forever, while any tab was open (perf sweep, Aug 2026). A
-                # RUNNING worker's numbers actually move, so it stays on the
-                # 2s beat; an idle one re-reads every 30s. Transitions are
-                # caught instantly via the worker's IN-MEMORY running/paused
-                # attributes (free to read), so starting or pausing a worker
-                # never shows stale for even one tick.
-                now_mono = time.monotonic()
-                hit = _enrich_stats_cache.get(name)
-                fresh_needed = (
-                    hit is None
-                    or hit[1].get('running')
-                    or getattr(worker, 'running', False) != bool(hit[1].get('running'))
-                    or getattr(worker, 'paused', False) != bool(hit[1].get('paused'))
-                    or now_mono - hit[0] >= _ENRICH_IDLE_STATS_TTL
-                )
-                if fresh_needed:
-                    status = worker.get_stats()
-                    _enrich_stats_cache[name] = (now_mono, status)
-                else:
-                    status = hit[1]
+                # forever, while any tab was open (perf sweep, Aug 2026).
+                # A working worker's numbers are re-read every few seconds,
+                # not every beat, and less often when its own read is slow:
+                # Similar Artists and MusicBrainz each ran their own counts
+                # on every tick, most of what this loop still cost after the
+                # shared pending pass (Nov 13 2026, profiled live). Starts,
+                # pauses and the item in hand are read from the worker's
+                # IN-MEMORY attributes (free), so those never show stale.
+                # core/enrichment/status_cache.py has the rules and the tests.
+                status = _enrich_stats.get(name, worker)
                 # Flag workers that were auto-paused for foreground work
                 if name in _download_auto_paused:
                     status['yield_reason'] = _auto_yield_cause.get(name, 'downloads')
@@ -24646,6 +24800,10 @@ def _emit_video_enrichment_status_loop():
     the access log). No-op until the video engine is actually running, so this
     never spins it up on the music side."""
     from core.video.enrichment.engine import peek_video_enrichment_engine
+    from core.enrichment.status_cache import WorkerStatsCache
+    # the beat stays at 2s; the COUNT(*)s behind each worker's numbers do not
+    # (twelve workers x four counts per kind every tick was 39% of a core)
+    stats_cache = WorkerStatsCache()
     while not globals().get('IS_SHUTTING_DOWN', False):
         socketio.sleep(2)
         if not _has_connected_clients():
@@ -24658,7 +24816,7 @@ def _emit_video_enrichment_status_loop():
         # wiring here.
         for svc, w in (eng.workers or {}).items():
             try:
-                socketio.emit(f'enrichment:{svc}', w.get_stats())
+                socketio.emit(f'enrichment:{svc}', stats_cache.get(svc, w))
             except Exception as e:
                 logger.debug(f"Error emitting video {svc} status: {e}")
         # The YouTube date enricher is a standalone daemon (not an engine worker),
@@ -25037,6 +25195,9 @@ def _emit_discovery_progress_loop():
             except Exception as e:
                 logger.debug(f"Error in {platform_name} discovery loop: {e}")
 
+_wishlist_next_run = {'at': -1e9, 'value': 0}
+
+
 def _emit_scan_status_loop():
     """Push watchlist and media scan status every 2 seconds.
     Skipped entirely while no client is connected."""
@@ -25064,7 +25225,17 @@ def _emit_scan_status_loop():
             logger.debug(f"Error emitting media scan: {e}")
         # Wishlist stats (auto-processing detection + countdown refresh)
         try:
-            next_run = automation_engine.get_system_automation_next_run_seconds('process_wishlist') if automation_engine else 0
+            # the countdown is read from the database every 10s and counted
+            # down in between: it was a connection and a query on every beat
+            _now = time.monotonic()
+            if _now - _wishlist_next_run['at'] >= 10.0:
+                _wishlist_next_run['value'] = (
+                    automation_engine.get_system_automation_next_run_seconds('process_wishlist')
+                    if automation_engine else 0)
+                _wishlist_next_run['at'] = _now
+                _now = time.monotonic()
+            next_run = max(0, int(_wishlist_next_run['value'] - (_now - _wishlist_next_run['at']))) \
+                if _wishlist_next_run['value'] else 0
             active_batches = 0
             with tasks_lock:
                 active_batches = sum(
@@ -25187,7 +25358,7 @@ def start_runtime_services():
         if stuck_flags_recovered:
             logger.warning("Recovered stuck flags from previous session")
         else:
-            logger.warning("No stuck flags detected - system healthy")
+            logger.info("No stuck flags detected - system healthy")
 
         # Album-bundle staging sweep — remove orphan ``<batch_id>``
         # dirs left behind by previous-session crashes, errored
@@ -25394,7 +25565,15 @@ def start_runtime_services():
             def _start_automation_after_upgrade():
                 automation_engine.resume_after_migration()
                 logger.info("Starting automation engine...")
-                automation_engine.start()
+                try:
+                    automation_engine.start()
+                except Exception as e:
+                    # G17-2: the deferred path (first boot after an upgrade)
+                    # never reached the except below, so the hint 3.6.1 gave
+                    # for a stale docker volume went missing
+                    logger.error(f"Automation engine failed to start: {e}")
+                    logger.info("   If using Docker, check that your volume mount is /app/data (not /app/database)")
+                    raise
                 logger.info("Automation engine started")
                 try:
                     automation_engine.emit('app_started', {})

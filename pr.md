@@ -1,59 +1,61 @@
-# soulsync 3.6.3: `dev` → `main`
+# soulsync 3.6.7: `dev` → `main`
 
-a hot fix for 3.6.2. on a big library the library page could time out with "could not load your library", and that's fixed, along with a batch of speedups and fixes found reviewing the app overnight.
+the settings page is react now, soulsync can answer as seerr for litefin and other seerr apps, an album can switch to another version of itself, and popular tracks get a flame. plus band names with an "&" stay one artist, numbered releases like group therapy stop crossing, and a long list of reported fixes.
 
-## the library page loads again
+## settings
 
-- **the artist list stops timing out on a big library.** the check for "is this artist in the library" couldn't use either index for "an album of theirs, or an album crediting them", so it walked every album for every artist: minutes on a cold load, and the page gave up with "request timed out". it's two indexed checks now, 50s to 1.5s for the first 3,000 artists, same list.
-- **the first click after a restart doesn't pay for it.** the discover warmer opens the library's first page too, after boot and every 25 minutes.
-- **"could be better" clicks count the library once.** every click that came in before the first count finished started its own 40 second count; under load one request took 21 minutes.
+- **the settings page is react.** every tab, music and video, the shell and the page itself. it looks and works the same, it just loads its tabs once and saves only what you changed.
+- typing in the settings search no longer queues a save, an emptied folder or redirect field stays empty while you type the new one, and autosaves refresh the sidebar's server dots straight away again.
+- **playlist folders say where organize by playlist is turned on (#2112)**, and an empty rebuild links to it.
 
-- **the artist page stops jumping up and down on phones.** two loops: the toolbar's name tag wrapped the toolbar to a second row, which brought the hero back into view, which took the tag away again; and on artists with a long biography the folded bio's fade turned its four-line limit off, so it measured as fitting, unfolded to its full length, then folded again, 3,800px a turn. both measured in a browser at phone size and fixed.
-- **artist pages stop showing "-updatedAt2026-04-13" as the biography.** the old plex metadata updater stamps that into plex's artist bios as bookkeeping and the library import copied it. it's stripped on import, and a startup pass cleans the ones already there.
+## library
+
+- **other versions (thanks wolf39us, #2145).** an album's ⋯ menu lists the release's other editions from musicbrainz and your primary source, with track count, year, country and label, plus a search for that artist. pick one and it shows what changes before it switches. fixing the manual match on the way: it kept the old release's cached tracklist.
+- **popular tracks get a flame (thanks wolf39us, #2144)**, up to three of an album's most played on last.fm that clearly stand out, like plexamp. nothing is fetched for it, it reads the play counts soulsync already has.
+- **the artist page shows what a rename would move (thanks wolf39us, #2141).** albums whose files don't match your naming template read "N to rename", and clicking opens preview rename.
+- **locking an album from the artist page stays on the artist page (thanks wolf39us, #2143)**, so you can lock one after another.
+- **collection completeness on the cards and table (thanks SeadogsBooty, #2106, #2107, #2108, #2109)**, with sorts, a featured filter, card size and multi-select. for an artist you don't watch it counts every track of the releases you own something of, so a single track off a 14 track album reads 1 of 14, not complete.
+- **guests stop filling the artists list (thanks Ericsson, #2142).** an album artist credit a guest picked up on someone else's album no longer makes them a library artist. the list and the artist page now go by the same rule.
+- **release type goes by length too (thanks wolf39us).** 4 to 6 tracks only made an ep when it runs under 30 minutes, so wish you were here is an album again. a provider's own word (deezer's type, apple's "- EP") wins, and a one time repair retypes the long releases a count guess got wrong when a provider agrees.
+- **leftover rows fold on every scan (thanks Ktzenjammer, #2094).** the fix in 3.6.6 only ran during the one time library upgrade. scans, refresh & scan and update discography fold them now, and a row with no file gets a remove this row option.
+- same-named albums of one artist no longer merge into one (#2110), a split album keeps each profile's watch choice, a locked album reads as finished (#2119), and a recycle bin button sits at the top of the music and video library (#2128).
+- **the library upgrade no longer stops at an old track with no id.** a few old installs had track rows with an empty id, and the first one failed the whole upgrade, pausing downloads. those files come across now and a restart finishes it.
+
+## artists and tags
+
+- **a band with "&" in its name stays one artist (thanks SeadogsBooty and wolf39us, #2136, #2131).** above & beyond became "above (feat. beyond)", kyau & albert became "kyau", and a rename folder dropped to "above". a name the library or the metadata source knows as one artist is never split now, and the stray split credits are taken back off your tracks on the next start.
+- **split artists keeps K/DA whole (thanks Vidariondr, #2150)**, and a finding can be corrected by hand: edit split, or one artist, which is remembered.
+- **a release stays under its album artist (thanks SeadogsBooty, #2133, #2135).** reorganize scattered a compilation into a folder per track artist while its preview showed the right one, and manual downloads tagged a track's own artist as the album artist.
+- **numbered releases never cross (thanks SeadogsBooty, #2134).** group therapy 699 was taken for 696, pt. 1 for pt. 4, and their metadata swapped. numbers in a title now have to agree for downloads, imports, library ownership and enrichment.
+- **artist.nfo lands in the artist folder (thanks Ericsson, #2138)**, also when the template nests the album deeper, and the same switch saves poster.jpg and background.jpg where the folder has no artist art yet.
+
+## downloads and review
+
+- **asked for and got are the right way round in review (thanks makiel).** files held for acoustid review showed them swapped, and wrong song put the wrong file's name back on the wishlist.
+- **an unfingerprintable file no longer reads as a bad acoustid key (thanks @nstrelow, #2140).** one file with no audio stopped every acoustid scan at the same spot.
+- a soulseek folder naming the artist by an alias counts (thanks Storm, #2105), live albums stay out with live albums off (#2117), and the releases tab searches every prowlarr torrent indexer (#2127).
+- **reorganize takes the cover along (thanks QT3496, #2010)** when you apply its findings from tools, and a cover already in the new folder no longer keeps the old one.
+- **a pair that can't be merged says why (thanks redbeardymcgee, #2146)** instead of buttons that look live and do nothing.
+- torrent rows name their tracker (#2123), and pausing a finished torrent shows paused with resume (#2125).
+- a free soundcloud account gets the uploader's original file when downloads are on (#2116).
+
+## playlists and servers
+
+- **jellyfin playlists are private (thanks Darkcere, #2148)** to the account they sync to. ones soulsync already made stay public until you change them in jellyfin.
+- **apple music mirrors refresh again (thanks NeskireDK, #2147)**, and a refresh that gets nothing back counts as a failure, not completed.
+- **copy mode playlists stay owned after a drive remounts (thanks NeskireDK, #2137).**
+- **music assistant scans follow their own task (thanks @ginevra-70, #2115)** before the database updates, and sync, scans and playlists reach music assistant (#2111).
 
 ## video
 
-- **a release sab or the torrent client failed is replaced by the next one (thanks SeadogsBooty).** it used to sit failed until the wishlist's next pass, hours away. now that release is blocklisted and the title searched again right away, so the next release your profile ranks is grabbed: the next megusta 1080p, then 720p, then whatever else the profile takes. a stalled torrent counts too, a job the client just lost doesn't. you get the failed notification only when nothing else could be taken, or when 5 releases of one title failed in 2 days (a client that fails everything would otherwise blocklist every release there is). the replaced job leaves the client with its partial files. on by default, switch it off on the usenet client card.
-- **cancel takes a torrent or usenet download out of the client.** it only marked the row cancelled, and the client downloaded it to the end for nothing.
-- **block and retry every failed download at once (thanks c5pie).** the downloads menu has block and retry failed next to retry failed: every failed release is blocklisted and the next best release grabbed for each, searched one title at a time so 40 retries don't hit your indexers together.
-- **tag a plex playlist's songs with a mood (thanks wolf39us).** the server playlist editor has tag in plex for admins: every song on the playlist gets a mood (the playlist's name, or one you type), in plex only. build a plex smart playlist on "mood is <tag>" and add rating rules on top, and a plain playlist turns into one that keeps itself tidy.
-- **downloaded episodes stop showing as missing (thanks c5pie).** after downloads soulsync skips the tv rescan when the server already has the newest grab, but it looked for the newest season pack only (a single episode is stored differently), found an old one the server had, and skipped the rescan after every episode grab. a server that doesn't pick up new files by itself never saw them. it checks the newest episode or pack now.
-- **the next-release retry keeps the quality profile (thanks SeadogsBooty).** a profile picked in the search modal for a show not in the library yet didn't reach episodes wished after the pick, and the retry read only the wishlist row, so the replacement was ranked under default and took a 1.4 gb non-megusta release. the retry keeps the failed grab's profile now, and the wishlist search reads the modal's pick.
-- **episode file names carry the episode title (thanks SeadogsBooty).** no grab passed the title to the import, so $episodetitle was always empty. the import looks it up (library, wishlist, then tmdb) and skips placeholders like tba.
-- **an episode's manual search results stay inside the panel (thanks SeadogsBooty).** a long release name made the panel wider than the modal, and scrolling the grabbed card into view slid it sideways, cutting off both edges.
-- **retry with another searches the profile that wished the title.** it searched the first profile's wishlist, so for a title another profile wished it said a search started and grabbed nothing.
+- **soulsync can answer as seerr (thanks Thibs, #2151).** turn it on under settings, system, soulsync api, and point litefin's seerr plugin (or another seerr app) at /seerr with an admin key. discover, search, details and requests go through the video side, requests land on the right profile's wishlist or approval queue. not tried against a real litefin yet.
+- **an import folder (#2129)**, like the music side's import page.
+- manual search opens with an editable query (#2121) and is on a movie's menu, owned or not (#2122), video download rows show the release's languages (#2120), and manual subtitle search says when the file already has the language (#2126).
+- **long titles and language lists give way in the library table (thanks @PapaBearDoes, #2152)** instead of pushing columns out of view.
+- the more menu on a detail page always fits on screen (#2124).
 
-## performance
+## also
 
-- **after downloads, plex and jellyfin scan only the folders that changed (thanks Eric-sson, #1978).** soulsync used to ask for a scan of the whole music library after every download run, which is heavy on a big library. it works out where the server sees its folders from files it already knows in both forms (H:\Music on your pc is /mnt/music on the server, say), no setup, and scans just the new album folders. anything it isn't sure of (nothing learned, more than 25 folders, a folder outside the server's libraries) falls back to the whole-library scan, the first scan after a restart is always the whole library, and a scheduled or manual scan still scans everything. navidrome's scan already only reads what changed.
+- replaygain analyses files with non utf-8 tags (#2118), re-identify remembers the move-the-file choice (#2114), and the tools findings filter speaks the list's names (#2113).
 
-- **jellyfin on localhost stops costing 2 seconds a connection on windows.** localhost tries ipv6 first, jellyfin only listens on ipv4, and windows takes 2 seconds to give up on the refused ipv6 connect, on every new connection. server activity's poll took 2.3s for that alone. a localhost connect tries ipv4 first now and remembers what answered per port: 2,034ms to 3ms. it helps anything else you run on localhost too (the arr stack, sab, qbittorrent).
-- **discover's decades, labels and undiscovered albums stop reading whole tables:** decades read every pool row in full to get at the year (6.9s, 0.3s now), labels started from every album to find the played tracks, and undiscovered albums built a key for each of 70k owned albums to drop the ones by its 25 artists (3.9s to 0.2s). an owned album by "BJÖRK" also stops showing as undiscovered when you listened to "björk".
-- **musicbrainz lookups by release id stop paying a 404 first.** the library's post-import check asked for each album as a release group, got a 404 (a second at musicbrainz's rate limit) and an error in the log, then asked again as a release. ids known to be releases go straight there now.
-
-- **filter, sort and save filters on manual search results (thanks SeadogsBooty).** a bar over every movie, show, season and episode search: quick text, sort by size, age, quality, format score, seeders, indexer or grabs, and a builder for conditions (1080, hevc, group contains megusta, under 1 gb) matched on all or any, saved per profile. display only, auto still ranks by your profile.
-- **a failed grab shows which release replaced it (thanks SeadogsBooty).** the card you grabbed lists what the retry tried after, and the release that replaced it is marked grabbed instead or downloaded instead. the episode row shows the newest attempt.
-- **choose what a colon in a title becomes (thanks SeadogsBooty).** settings > library organization: delete (the default, as before), smart ("Dexter - Resurrection", 12:30 becomes 12-30), space dash space, or dash.
-
-## search
-
-- **browse tiles show what's charting on deezer (thanks cremonies, #1984).** top trending and the genre tiles read deezer's public charts now (no account needed, kept a few hours), a two-genre tile like electronic & dance blends both, and when deezer is off or has nothing for a tile it falls back to your own metadata like before.
-
-## fixes
-
-- **anime TMDB lumps into one season splits without a tvdb key (thanks Thibs).** jujutsu kaisen is one season of 59 on tmdb. the split into 24/23/12 came from tvdb by air date, so with no tvdb key it stayed one season. the anime map and anilist know the same split (where each anilist season starts inside tmdb's, and how many episodes it has), so the episode sync uses that when tvdb can't, and only when the counts add up. shows anilist already linked are re-synced once. a server that numbers the show tmdb's way still keeps its numbering.
-- **a search preview gets the anime layer too.** frieren opened from search had no anilist score, other names or season links, because only library titles were linked. a preview the anime map knows asks anilist itself now, one request, cached with the page.
-
-- **interactive search says wrong artist when it's the wrong artist (thanks cremonies, #1980).** on streaming sources the length check ran first, so every other artist's song of the same name read as wrong length and the right one got lost in them. wrong artists are labelled as such now, the closest misses sort to the top, and when nothing passes the filtered results show instead of an empty table.
-- **a matched song that didn't start says why (#1981)** instead of "no specific failure reason was recorded".
-- **a running wishlist batch opens with its songs (#1982)** instead of an empty table.
-- **a deleted mirrored playlist stops showing as In SoulSync on its source tab (#1979).**
-
-- **the library upgrade stops sitting paused forever (thanks Skowl).** two old rows stamped with the same media-server id took turns holding it in the upgrade's mapping step, which never finished, so automations and enrichment stayed paused. a row whose id another row already holds is left to that row now.
-- **one bad afternoon stops costing a song a week (thanks TheHomeGuy).** the retry ladder spaces the wishlist's passes (4 hours, a day, a week), but failures from playlist syncs and batches counted too, so a few failed syncs in one afternoon put a song on the week-long rung while a manual search found it at once. a failure only moves a song up the ladder when it was due now, and the artist panel shows why a stuck song keeps failing instead of hiding it in a tooltip.
-- **a failing wishlist sync row waits before its next try** (30s, doubling, an hour at most). the background sync picked the same failing row first every time, so a passing "database is locked" spent all ten tries in a second and the change sat failed.
-- **bandcamp's bot check stops writing albums off.** bandcamp sometimes answers searches with a "client challenge" page instead of results. soulsync asked again for every album (125 warnings in 45 minutes) and the bandcamp worker marked each one not found. a challenge now pauses bandcamp searches for 30 minutes with one warning, and the albums stay pending.
-- **audiobooks: a release you blocked stays out of your searches.** the search only read the first profile's blocklist, so a release another profile blocked kept being offered and grabbed for them.
-- **settings > metasync says whether your install is counted.** a metasync node starts in dry run and sends nothing; the settings now say so, with the week's report waiting and a link to start sending, and show how many installs reported last week.
-- a refused qobuz call names the id it was about in the log.
-- the test suite no longer writes into a dev checkout's logs/app.log, the library route tests stop failing at random in parallel, and a credential test can't fail on an unlucky ciphertext.
+tested: the full suite passes on windows python with every failure rechecked on linux (only the known drive permission tests on a windows disk fail), the frontend suite passes, and each fix carries its own test.

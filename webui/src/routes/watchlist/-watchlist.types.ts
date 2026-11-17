@@ -83,6 +83,9 @@ export interface WatchlistArtist {
   include_eps: boolean;
   include_singles: boolean;
   include_live: boolean;
+  /** #2082: live versions on releases that are not live albums. Absent on an
+   *  older server, where include_live covers both. */
+  include_live_tracks?: boolean;
   include_remixes: boolean;
   include_acoustic: boolean;
   include_compilations: boolean;
@@ -136,6 +139,8 @@ export type WatchlistScanStatus = (typeof WATCHLIST_SCAN_STATUS_VALUES)[number];
 
 export interface WatchlistScanSummary {
   total_artists?: number;
+  /** artists the scan got through without an error */
+  successful_scans?: number;
   new_tracks_found?: number;
   tracks_added_to_wishlist?: number;
 }
@@ -161,7 +166,10 @@ export interface WatchlistGlobalConfig {
   include_albums: boolean;
   include_eps: boolean;
   include_singles: boolean;
+  /** Live albums: concert recordings and unplugged sets. */
   include_live: boolean;
+  /** #2082: live versions on other releases (a live bonus track). */
+  include_live_tracks: boolean;
   include_remixes: boolean;
   include_acoustic: boolean;
   include_compilations: boolean;
@@ -234,7 +242,10 @@ export interface WatchlistArtistConfig {
   include_albums: boolean;
   include_eps: boolean;
   include_singles: boolean;
+  /** Live albums: concert recordings and unplugged sets. */
   include_live: boolean;
+  /** #2082: live versions on other releases (a live bonus track). */
+  include_live_tracks: boolean;
   include_remixes: boolean;
   include_acoustic: boolean;
   include_compilations: boolean;
@@ -416,4 +427,28 @@ export interface WatchlistPodcastsResponse {
   count?: number;
   podcasts?: WatchlistPodcast[];
   error?: string;
+}
+
+/** one release a scan added to the wishlist (GET /api/watchlist/found) */
+export interface WatchlistFoundRelease {
+  artist_name: string;
+  album_name: string;
+  album_image_url: string | null;
+  found_at: string | null;
+  track_count: number;
+  tracks: string[];
+  /** the library album when you own it with files, so the shelf can play it */
+  library_album_id?: number | null;
+}
+
+/** one saved scan run (GET /api/watchlist/scan/history), counts only */
+export interface WatchlistScanRun {
+  run_id: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  total_artists: number;
+  artists_scanned: number;
+  tracks_found: number;
+  tracks_added: number;
 }

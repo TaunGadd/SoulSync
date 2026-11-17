@@ -203,7 +203,9 @@ def test_process_wishlist_automatically_toggles_cycle_when_no_tracks_match_curre
     assert executor.submissions == []
     assert music_db.cycle_value == "singles"
     assert music_db.commits == 1
-    assert any("No albums tracks in wishlist" in msg for msg in logger.warning_messages)
+    # a cycle with nothing in it is routine too
+    assert any("No albums tracks in wishlist" in msg for msg in logger.info_messages)
+    assert not any("No albums tracks in wishlist" in msg for msg in logger.warning_messages)
     assert guard_events == ["enter", "exit"]
     assert [kwargs.get("progress") for _args, kwargs in progress_calls if "progress" in kwargs] == [10, 25, 40]
 
@@ -285,6 +287,34 @@ def test_playlist_scope_dispatches_only_matching_wishlist_tracks_without_cycle_m
     assert batch["current_cycle"] == "playlist"
     assert batch["wishlist_scope"] == "playlist"
     assert batch["toggle_wishlist_cycle"] is False
+
+
+def test_playlist_scope_does_not_dispatch_a_track_the_library_sweep_removed(monkeypatch):
+    """review 5 R5-J-1: the scoped run read its rows before the cycle-start
+    library sweep, so a track the sweep removed as owned was still sent and
+    the force_download_all batch downloaded it again"""
+    def _row(tid, name):
+        return {"name": name, "track_id": tid, "spotify_track_id": tid,
+                "artists": [{"name": "Artist A"}],
+                "spotify_data": {"id": tid, "album": {"album_type": "album"}}}
+
+    runtime, service, _profiles_db, _music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[_row("owned", "Owned Song"), _row("missing", "Missing Song")],
+        count=2,
+    )
+
+    def sweep(*_a, **_k):
+        # the library owns "owned": the sweep deletes its wishlist row
+        service._tracks = [t for t in service._tracks if t["track_id"] != "owned"]
+        return 1
+
+    monkeypatch.setattr(processing, "remove_tracks_already_in_library", sweep)
+
+    process_wishlist_automatically(
+        runtime, automation_id="playlist-run", track_ids=["owned", "missing"], profile_ids=[1])
+
+    sent = [t["track_id"] for _fn, args, _kw in executor.submissions for t in args[2]]
+    assert sent == ["missing"]
 
 
 def test_playlist_composite_scope_does_not_dispatch_same_track_from_other_album():
@@ -599,7 +629,9 @@ def test_process_wishlist_automatically_returns_early_when_no_tracks_are_availab
     assert music_db.duplicate_removals == []
     assert guard_events == ["enter", "exit"]
     assert [kwargs.get("progress") for _args, kwargs in progress_calls if "progress" in kwargs] == [10]
-    assert any("No tracks in wishlist for auto-processing" in msg for msg in logger.warning_messages)
+    # an empty wishlist is routine, so it is said at info, not as a warning
+    assert any("No tracks in wishlist for auto-processing" in msg for msg in logger.info_messages)
+    assert not any("No tracks in wishlist" in msg for msg in logger.warning_messages)
 
 
 def test_process_wishlist_automatically_skips_when_wishlist_batch_is_already_active():

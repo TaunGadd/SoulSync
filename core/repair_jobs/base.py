@@ -186,7 +186,7 @@ def build_artist_file_scope(db: Any, artist_id: int, artist_name: str = "") -> D
             "SELECT name FROM lib2_artists WHERE id=?", (artist_id,)
         ).fetchone()
         if artist is None:
-            raise ValueError("Library v2 artist not found")
+            raise ValueError("Library artist not found")
         from core.library2.artist_aliases import resolve_alias_group
         group = resolve_alias_group(conn, artist_id)
         marks = ",".join("?" for _ in group)
@@ -357,6 +357,32 @@ def drop_hand_tagged(context, subjects, path_key: str = 'path') -> list:
             if not is_hand_tagged_path((s or {}).get(path_key), keys)]
 
 
+def drop_hand_tagged_albums(context, subjects, everything=None,
+                            path_key: str = 'path', album_key: str = 'album_id') -> list:
+    """``subjects`` without any file on an album that has a hand-tagged file.
+
+    3.6.1 locked the whole album when one of its files was hand-tagged, so a
+    retag, the live/commentary cleaner or a bpm backfill never compared the
+    other files against the service's studio album and split the release the
+    user typed. ``drop_hand_tagged`` drops only the file itself. ``everything``
+    is the unscoped subject list the albums are judged from, so a scoped run
+    still sees a hand-tagged file outside its scope.
+    """
+    subjects = list(subjects or [])
+    keys = hand_tagged_path_keys(getattr(context, 'db', None))
+    if not keys:
+        return subjects
+    pool = subjects if everything is None else list(everything)
+    hand_albums = {
+        (s or {}).get(album_key) for s in pool
+        if is_hand_tagged_path((s or {}).get(path_key), keys)
+        and (s or {}).get(album_key) is not None
+    }
+    return [s for s in subjects
+            if not is_hand_tagged_path((s or {}).get(path_key), keys)
+            and (s or {}).get(album_key) not in hand_albums]
+
+
 def has_metadata_locked(cursor, table: str) -> bool:
     """does this table carry metadata_locked yet. very old schemas don't, and
     a missing column just means nothing there is locked"""
@@ -418,6 +444,10 @@ class JobContext:
     # honor it; scheduled runs never carry one.
     scope: Optional[Dict[str, Any]] = None
 
+    # True when a person started this run (Run Now, a Run a check playbook),
+    # False for the schedule. a job can do by hand what it won't do on its own.
+    manual: bool = False
+
     # API clients (may be None if unavailable)
     spotify_client: Any = None
     itunes_client: Any = None
@@ -475,6 +505,15 @@ class JobContext:
                 time.sleep(0.2)
         return self.check_stop()
 
+    def stop_or_paused(self) -> bool:
+        """True when the worker should stop or is paused, without waiting.
+
+        For a stop callback handed into work that holds a write transaction:
+        wait_if_paused blocks while paused, and a paused job then held the
+        write lock for minutes (every other writer got "database is
+        locked"). A paused run ends here instead; the next run carries on."""
+        return self.check_stop() or bool(self.is_paused and self.is_paused())
+
     def sleep_or_stop(self, seconds: float, step: float = 0.2) -> bool:
         """Sleep in small increments so stop requests can interrupt quickly."""
         if seconds <= 0:
@@ -506,6 +545,9 @@ class RepairJob(ABC):
     # exhaustive manifest so a newly registered job cannot silently omit it.
     data_basis: str = ''
     library_v2_effects: frozenset[str] = frozenset()
+    # #2046: what a reviewed and locked album means to this job. Assigned by
+    # the registry from JOB_LOCK_SCOPE, which every job has to be in.
+    lock_scope: str = 'report'
     default_enabled: bool = False
     default_interval_hours: int = 24
     default_settings: Dict[str, Any] = {}

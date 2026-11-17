@@ -912,39 +912,54 @@ class MetadataCache:
                 cursor = conn.cursor()
                 stats = {}
 
-                # Query 1: Main entity stats in one pass (was 7 separate queries)
-                junk_names = "', '".join(self._JUNK_NAMES - {''})
-                cursor.execute(f"""
-                    SELECT
-                        COUNT(*) as total,
-                        SUM(CASE WHEN (name IS NULL OR TRIM(name) = '' OR LOWER(TRIM(name)) IN ('{junk_names}'))
-                             AND entity_id NOT LIKE '%\\_features' ESCAPE '\\'
-                             AND entity_id NOT LIKE '%\\_tracks' ESCAPE '\\'
-                             THEN 1 ELSE 0 END) as junk,
-                        SUM(CASE WHEN julianday('now') - julianday(updated_at) > ttl_days - 1 THEN 1 ELSE 0 END) as exp_24h,
-                        SUM(CASE WHEN julianday('now') - julianday(updated_at) > ttl_days - 7 THEN 1 ELSE 0 END) as exp_7d,
-                        ROUND(AVG(julianday('now') - julianday(updated_at)), 1) as avg_age,
-                        COALESCE(SUM(access_count), 0) as total_hits
-                    FROM metadata_cache_entities
-                """)
-                row = cursor.fetchone()
-                stats['total_entities'] = row[0] or 0
-                stats['junk_entities'] = row[1] or 0
-                stats['expiring_24h'] = row[2] or 0
-                stats['expiring_7d'] = row[3] or 0
-                stats['avg_age_days'] = row[4] or 0
-                stats['total_access_hits'] = row[5] or 0
-
-                # Query 2: Group counts (source + type in one pass)
+                # every query here reads an index, never the table: a single
+                # pass over the rows dragged each raw_json blob off disk and
+                # took 33s on 340k cached entities. review 5 perf
+                # Query 1: counts and hits per group, off idx_mce_stats
                 cursor.execute("""
-                    SELECT source, entity_type, COUNT(*) as cnt
+                    SELECT source, entity_type, COUNT(*) as cnt,
+                           COALESCE(SUM(access_count), 0) as hits
                     FROM metadata_cache_entities GROUP BY source, entity_type
                 """)
                 by_source = {}
                 by_type = {}
+                total = 0
+                total_hits = 0
                 for r in cursor.fetchall():
                     by_source[r[0]] = by_source.get(r[0], 0) + r[2]
                     by_type[r[1]] = by_type.get(r[1], 0) + r[2]
+                    total += r[2]
+                    total_hits += r[3]
+
+                # Query 2: junk names. the inner scan reads only idx_mce_name;
+                # the few matches are then looked up by rowid for entity_id
+                junk_names = "', '".join(self._JUNK_NAMES - {''})
+                cursor.execute(f"""
+                    SELECT COUNT(*) FROM metadata_cache_entities
+                    WHERE id IN (
+                        SELECT id FROM metadata_cache_entities
+                        WHERE name IS NULL OR TRIM(name) = ''
+                           OR LOWER(TRIM(name)) IN ('{junk_names}'))
+                      AND entity_id NOT LIKE '%\\_features' ESCAPE '\\'
+                      AND entity_id NOT LIKE '%\\_tracks' ESCAPE '\\'
+                """)
+                junk = cursor.fetchone()[0]
+
+                # Query 3: ages, off idx_mce_age (updated_at, ttl_days)
+                cursor.execute("""
+                    SELECT
+                        SUM(CASE WHEN julianday('now') - julianday(updated_at) > ttl_days - 1 THEN 1 ELSE 0 END) as exp_24h,
+                        SUM(CASE WHEN julianday('now') - julianday(updated_at) > ttl_days - 7 THEN 1 ELSE 0 END) as exp_7d,
+                        ROUND(AVG(julianday('now') - julianday(updated_at)), 1) as avg_age
+                    FROM metadata_cache_entities
+                """)
+                row = cursor.fetchone()
+                stats['total_entities'] = total
+                stats['junk_entities'] = junk or 0
+                stats['expiring_24h'] = row[0] or 0
+                stats['expiring_7d'] = row[1] or 0
+                stats['avg_age_days'] = row[2] or 0
+                stats['total_access_hits'] = total_hits
                 stats['by_source'] = by_source
                 stats['by_type'] = by_type
 
@@ -1263,14 +1278,10 @@ class MetadataCache:
             fields['artist_id'] = str(data.get('artistId', ''))
             fields['release_date'] = data.get('releaseDate', '')[:10] if data.get('releaseDate') else ''
             fields['total_tracks'] = data.get('trackCount', 0)
-            # Infer album type from track count
-            tc = data.get('trackCount', 0)
-            if tc <= 3:
-                fields['album_type'] = 'single'
-            elif tc <= 6:
-                fields['album_type'] = 'ep'
-            else:
-                fields['album_type'] = 'album'
+            from core.metadata.release_type import itunes_release_type
+            fields['album_type'] = itunes_release_type(
+                data.get('collectionName'), data.get('collectionType'),
+                data.get('trackCount', 0))
             fields['image_url'] = _upscale_artwork(data.get('artworkUrl100'))
             urls = {}
             if data.get('collectionViewUrl'):
@@ -1440,13 +1451,19 @@ class MetadataCache:
                     ORDER BY COALESCE(popularity, 0) DESC, access_count DESC
                     LIMIT 200
                 """, params)
+                from core.wishlist.presence import album_presence_key
                 results = []
+                # the owned keys, then each album already on the shelf: three
+                # pressings of one missing record are one suggestion (#2083)
+                seen = set(library_album_keys)
                 for row in cursor.fetchall():
-                    key = (row['name'].lower().strip(), row['artist_name'].lower().strip())
-                    if key not in library_album_keys:
-                        results.append(dict(row))
-                        if len(results) >= limit:
-                            break
+                    key = album_presence_key(row['name'], row['artist_name'])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(dict(row))
+                    if len(results) >= limit:
+                        break
                 return self._with_art(cursor, results, 'album')
             finally:
                 conn.close()

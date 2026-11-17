@@ -90,6 +90,22 @@ describe('FindingDetail duplicate rows', () => {
     );
     expect(rows[1].textContent).toContain('KEEP');
   });
+
+  it('an old 3.6.1 duplicate finding is read-only and points at the Duplicate Detector', () => {
+    // third #1062 review G16-3: its fixer is gone, so "keep this version"
+    // opened a destructive confirm the server could only refuse
+    const onKeep = vi.fn();
+    const { container } = render(
+      <FindingDetail
+        finding={duplicateFinding()}
+        onKeepDuplicate={onKeep}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    fireEvent.click(container.querySelectorAll('.repair-detail-subitem')[0]);
+    expect(onKeep).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('Run the Duplicate Detector');
+  });
 });
 
 const nativeFinding = (requiresConfirmation = false): RepairFinding =>
@@ -222,6 +238,28 @@ describe('Catalogue duplicate review', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Merge into release #1125' }));
     expect(choose).toHaveBeenCalledWith(1, 'merge-1125');
     expect(container.textContent).not.toContain('quarantine');
+    expect(container.textContent).not.toContain("Can't merge yet");
+  });
+
+  it('says up front why a blocked pair cannot be merged (#2146)', () => {
+    // the buttons were disabled with the reasons as loose lines, so they read
+    // as live buttons that did nothing
+    const { container } = render(
+      <FindingDetail
+        finding={catalogueFinding(false)}
+        onKeepDuplicate={vi.fn()}
+        onApplyCoverArt={vi.fn()}
+      />,
+    );
+    const note = screen.getByRole('note');
+    expect(note.textContent).toContain("Can't merge yet");
+    expect(note.textContent).toContain('An acquisition is still active.');
+    expect(note.textContent).toContain('run the Duplicate Detector again');
+    expect(container.textContent).not.toContain('Select the release group to keep');
+    expect(screen.getByRole('button', { name: 'Merge into release #1125' })).toHaveAttribute(
+      'title',
+      "Can't merge yet, the reason is above",
+    );
   });
 
   it('explains an active-download blocker and disables merging', () => {
@@ -232,7 +270,162 @@ describe('Catalogue duplicate review', () => {
         onApplyCoverArt={vi.fn()}
       />,
     );
-    expect(screen.getByText('An acquisition is still active.')).toBeInTheDocument();
+    expect(screen.getByRole('note')).toHaveTextContent('An acquisition is still active.');
     expect(screen.getByRole('button', { name: 'Merge into release #995' })).toBeDisabled();
+  });
+});
+
+describe('Library re-tag checks (Storm)', () => {
+  const retag = {
+    id: 9,
+    finding_type: 'library_retag',
+    severity: 'info',
+    entity_type: 'track',
+    entity_id: 'lib2:1',
+    title: 'Tags out of date',
+    description: '',
+    details: {
+      validation: { checks: { album: 'correct', albumartist: 'mismatch', genre: 'unknown' } },
+      diff: [
+        { file_key: 'album', file_value: 'Views', db_value: 'Views' },
+        { file_key: 'album_artist', file_value: 'Jim O’Rourke', db_value: 'Jim O Rourke' },
+      ],
+    },
+  } as unknown as RepairFinding;
+
+  it('a genre or year that only differs is shown as left alone, not as a fault', () => {
+    const quiet = {
+      ...retag,
+      details: {
+        validation: {
+          checks: { genre: 'differs', year: 'differs', total_discs: 'missing' },
+          reference: { genres: ['Electronic'], year: 1996 },
+        },
+      },
+    } as unknown as RepairFinding;
+    const { container } = render(
+      <FindingDetail finding={quiet} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('differs from the library, which has Electronic. Left as it is');
+    expect(text).toContain('differs from the library, which has 1996. Left as it is');
+    // never the raw state word, and never dressed as something to fix
+    expect(text).not.toMatch(/Genre\s*differs$/);
+    expect(text).toContain('missing from the file');
+  });
+
+  it('says what the file has and what SoulSync would write for a mismatch', () => {
+    const { container } = render(
+      <FindingDetail finding={retag} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('mismatch: file "Jim O’Rourke", SoulSync "Jim O Rourke"');
+    // a correct field stays a single word
+    expect(text).not.toContain('correct: file');
+  });
+
+  it('lists every field Apply Tags writes, source ids, siblings and hand edits too', () => {
+    // third #1062 review G16-2: the checks grid has no row for these, so a
+    // finding whose only drift was an id said every check was correct
+    const finding = {
+      ...retag,
+      details: {
+        validation: { checks: { title: 'correct' } },
+        diff: [
+          {
+            field: 'MusicBrainz Recording ID',
+            file_key: 'musicbrainz_recording_id',
+            file_value: '',
+            db_value: 'mb-1',
+            changed: true,
+          },
+          { field: 'Title (song.mp3)', file_value: 'Old', db_value: 'New', changed: true },
+          { field: 'Genre', file_value: 'Rock', db_value: 'Pop', changed: true, manual: true },
+        ],
+      },
+    } as unknown as RepairFinding;
+    const { container } = render(
+      <FindingDetail finding={finding} onKeepDuplicate={vi.fn()} onApplyCoverArt={vi.fn()} />,
+    );
+    const text = container.textContent ?? '';
+    expect(text).toContain('Apply Tags will write');
+    expect(text).toContain('MusicBrainz Recording ID');
+    expect(text).toContain('∅   →   mb-1');
+    expect(text).toContain('Title (song.mp3)');
+    expect(text).toContain('Rock   →   Pop   (set by hand)');
+    // the checks still show, below
+    expect(text).toContain('Tag checks');
+  });
+});
+
+describe('FindingDetail split artists correction (#2150)', () => {
+  const credit = 'K/DA; League Of Legends; Mimi Webb';
+  const splitFinding = (status = 'pending'): RepairFinding =>
+    ({
+      id: 7,
+      finding_type: 'comma_artist_split',
+      severity: 'warning',
+      status,
+      entity_type: 'artist',
+      entity_id: 'lib2:1',
+      title: `Combined artist: ${credit}`,
+      description: '',
+      details: {
+        combined_name: credit,
+        split_artists: ['K', 'DA', 'League Of Legends', 'Mimi Webb'],
+        new_display_artist: 'K; DA; League Of Legends; Mimi Webb',
+        primary_artist: 'K',
+      },
+    }) as unknown as RepairFinding;
+
+  it('sends the hand-edited split as the fix', () => {
+    const onFixAction = vi.fn();
+    render(
+      <FindingDetail
+        finding={splitFinding()}
+        onKeepDuplicate={vi.fn()}
+        onApplyCoverArt={vi.fn()}
+        onFixAction={onFixAction}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Edit split' }));
+    const input = screen.getByLabelText('Split artists') as HTMLInputElement;
+    expect(input.value).toBe('K; DA; League Of Legends; Mimi Webb');
+    fireEvent.change(input, { target: { value: 'K/DA; League Of Legends; Mimi Webb' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply this split' }));
+    expect(onFixAction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 7 }),
+      'split:K/DA; League Of Legends; Mimi Webb',
+    );
+  });
+
+  it('asks before keeping the whole credit as one artist', async () => {
+    const onFixAction = vi.fn();
+    const confirm = vi.fn().mockResolvedValue(true);
+    window.showConfirmDialog = confirm as typeof window.showConfirmDialog;
+    render(
+      <FindingDetail
+        finding={splitFinding()}
+        onKeepDuplicate={vi.fn()}
+        onApplyCoverArt={vi.fn()}
+        onFixAction={onFixAction}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'One artist' }));
+    await vi.waitFor(() => expect(onFixAction).toHaveBeenCalled());
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(onFixAction).toHaveBeenCalledWith(expect.objectContaining({ id: 7 }), 'keep_whole');
+  });
+
+  it('offers no correction on a finding that is already settled', () => {
+    render(
+      <FindingDetail
+        finding={splitFinding('resolved')}
+        onKeepDuplicate={vi.fn()}
+        onApplyCoverArt={vi.fn()}
+        onFixAction={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Edit split' })).toBeNull();
   });
 });

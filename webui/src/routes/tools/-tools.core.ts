@@ -214,6 +214,7 @@ export function findingSeverityClass(severity: string | null | undefined): strin
 
 export const FINDING_TYPE_LABELS: Record<string, string> = {
   dead_file: 'Dead File',
+  library_unreachable: 'Unreachable Library',
   orphan_file: 'Orphan',
   acoustid_mismatch: 'Wrong Song',
   acoustid_no_match: 'No Match',
@@ -256,6 +257,7 @@ export function findingTypeLabel(findingType: string): string {
  *  above — that asymmetry is in the vanilla and is preserved. */
 export const FINDING_FIXABLE_TYPES: Record<string, string> = {
   dead_file: 'Re-download',
+  library_unreachable: 'They are gone',
   orphan_file: 'Resolve',
   track_number_mismatch: 'Fix',
   missing_cover_art: 'Apply Art',
@@ -267,7 +269,7 @@ export const FINDING_FIXABLE_TYPES: Record<string, string> = {
   empty_folder: 'Delete Folder',
   expired_download: 'Delete',
   metadata_gap: 'Apply',
-  duplicate_tracks: 'Keep Best',
+  // duplicate_tracks (3.6.1's) has no fixer since the native detector replaced it (G16-3)
   native_duplicate_tracks: 'Keep Best',
   native_duplicate_releases: 'Review Merge',
   incomplete_album: 'Auto-Fill',
@@ -343,6 +345,7 @@ export const FINDING_ACTION_LABELS: Record<string, string> = {
   deleted_file: 'File Deleted',
   genres_cleaned: 'Genres Cleaned',
   artists_split: 'Artists Split',
+  kept_whole: 'Kept As One Artist',
   already_gone: 'Already Gone',
   fixed_track_number: 'Track # Fixed',
   applied_cover_art: 'Art Applied',
@@ -818,6 +821,32 @@ export interface LibraryRetagDetail {
   unmatched: string[];
 }
 
+/** third #1062 review G16-2: a native Library Re-tag finding stores its
+ *  changed tag rows as `diff` (field, file_value, db_value, manual; sibling
+ *  files labelled "Title (song.mp3)"). 3.6.1 showed every change, old to new;
+ *  v2 showed only the validation grid, which has no row for source ids,
+ *  lyrics or a sibling copy, so the change Apply Tags makes wasn't visible. */
+export function nativeRetagChanges(diff: unknown): FindingDetailRow[] {
+  return arr<{
+    field?: string;
+    file_value?: unknown;
+    db_value?: unknown;
+    changed?: boolean;
+    manual?: boolean;
+  }>(diff)
+    .filter((row) => row && row.changed !== false && row.field)
+    .slice(0, LIBRARY_RETAG_TRACK_CAP)
+    .map((row) => {
+      const before = row.file_value === '' || row.file_value == null ? '∅' : str(row.file_value);
+      const after = row.db_value === '' || row.db_value == null ? '∅' : str(row.db_value);
+      return [
+        str(row.field),
+        `${before}   →   ${after}${row.manual ? '   (set by hand)' : ''}`,
+        'highlight',
+      ];
+    });
+}
+
 /** Cap from the vanilla — huge albums would otherwise render thousands of rows. */
 export const LIBRARY_RETAG_TRACK_CAP = 40;
 
@@ -900,9 +929,19 @@ export const COMMA_SPLIT_TRACK_CAP = 40;
  * keys, which are already rendered as images by the media strip.
  */
 export function genericDetailRows(details: Details | null | undefined): FindingDetailRow[] {
-  return Object.entries(details || {})
-    .filter(([k, v]) => typeof v !== 'object' && !k.endsWith('_thumb_url'))
-    .map(([k, v]) => [k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase()), String(v)]);
+  return (
+    Object.entries(details || {})
+      // ids, fingerprints and bookkeeping flags are ours, not the reader's
+      .filter(
+        ([k, v]) =>
+          typeof v !== 'object' &&
+          v !== '' &&
+          !k.startsWith('_') &&
+          !/(_thumb_url|_url|_id|_ids|_fingerprint|_native|_scope|_hash)$/.test(k) &&
+          k !== 'schema',
+      )
+      .map(([k, v]) => [k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase()), String(v)])
+  );
 }
 
 // ── Bulk fix ─────────────────────────────────────────────────────────────────
@@ -946,13 +985,14 @@ export function findingsBulkBarState(
 export function bulkFixRunMessage(
   status: Pick<
     BulkFixStatus,
-    'fixed' | 'failed' | 'skipped' | 'total' | 'stopped' | 'error' | 'note' | 'errors'
+    'fixed' | 'failed' | 'skipped' | 'partial' | 'total' | 'stopped' | 'error' | 'note' | 'errors'
   >,
 ): { message: string; type: 'success' | 'error' } {
   const fixed = status.fixed || 0;
   const failed = status.failed || 0;
   const skipped = status.skipped || 0;
-  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''} of ${status.total || 0}`;
+  const partial = status.partial || 0;
+  let message = `Fixed ${fixed}${partialClause(partial)}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''} of ${status.total || 0}`;
   if (status.stopped) {
     message = `Bulk fix stopped — ${message.charAt(0).toLowerCase()}${message.slice(1)}`;
   }
@@ -969,7 +1009,18 @@ export function bulkFixRunMessage(
     const errors = status.errors;
     if (errors && errors.length > 0) message += `: ${errors[0].error}`;
   }
-  return { message, type: fixed > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error' };
+  return {
+    message,
+    type: fixed > 0 || partial > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error',
+  };
+}
+
+/** a bulk re-tag fills blank tags and leaves the tags that differ on the
+ *  finding: said apart, so "fixed" never counts a row that is still open. */
+function partialClause(partial: number): string {
+  return partial
+    ? `, filled the blank tags in ${partial} more (what differs is left for you to review)`
+    : '';
 }
 
 /** From the tail of `bulkFixFindings` — the per-id loop's own summary. Note it
@@ -980,8 +1031,9 @@ export function bulkFixLoopMessage(
   lastError: string,
   skipped = 0,
   otherArtistSkipped = 0,
+  partial = 0,
 ): { message: string; type: 'success' | 'error' } {
-  let message = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''}`;
+  let message = `Fixed ${fixed}${partialClause(partial)}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped` : ''}`;
   if (failed && lastError) message += `: ${lastError}`;
   // A failed gated finding's own error already carries this sentence.
   if (otherArtistSkipped && !lastError.includes('other artists were not added')) {
@@ -989,7 +1041,10 @@ export function bulkFixLoopMessage(
   }
   // Same rule as bulkFixRunMessage: skipped-by-design softens the type
   // only when nothing actually failed.
-  return { message, type: fixed > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error' };
+  return {
+    message,
+    type: fixed > 0 || partial > 0 || (skipped > 0 && failed === 0) ? 'success' : 'error',
+  };
 }
 
 /**

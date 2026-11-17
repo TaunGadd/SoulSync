@@ -30,7 +30,7 @@ from __future__ import annotations
 import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from utils.logging_config import get_logger
 
@@ -58,6 +58,14 @@ def _sync_lock(database, artist_id: int) -> threading.RLock:
 
 def _bucket(album_type: str) -> str:
     return "single" if (album_type or "").lower() in _SINGLE_TYPES else "release"
+
+
+def _stamp_release_types(cursor: Any, album_id: Any, release_group_id: Any, release: Any) -> None:
+    """A MusicBrainz listing says what kind each release is (live,
+    soundtrack, ...): keep it with the group, for the artist page (#2055)."""
+    from core.library2.release_group_types import stamp
+    kinds = [str(v).strip().lower() for v in (getattr(release, "secondary_types", None) or []) if v]
+    stamp(cursor, album_id, release_group_id, kinds)
 
 
 def _normalize_type(raw: Any) -> str:
@@ -138,13 +146,17 @@ def _link_release_artists(
         (album_id, primary_artist_id),
     )
     for name, key, provider_id in names:
-        resolved_id = find_or_create_artist(
+        # the primary credit is primary_artist_id already: resolving it was
+        # a lookup (and maybe a stray artist row) thrown away, inside the
+        # write transaction. review 5 R5-E-3
+        if key == primary_key:
+            continue
+        credited_id = find_or_create_artist(
             conn,
             name,
             spotify_id=provider_id,
             source=source,
         )
-        credited_id = primary_artist_id if key == primary_key else resolved_id
         if credited_id is None or int(credited_id) == int(primary_artist_id):
             continue
         conn.execute(
@@ -272,6 +284,8 @@ def _should_auto_monitor(
 
 
 _CONTENT_FILTER_DEFAULTS = {
+    # live albums. live tracks on other releases are include_live_tracks,
+    # which follows this one until it is set (#2082)
     "include_live": False,
     "include_remixes": False,
     "include_acoustic": False,
@@ -287,20 +301,22 @@ _CONTENT_FILTER_DEFAULTS = {
 }
 
 
-def _release_type_included(track_count: Any, filters: Dict[str, bool]) -> bool:
-    """3.6.1's rule by track count: 1-3 a single, 4-6 an EP, 7+ an album. A
-    release whose count isn't known yet is let through, as 3.6.1 did on error."""
+def _release_type_included(track_count: Any, filters: Dict[str, bool],
+                           total_ms: Any = None) -> bool:
+    """3.6.1's release types by the store rule: 1-3 tracks under 30 min a
+    single, 4-6 an EP, else an album (count alone when the runtime isn't
+    known). A release whose count isn't known yet is let through, as 3.6.1
+    did on error."""
+    from core.metadata.release_type import release_type_from_shape
     try:
         count = int(track_count or 0)
     except (TypeError, ValueError):
         return True
     if count <= 0:
         return True
-    if count >= 7:
-        return filters.get("include_albums", True)
-    if count >= 4:
-        return filters.get("include_eps", True)
-    return filters.get("include_singles", True)
+    kind = release_type_from_shape(count, total_ms)
+    return filters.get({"album": "include_albums", "ep": "include_eps"}.get(
+        kind, "include_singles"), True)
 
 
 def _artist_content_filters(conn, artist_id: int, profile_id: int = 1) -> Dict[str, bool]:
@@ -322,10 +338,14 @@ def _artist_content_filters(conn, artist_id: int, profile_id: int = 1) -> Dict[s
             settings = get_artist_settings(conn, artist_id, profile_id=pid)
         except Exception:  # noqa: BLE001 - no row for this profile, try the next
             continue
-        return {
+        filters = {
             key: bool(settings.get(key, default))
             for key, default in _CONTENT_FILTER_DEFAULTS.items()
         }
+        live_tracks = settings.get("include_live_tracks")
+        filters["include_live_tracks"] = (
+            filters["include_live"] if live_tracks is None else bool(live_tracks))
+        return filters
     return dict(_CONTENT_FILTER_DEFAULTS)
 
 
@@ -653,6 +673,11 @@ def _expand_artist_discography(
 
                 if is_compilation_album(title):
                     auto_monitor_release = False
+            # a live album with Live albums off is not a new release to want,
+            # the same release rule the discography refresh job reads (#2117)
+            if (auto_monitor_release and content_filters is not None
+                    and _track_content_excluded(title or "", title or "", content_filters)):
+                auto_monitor_release = False
 
             existing = _match_existing(index, title=title, album_type=album_type,
                                        provider_id=provider_id, source=source,
@@ -685,6 +710,9 @@ def _expand_artist_discography(
                 existing["external_ids"] = merged_external_ids
                 if release_group_id and not existing["musicbrainz_release_group_id"]:
                     existing["musicbrainz_release_group_id"] = release_group_id
+                if release_group_id and str(
+                        existing["musicbrainz_release_group_id"]).lower() == str(release_group_id).lower():
+                    _stamp_release_types(cursor, existing["id"], release_group_id, release)
                 if id_conflict:
                     from core.library2.editions import record_alternative_edition
                     record_alternative_edition(
@@ -719,6 +747,8 @@ def _expand_artist_discography(
             new_id = cursor.lastrowid
             from core.library2.release_kind import confirm_release_kind
             confirm_release_kind(cursor, new_id, album_type)
+            if release_group_id:
+                _stamp_release_types(cursor, new_id, release_group_id, release)
             seen_ids.add(new_id)
             if auto_monitor_release:
                 if not defer_auto_monitor:
@@ -837,56 +867,66 @@ def _uncredited_track_ids(conn, album_id: int, track_ids: List[int]) -> set:
 
 def _track_content_excluded(
     track_title: str, album_title: str, filters: Dict[str, bool],
+    *, requested: bool = False,
 ) -> bool:
     """True when ``track_title`` is a Live/Remix/Acoustic/Instrumental
     version the artist's watchlist settings don't opt into (review A3).
     Explicit params (not a closure) — this is called from inside a loop over
-    an album's tracks and must not depend on loop-variable capture."""
-    from core.watchlist_scanner import (
-        is_acoustic_version,
-        is_instrumental_version,
-        is_live_version,
-        is_remix_version,
-    )
+    an album's tracks and must not depend on loop-variable capture.
 
-    if not filters["include_live"] and is_live_version(track_title, album_title):
-        return True
-    if not filters["include_remixes"] and is_remix_version(track_title, album_title):
-        return True
-    if not filters["include_acoustic"] and is_acoustic_version(track_title, album_title):
-        return True
-    if not filters["include_instrumentals"] and is_instrumental_version(
-        track_title, album_title,
-    ):
-        return True
-    return False
+    The rules are the watchlist scanner's and Download Discography's, in one
+    place (#2082): a live album is one rule, a live track on another release
+    a second, and a release the person asked for (``requested``) is never
+    kept out by what the release itself is."""
+    from core.metadata.discography_filters import content_type_skip_reason
+
+    return content_type_skip_reason(
+        track_title, album_title, filters, requested=requested) is not None
 
 
-def approve_release(db, config_manager, album_id: int, *, profile_id: int = 1) -> int:
+def approve_release(db, config_manager, album_id: int, *, profile_id: int = 1,
+                    requested: bool = False) -> int:
     """Put one catalogue release on ``profile_id``'s wishlist: monitor it, queue
     its tracklist and wish for its tracks. What Fix on a discography finding
     does, and what the back catalogue's auto add does without the click.
-    Returns the tracks mirrored; raises LookupError when the album is gone."""
+    Returns the tracks mirrored; raises LookupError when the album is gone.
+
+    ``requested``: a person asked for this release (the Fix click). The
+    edition preference and the release's own kind then never keep it out:
+    asking for a live album with Live albums off wished for none of its
+    tracks (#2082)."""
     from contextlib import closing as _closing
 
+    from core.library2 import ADMIN_PROFILE_ID
+    profile = int(profile_id or ADMIN_PROFILE_ID)
     with _closing(db._get_connection()) as conn:
+        # third #1062 review P2D-6: the monitored column is the shared
+        # library's (the admin's). an own library's approval is that
+        # profile's album rule; setting the column made a failed tracklist
+        # retry into the admin's wishlist and download into the shared library
         cursor = conn.execute(
             """UPDATE lib2_albums
-                  SET monitored=1, tracklist_status='pending',
+                  SET monitored=CASE WHEN ? THEN 1 ELSE monitored END,
+                      tracklist_status='pending',
                       tracklist_error=NULL, tracklist_retry_at=NULL,
                       updated_at=CURRENT_TIMESTAMP
                 WHERE id=?""",
-            (int(album_id),),
+            (profile == ADMIN_PROFILE_ID, int(album_id)),
         )
         if cursor.rowcount == 0:
-            raise LookupError("Library-v2 album no longer exists")
+            raise LookupError("Library album no longer exists")
+        if profile != ADMIN_PROFILE_ID:
+            from core.library2.monitor_rules import PROVENANCE_USER, record_rule
+            record_rule(conn, "album", int(album_id), True, PROVENANCE_USER, profile_id=profile)
         conn.commit()
     return auto_monitor_releases(db, config_manager, [int(album_id)],
-                                 wishlist_profile_id=int(profile_id or 1))
+                                 wishlist_profile_id=int(profile_id or 1),
+                                 requested_ids={int(album_id)} if requested else None)
 
 
 def auto_monitor_releases(db, config_manager, album_ids: List[int],
-                          *, wishlist_profile_id: int = 1) -> int:
+                          *, wishlist_profile_id: int = 1,
+                          requested_ids: Optional[Iterable[int]] = None) -> int:
     """Make freshly discovered releases genuinely wanted.
 
     For each album: materialize its provider tracklist into real track rows,
@@ -902,9 +942,14 @@ def auto_monitor_releases(db, config_manager, album_ids: List[int],
     from core.library2.completeness import resolve_tracklist
 
     from core.library2.edition_selection import select_automatic_album_ids
+    # what a person asked for by name is not up to the edition preference
+    requested_set = {int(a) for a in (requested_ids or ())}
     with closing(db._get_connection()) as selection_conn:
-        album_ids = select_automatic_album_ids(selection_conn, album_ids, config_manager,
-                                              profile_id=wishlist_profile_id)
+        selected = set(select_automatic_album_ids(
+            selection_conn, [a for a in album_ids if int(a) not in requested_set],
+            config_manager, profile_id=wishlist_profile_id))
+        album_ids = [a for a in dict.fromkeys(int(a) for a in album_ids)
+                     if a in requested_set or a in selected]
     mirrored = 0
     filters_cache: Dict[int, Dict[str, bool]] = {}
     with closing(db._get_connection()) as conn:
@@ -1006,17 +1051,60 @@ def auto_monitor_releases(db, config_manager, album_ids: List[int],
 
             if not filters.get("include_other_artists", False):
                 vetoed = set(vetoed) | _uncredited_track_ids(conn, album_id, album_track_ids)
+            # a release the person asked for, by the click that got us here
+            # (#2082). not read off the album's rule: the back catalogue's own
+            # auto add writes a user rule for a member's library too
+            asked_for = int(album_id) in requested_set
             auto_monitor_ids = [
                 r["id"] for r in album_tracks
                 if r["id"] not in vetoed
-                and not _track_content_excluded(r["title"] or "", album_title, filters)
+                and not _track_content_excluded(r["title"] or "", album_title, filters,
+                                                requested=asked_for)
             ]
-            if auto_monitor_ids:
-                marks = ",".join("?" for _ in auto_monitor_ids)
-                conn.execute(
-                    f"UPDATE lib2_tracks SET monitored=1 WHERE id IN ({marks})",
-                    auto_monitor_ids,
-                )
+            from core.library2 import ADMIN_PROFILE_ID
+            if int(wishlist_profile_id) == ADMIN_PROFILE_ID:
+                if auto_monitor_ids:
+                    marks = ",".join("?" for _ in auto_monitor_ids)
+                    conn.execute(
+                        f"UPDATE lib2_tracks SET monitored=1 WHERE id IN ({marks})",
+                        auto_monitor_ids,
+                    )
+                # #2117: skipping the flip was not enough. the tracks were born
+                # monitored off the album, and the album's new_release rule
+                # made every one of them wanted, so a live album came down
+                # with Live albums off. what the filters leave out gets a rule
+                # saying so, unless the user picked or wished that track
+                left_out = [t for t in album_track_ids
+                            if t not in set(auto_monitor_ids)]
+                if left_out:
+                    marks = ",".join("?" for _ in left_out)
+                    user_set = {r[0] for r in conn.execute(
+                        f"SELECT entity_id FROM lib2_monitor_rules WHERE entity_type='track' "
+                        f"AND profile_id=? AND provenance IN ('user_explicit','wishlist_import') "
+                        f"AND entity_id IN ({marks})",
+                        (ADMIN_PROFILE_ID, *left_out))}
+                    left_out = [t for t in left_out if t not in user_set]
+                if left_out:
+                    marks = ",".join("?" for _ in left_out)
+                    conn.execute(
+                        f"UPDATE lib2_tracks SET monitored=0 WHERE id IN ({marks})", left_out)
+                    for track_id in left_out:
+                        record_rule(conn, "track", track_id, False, PROVENANCE_NEW_RELEASE,
+                                    profile_id=ADMIN_PROFILE_ID)
+            else:
+                # P2D-6: lib2_tracks.monitored is the shared library's. another
+                # profile's want is its own track rules, and what its filters
+                # leave out is a rule too (the column flip's veto, per profile)
+                marks = ",".join("?" for _ in album_track_ids) or "NULL"
+                user_set = {r[0] for r in conn.execute(
+                    f"SELECT entity_id FROM lib2_monitor_rules WHERE entity_type='track' "
+                    f"AND profile_id=? AND provenance='user_explicit' AND entity_id IN ({marks})",
+                    (int(wishlist_profile_id), *album_track_ids))}
+                for track_id in album_track_ids:
+                    if track_id in user_set:  # the user's own choice stands
+                        continue
+                    record_rule(conn, "track", track_id, track_id in auto_monitor_ids,
+                                PROVENANCE_NEW_RELEASE, profile_id=wishlist_profile_id)
             explicit = conn.execute("SELECT 1 FROM lib2_monitor_rules WHERE entity_type='album' AND entity_id=? AND profile_id=? AND provenance='user_explicit'", (album_id, wishlist_profile_id)).fetchone()
             if not explicit:
                 record_rule(conn, "album", album_id, True, PROVENANCE_NEW_RELEASE,
@@ -1075,6 +1163,21 @@ def repair_track_number_collisions(database, config_manager, artist_id: int) -> 
                 ORDER BY al.id""",
             (artist_id,),
         ).fetchall()]
+        if album_ids:
+            # a row a moved file left behind shares its position with the row
+            # that has the file now. that is not a numbering fault, it folds
+            # (#2094), and only what still collides gets the tracklist pass
+            from core.library2.dedup_repair import fold_leftover_rows
+            if fold_leftover_rows(conn, album_ids)["leftover_tracks_folded"]:
+                conn.commit()
+                marks = ",".join("?" for _ in album_ids)
+                album_ids = [row["id"] for row in conn.execute(
+                    f"""SELECT al.id FROM lib2_albums al
+                         WHERE al.id IN ({marks}) AND EXISTS (
+                             SELECT 1 FROM lib2_tracks t WHERE t.album_id = al.id
+                              GROUP BY COALESCE(t.disc_number, 1), t.track_number
+                             HAVING COUNT(*) > 1)
+                         ORDER BY al.id""", album_ids).fetchall()]
         for album_id in album_ids:
             try:
                 if resolve_tracklist(config_manager, conn, album_id):
@@ -1130,6 +1233,34 @@ def repair_incomplete_library_tracklists(
     return repaired
 
 
+def _owner_retry_albums(database, artist_id: int) -> Dict[int, List[int]]:
+    """{profile: album ids} for this artist's releases another profile
+    approved whose tracklist is still pending or failed and due"""
+    out: Dict[int, List[int]] = {}
+    try:
+        with closing(database._get_connection()) as conn:
+            for album_id, profile in conn.execute(
+                    """SELECT DISTINCT al.id, r.profile_id
+                         FROM lib2_albums al
+                         JOIN lib2_monitor_rules r
+                           ON r.entity_type='album' AND r.entity_id=al.id
+                          AND r.monitored=1 AND r.profile_id<>1
+                        WHERE al.id IN (SELECT album_id FROM lib2_album_artists WHERE artist_id=?
+                                        UNION SELECT id FROM lib2_albums WHERE primary_artist_id=?)
+                          AND al.origin='discography'
+                          AND (al.tracklist_status='pending'
+                               OR (al.tracklist_status='failed' AND (
+                                   al.tracklist_retry_at IS NULL
+                                   OR al.tracklist_retry_at <= CURRENT_TIMESTAMP))
+                               OR (al.tracklist_status='idle' AND NOT EXISTS (
+                                   SELECT 1 FROM lib2_tracks t WHERE t.album_id=al.id)))
+                        ORDER BY al.id""", (int(artist_id), int(artist_id))):
+                out.setdefault(int(profile), []).append(int(album_id))
+    except Exception as exc:  # noqa: BLE001 - the next sweep retries
+        logger.debug("owner retry lookup failed for artist %s: %s", artist_id, exc)
+    return out
+
+
 def _refresh_one_artist(
     database, artist_id: int, config_manager, *, wishlist_profile_id: int,
     auto_monitor: bool = True,
@@ -1149,6 +1280,12 @@ def _refresh_one_artist(
                 album_ids,
                 wishlist_profile_id=wishlist_profile_id,
             )
+        if auto_monitor:
+            # P2D-6: an own library's approved release whose tracklist failed
+            # retries for that library, not the admin's
+            for profile, owner_ids in _owner_retry_albums(database, artist_id).items():
+                mirrored += auto_monitor_releases(database, config_manager, owner_ids,
+                                                  wishlist_profile_id=profile)
         stats["repaired_track_number_collisions"] = repair_track_number_collisions(
             database, config_manager, artist_id)
         stats["repaired_incomplete_tracklists"] = repair_incomplete_library_tracklists(

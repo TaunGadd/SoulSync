@@ -22,6 +22,12 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 
+import {
+  CardSizeSlider,
+  cardGridStyle,
+  useCardSize,
+  type CardSizeRange,
+} from '@/components/card-size';
 import { DialogFrame, DialogHeader } from '@/components/dialog';
 import {
   routedNamesQueryOptions,
@@ -54,7 +60,6 @@ import {
   clearLibraryV2EntityMatch,
   deleteLibraryV2Entity,
   deleteLibraryV2Files,
-  editLibraryV2Artist,
   editTrackFileTag,
   enrichLibraryV2Entity,
   fetchLibraryV2AlbumHistory,
@@ -134,6 +139,7 @@ import {
 } from '../-library-v2.api';
 import { useLibraryChanged, useMaintenanceChanged } from '../-library-v2.live';
 import { albumQueueRows, artistQueueRows, playlistTrack, queueableRows } from '../-library-v2.play';
+import { copiesNote, releaseLeads, withoutShadowEntries } from '../-library-v2.releases';
 import { getServiceUrl } from '../-library-v2.service-links';
 import {
   fetchSongsToPlay,
@@ -186,6 +192,7 @@ import {
 } from '../../artist-detail/-artist-detail.api';
 import { ensurePageOrigin, pushArtistOrigin } from '../../artist-detail/-artist-detail.back-label';
 import { announceWatchlistFollow } from '../../artist-detail/-artist-detail.enrich-match';
+import { gapSameRelease, gapSourceLabel } from '../../artist-detail/-artist-detail.gap-fill';
 import { syncResultMessage } from '../../artist-detail/-artist-detail.meta';
 import {
   checkWatchlistRequest,
@@ -200,14 +207,21 @@ import { ReassignModal } from '../../artist-detail/-ui/reassign-modal';
 import { ReidentifyModal } from '../../artist-detail/-ui/reidentify-modal';
 import { SimilarArtistsSection } from '../../artist-detail/-ui/similar-artists-section';
 import { WatchlistAddModal } from '../../artist-detail/-ui/watchlist-add-modal';
+import { AlbumVersionsModal } from './album-versions-modal';
 import { AlbumArtPickerModal, ArtistImagePickerModal } from './art-picker-modal';
 import { ArtistHeroVideo } from './artist-hero-video';
 import { ArtistPageLibraryProvider, ReleaseMonitorButton } from './artist-page-release-actions';
 import { parseArtworkTarget, watchPendingArtwork } from './artwork-pending';
 import { cardFadeIn } from './card-fade';
 import {
+  applyMusicBrainzDeclutter,
   classifyReleaseContent,
   DEFAULT_DISCOGRAPHY_FILTERS,
+  BASE_SECTIONS,
+  DISCOGRAPHY_SECTIONS,
+  groupReleases,
+  SECTION_LABELS,
+  type DiscographySection,
   passesDiscographyFilters,
   type DiscographyFilterState,
   type DiscographyOwnership,
@@ -223,7 +237,19 @@ import {
   summarizeRecentHistory,
 } from './history-groups';
 import { InteractiveSearchModal } from './interactive-search';
+import { ArtistBulkBar, SelectBox, useArtistSelection, type ArtistSelection } from './library-bulk';
+import bulkStyles from './library-bulk.module.css';
 import classic from './library-classic-cards.module.css';
+import {
+  ArtistSortControl,
+  CollectionMeter,
+  ShowMissingProvider,
+  LibraryOverview,
+  OverviewToggle,
+  rememberIndex,
+  useIndexScrollMemory,
+  useOverviewOpen,
+} from './library-collection';
 import { LibraryCover } from './library-cover';
 import {
   AlbumCardPlayButton,
@@ -232,11 +258,22 @@ import {
   LibraryActiveFilters,
   LibraryAlphabetBar,
   LibraryRadioButton,
+  LibraryRecycleBinButton,
   LibrarySearchFallback,
   LibrarySearchInput,
   LibraryFilterMenu,
   useUpgradableCounts,
 } from './library-index-extras';
+import extrasStyles from './library-index-extras.module.css';
+import {
+  ChipCheck,
+  ChoiceCard,
+  SettingsGroup,
+  SettingsPills,
+  SwitchRow,
+  TrackTablePreview,
+  ls,
+} from './library-settings-parts';
 import {
   LibrarySongList,
   LibrarySongSkeleton,
@@ -244,6 +281,7 @@ import {
   songsStripQueryOptions,
 } from './library-songs';
 import styles from './library-v2-page.module.css';
+import { LineIcon } from './line-icon';
 import { WatchlistIcon, WishlistIcon } from './list-icons';
 import { AlbumUpgradeButton } from './owned-album-upgrade';
 import { useArtistBack } from './owned-artist-back';
@@ -256,14 +294,21 @@ import { OwnedArtistHeroExtras } from './owned-artist-hero-extras';
 import { openProviderRelease, ReleaseCardExtras } from './owned-artist-release-cards';
 import { OwnedArtistReorganizeQueue } from './owned-artist-reorganize-queue';
 import { OwnedTopTrackActions, OwnedTopTracksDownloadAll } from './owned-artist-top-tracks';
-import { AlbumUnlockMenuItem, OwnedTrackMoreMenu } from './owned-artist-track-actions';
+import {
+  AlbumUnlockMenuItem,
+  OwnedTrackMoreMenu,
+  leftoverSlotKeepers,
+} from './owned-artist-track-actions';
 import { QualityProfilePicker } from './quality-profile-modal';
 import { reassignSubject } from './reassign';
+import { AlbumRenameBadge, renameHintTitle, useRenameCheck } from './rename-hint';
 import { AlbumReorganizeModal, ArtistRenamePreviewModal } from './reorganize-modal';
 import { RetagModal } from './retag-modal';
+import { ReviewLockButton, lockedPresence, useLockedIds } from './review-lock';
 import { StatusNotice } from './status-notice';
 import { LibraryToolDialog } from './tool-dialog';
 import { UnmatchedReviewModal } from './unmatched-review-modal';
+import { releaseLibraryFileTagValues, UseFileTagsModal } from './use-file-tags-modal';
 import { WatchAllModal } from './watch-all-modal';
 
 // not the route module: it imports this page, and the cycle only held while nothing
@@ -283,22 +328,36 @@ function TrackPresence({
   present,
   total,
   className = '',
+  locked = false,
 }: {
   present: number;
   total: number;
   className?: string;
+  /** #2119: a reviewed and locked album reads as finished */
+  locked?: boolean;
 }) {
-  const description = `${present} of ${total} tracks in your library`;
+  const shown = lockedPresence(present, total, locked);
+  const description = shown.locked
+    ? `${present} ${present === 1 ? 'track' : 'tracks'}, reviewed and locked` +
+      (total > present ? ` (${total} on the release)` : '')
+    : `${present} of ${total} tracks in your library`;
   return (
     <span
       className={`${styles.trackPresence} ${className}`}
       data-presence={
-        total === 0 ? 'unknown' : present >= total ? 'complete' : present > 0 ? 'partial' : 'empty'
+        shown.total === 0
+          ? 'unknown'
+          : shown.present >= shown.total
+            ? 'complete'
+            : shown.present > 0
+              ? 'partial'
+              : 'empty'
       }
+      data-locked={shown.locked ? '' : undefined}
       title={description}
       aria-label={description}
     >
-      {trackProgress(present, total)}
+      {trackProgress(shown.present, shown.total)}
     </span>
   );
 }
@@ -991,9 +1050,10 @@ function EnhanceQualityButton({
   artistId: number;
   artistName: string;
   busy: boolean;
-  onEnhance: (trackIds: number[]) => void;
+  onEnhance: (trackIds: number[], targetProfileId: number | null) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const canWrite = useLibraryV2CanWrite();
   const tracks = useQuery(libraryV2EnhanceQueryOptions('artists', artistId)).data?.tracks ?? [];
   if (tracks.length === 0) return null;
   return (
@@ -1010,10 +1070,12 @@ function EnhanceQualityButton({
         <EnhanceQualityModal
           title={artistName}
           tracks={tracks}
+          scope={{ entity: 'artists', id: artistId }}
+          canChooseTarget={canWrite}
           onClose={() => setOpen(false)}
-          onEnhance={(trackIds) => {
+          onEnhance={(trackIds, targetProfileId) => {
             setOpen(false);
-            onEnhance(trackIds);
+            onEnhance(trackIds, targetProfileId);
           }}
         />
       ) : null}
@@ -1080,6 +1142,10 @@ function refreshSummary(result: LibraryV2JobState['result']): string {
   if (count('recovered')) parts.push(`${count('recovered')} back`);
   if (count('missing_confirmed')) parts.push(`${count('missing_confirmed')} now missing`);
   if (count('missing_suspected')) parts.push(`${count('missing_suspected')} unverified`);
+  if (count('leftover_tracks_folded'))
+    parts.push(
+      `${count('leftover_tracks_folded')} leftover row${count('leftover_tracks_folded') === 1 ? '' : 's'} with no file folded`,
+    );
   const drifting = count('path_drift') - count('path_repointed');
   if (drifting > 0) parts.push(`${drifting} needing review in Stale Index Paths`);
   return `Refresh & Scan: ${parts.join(', ')}.`;
@@ -1169,8 +1235,17 @@ function ModalShell({
 
 function matchChipClass(status: string): string {
   if (status === 'matched') return styles.matchMatched;
-  if (status === 'not_found') return styles.matchNotFound;
+  if (status === 'not_found' || status === 'cleared') return styles.matchNotFound;
   return styles.matchPending;
+}
+
+/** P2B-3: what the workers last heard, in words (3.6.1 said "not found") */
+export function matchStatusText(status: string): string {
+  if (status === 'not_found') return 'not found';
+  if (status === 'cleared') return 'cleared, match it by hand';
+  if (status === 'error') return 'lookup failed, will retry';
+  if (status === 'pending') return 'not tried yet';
+  return status;
 }
 
 /** §52.5/§56.2: only Spotify/Deezer artist search results and the live
@@ -1344,13 +1419,14 @@ export function MatchChips({
         ]
           .filter(Boolean)
           .join(' · ');
-        const tip = `${s.label}: ${s.status} (${details})`;
+        const tip = `${s.label}: ${matchStatusText(s.status)} (${details})`;
         return (
           <button
             key={s.service}
             type="button"
             className={`${styles.matchChip} ${abbreviated ? styles.trackMatchChip : ''} ${matchChipClass(s.status)}`}
-            title={canWrite ? tip : 'Library changes require the admin profile'}
+            // review 4 R4-E-4: everyone reads why a chip says what it says
+            title={canWrite ? tip : `${tip}. Matching is the admin's`}
             data-requires-write=""
             disabled={!canWrite || s.library_v2_entity_id == null}
             onClick={() => {
@@ -1768,7 +1844,7 @@ function EnrichDropdown({
   entity,
   entityId,
   entityName,
-  wrapperRef,
+  insideRefs,
   onClose,
   align = 'left',
   submenu = false,
@@ -1776,7 +1852,10 @@ function EnrichDropdown({
   entity: 'artists' | 'albums' | 'tracks';
   entityId: number;
   entityName: string;
-  wrapperRef: React.RefObject<HTMLSpanElement | null>;
+  /** presses in these count as inside: the menu that holds this list. the
+   *  album menu is portaled to the body, so its "..." button alone was not
+   *  enough (review 5 W3-TL-1) */
+  insideRefs: React.RefObject<HTMLElement | null>[];
   onClose: () => void;
   align?: 'left' | 'right';
   submenu?: boolean;
@@ -1790,22 +1869,34 @@ function EnrichDropdown({
         const services = enrichServices(entity);
         window.showToast?.(`Enriching ${entityName} from all services...`, 'info');
         let resynced = false;
+        // a failure per service was only logged, so a run where every one
+        // refused still read as a green "nothing new" (review 5 W3-TL-2)
+        const failed: { label: string; message: string }[] = [];
         for (const s of services) {
           try {
             const res = await enrichLibraryV2Entity(entity, entityId, s.key);
             if (res.resynced) resynced = true;
           } catch (e) {
             console.error(`Bulk enrich failed for ${s.key}:`, e);
+            failed.push({ label: s.label, message: mutationErrorMessage(e, 'failed') });
           }
         }
-        return { resynced };
+        if (failed.length && failed.length === services.length) {
+          const reasons = [...new Set(failed.map((f) => f.message))].join('; ');
+          throw new Error(`Enrichment failed on every service: ${reasons}`);
+        }
+        return { resynced, failed: failed.map((f) => f.label) };
       }
       window.showToast?.(`Enriching ${entityName} from ${service}...`, 'info');
       return enrichLibraryV2Entity(entity, entityId, service);
     },
     onSuccess: (data) => {
       void queryClient.invalidateQueries({ queryKey: LIBRARY_V2_QUERY_KEY });
-      if (data?.resynced) {
+      const failed = 'failed' in data ? data.failed : [];
+      if (failed.length) {
+        const done = data.resynced ? 'Enriched and refreshed' : 'Enriched (nothing new found)';
+        window.showToast?.(`${done}, but ${failed.join(', ')} failed.`, 'warning');
+      } else if (data?.resynced) {
         window.showToast?.('Enriched and refreshed.', 'success');
       } else {
         window.showToast?.('Enriched (nothing new found).', 'success');
@@ -1816,18 +1907,23 @@ function EnrichDropdown({
     },
   });
 
+  const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
-        onClose();
-      }
+      // its own items are inside too: closing on their mousedown unmounted the
+      // list before the click landed, so no enrich ever ran (review 5 W3-TL-1)
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target)) return;
+      if (insideRefs.some((ref) => ref.current?.contains(target))) return;
+      onClose();
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [onClose, wrapperRef]);
+  }, [onClose, insideRefs]);
 
   return (
     <div
+      ref={rootRef}
       className={`${styles.enrichDropdownMenu} ${align === 'right' ? styles.alignRight : styles.alignLeft} ${
         submenu ? styles.enrichDropdownSubmenu : ''
       }`}
@@ -2067,169 +2163,6 @@ function LinkArtistAliasModal({
   );
 }
 
-/** Lidarr-style artist monitoring options: one click applies a monitoring
- *  strategy across the artist's releases (runs as a background bulk job). */
-export function MonitoringModal({
-  artistId,
-  monitorNewItems,
-  onClose,
-}: {
-  artistId: number;
-  monitorNewItems: string;
-  onClose: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const canWrite = useLibraryV2CanWrite();
-  const [busy, setBusy] = useState<string | null>(null);
-  const [bulkError, setBulkError] = useState<string | null>(null);
-  const [failedBulkAction, setFailedBulkAction] = useState<{
-    scope: 'all' | 'missing';
-    monitored: boolean;
-    label: string;
-  } | null>(null);
-  const initialNewItems =
-    monitorNewItems === 'none' || monitorNewItems === 'new' ? monitorNewItems : 'all';
-  const [newItems, setNewItems] = useState<'all' | 'none' | 'new'>(initialNewItems);
-  const futureReleasesMutation = useMutation({
-    mutationFn: (value: 'all' | 'none' | 'new') => {
-      if (!canWrite) throw new Error('Library changes require the admin profile');
-      return editLibraryV2Artist(artistId, value);
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: LIBRARY_V2_QUERY_KEY }),
-    onMutate: (value) => {
-      const previous = newItems;
-      setNewItems(value);
-      return { previous };
-    },
-    onError: (_error, _value, context) => {
-      setNewItems(context?.previous ?? initialNewItems);
-    },
-  });
-
-  function saveFutureReleases(value: 'all' | 'none' | 'new') {
-    futureReleasesMutation.mutate(value);
-  }
-
-  async function apply(scope: 'all' | 'missing', monitored: boolean, label: string) {
-    if (!canWrite) return;
-    setBusy(label);
-    setBulkError(null);
-    setFailedBulkAction(null);
-    try {
-      const jobId = await bulkMonitorLibraryV2Releases(artistId, scope, monitored);
-      const jobError = await awaitBulkJob(queryClient, jobId);
-      if (jobError) throw new Error(jobError);
-      onClose();
-    } catch (caught) {
-      await queryClient.invalidateQueries({ queryKey: LIBRARY_V2_QUERY_KEY });
-      setBulkError(mutationErrorMessage(caught, 'Could not update your Wishlist'));
-      setFailedBulkAction({ scope, monitored, label });
-      setBusy(null);
-    }
-  }
-
-  const options: Array<{ label: string; desc: string; run: () => void }> = [
-    {
-      label: 'Add all releases to Wishlist',
-      desc: 'Every album, EP and single becomes wanted (missing tracks queue for download).',
-      run: () => void apply('all', true, 'all'),
-    },
-    {
-      label: 'Add missing releases to Wishlist',
-      desc: 'Only releases with missing tracks become wanted; complete ones stay untouched.',
-      run: () => void apply('missing', true, 'missing'),
-    },
-    {
-      label: 'Remove everything from Wishlist',
-      desc: 'Stop wanting all releases; wishlist entries are withdrawn.',
-      run: () => void apply('all', false, 'none'),
-    },
-  ];
-
-  return (
-    <ModalShell title="Watchlist settings" onClose={onClose}>
-      <div className={styles.qpList}>
-        {options.map((o) => (
-          <button
-            key={o.label}
-            type="button"
-            className={styles.qpOption}
-            data-requires-write=""
-            disabled={busy !== null || !canWrite}
-            onClick={o.run}
-          >
-            <span className={styles.qpName}>{busy === o.label ? 'Applying…' : o.label}</span>
-            <span className={styles.qpDesc}>{o.desc}</span>
-          </button>
-        ))}
-      </div>
-      {bulkError && failedBulkAction ? (
-        <div className={styles.mutationError} role="alert">
-          <span>{bulkError}</span>
-          <button
-            type="button"
-            className={styles.inlineRetry}
-            data-requires-write=""
-            disabled={!canWrite}
-            onClick={() =>
-              void apply(failedBulkAction.scope, failedBulkAction.monitored, failedBulkAction.label)
-            }
-          >
-            Retry
-          </button>
-        </div>
-      ) : null}
-      <div className={styles.editRow}>
-        <label htmlFor="lib2-monitor-new">Future releases</label>
-        <select
-          id="lib2-monitor-new"
-          className={styles.select}
-          value={newItems}
-          data-requires-write=""
-          disabled={futureReleasesMutation.isPending || !canWrite}
-          onChange={(e) => {
-            const value = e.target.value as 'all' | 'none' | 'new';
-            saveFutureReleases(value);
-          }}
-        >
-          <option value="all">Add new releases to Wishlist</option>
-          <option value="new">Add new releases to Wishlist (from now on)</option>
-          <option value="none">Don't add new releases to Wishlist</option>
-        </select>
-      </div>
-      {futureReleasesMutation.isPending ? (
-        <div className={styles.mutationFeedback} role="status">
-          Saving the new-release setting…
-        </div>
-      ) : futureReleasesMutation.isError ? (
-        <div className={styles.mutationError} role="alert">
-          <span>
-            {mutationErrorMessage(
-              futureReleasesMutation.error,
-              'The new-release setting could not be saved',
-            )}
-          </span>
-          <button
-            type="button"
-            className={styles.inlineRetry}
-            data-requires-write=""
-            disabled={!canWrite}
-            onClick={() =>
-              futureReleasesMutation.mutate(futureReleasesMutation.variables ?? newItems)
-            }
-          >
-            Retry
-          </button>
-        </div>
-      ) : futureReleasesMutation.isSuccess ? (
-        <div className={styles.mutationSuccess} role="status">
-          New-release setting saved.
-        </div>
-      ) : null}
-    </ModalShell>
-  );
-}
-
 /** §52.3/§52.4: one Artist Settings surface over the existing Watchlist row,
  * in the same workspace as the library tools (Retag, Organize). Quality and
  * audiobook filing apply at once and exist for every artist; the Watchlist's
@@ -2244,6 +2177,9 @@ export function ArtistSettingsModal({
 }) {
   const queryClient = useQueryClient();
   const canWrite = useLibraryV2CanWrite();
+  // the watchlist part is the profile's own row: anyone who may wish here
+  // saves it (3.6.1's watchlist config); the rest of the sheet is the admin's
+  const canSaveWatchlist = useLibraryV2CanWish() === true;
   const settingsQuery = useQuery({
     queryKey: [...LIBRARY_V2_QUERY_KEY, 'artist-settings', artist.id],
     queryFn: () => fetchLibraryV2ArtistSettings(artist.id),
@@ -2262,7 +2198,7 @@ export function ArtistSettingsModal({
 
   const save = useMutation({
     mutationFn: (value: LibraryV2ArtistSettings) => {
-      if (!canWrite) throw new Error('Library changes require the admin profile');
+      if (!canSaveWatchlist) throw new Error('Library changes require the admin profile');
       return updateLibraryV2ArtistSettings(artist.id, value);
     },
     onSuccess: async (response) => {
@@ -2335,10 +2271,9 @@ export function ArtistSettingsModal({
             <button
               type="button"
               className={styles.btnPrimary}
-              data-requires-write=""
-              disabled={save.isPending || !canWrite}
+              disabled={save.isPending || !canSaveWatchlist}
               onClick={() => {
-                if (canWrite) save.mutate(watchlist);
+                if (canSaveWatchlist) save.mutate(watchlist);
               }}
             >
               {save.isPending ? 'Saving…' : 'Save future-release settings'}
@@ -2347,234 +2282,229 @@ export function ArtistSettingsModal({
         </div>
       }
     >
-      <div className={styles.artistSettingsLayout}>
-        <div className={styles.artistSettingsMain}>
-          <section className={styles.artistSettingsSection}>
-            <h4>Quality profile</h4>
-            <p className={styles.muted}>
-              What this artist’s downloads and upgrades must meet. It does not add anything to the
-              Wishlist.
-            </p>
-            <fieldset className={styles.settingsPlain} disabled={!canWrite}>
-              <QualityProfilePicker
-                entity="artists"
-                id={artist.id}
-                currentProfileId={artist.quality_profile?.id ?? 1}
-                currentProfileSource={artist.quality_profile_source}
-                currentProfileExplicit={artist.quality_profile_explicit}
-              />
-            </fieldset>
-          </section>
+      <div className={ls.sheetTool}>
+        <ArtistSettingsHero
+          artist={artist}
+          stats={settingsQuery.data?.artist_stats}
+          watchlist={watchlist}
+        />
+        <div className={ls.split}>
+          <div className={ls.stack}>
+            <SettingsGroup
+              title="Quality profile"
+              hint="What this artist’s downloads and upgrades must meet. It does not add anything to the Wishlist."
+            >
+              <fieldset className={ls.plain} disabled={!canWrite}>
+                <QualityProfilePicker
+                  entity="artists"
+                  id={artist.id}
+                  currentProfileId={artist.quality_profile?.id ?? 1}
+                  currentProfileSource={artist.quality_profile_source}
+                  currentProfileExplicit={artist.quality_profile_explicit}
+                />
+              </fieldset>
+            </SettingsGroup>
 
-          {!artist.monitored ? (
-            <section className={styles.artistSettingsSection}>
-              <h4>Future releases</h4>
-              <p className={styles.muted}>
-                Add the artist to the Watchlist: then new releases are discovered here, with release
-                types, lookback and auto-download set in this dialog.
-              </p>
-            </section>
-          ) : settingsQuery.isError ? (
-            <div className={styles.mutationError} role="alert">
-              {mutationErrorMessage(settingsQuery.error, 'Artist settings could not be loaded')}
-            </div>
-          ) : !watchlist ? (
-            <div className={styles.inlineLoading}>Loading Watchlist Artist Settings…</div>
-          ) : (
-            <>
-              <section className={styles.artistSettingsSection}>
-                <h4>Future releases</h4>
-                <p className={styles.muted}>
-                  The Watchlist scanner’s settings: what is discovered, and whether new releases
-                  enter the download pipeline.
-                </p>
-                <label className={styles.artistSettingsToggle}>
-                  <input
-                    type="checkbox"
-                    checked={watchlist.auto_download}
-                    onChange={(event) => setBoolean('auto_download', event.target.checked)}
-                  />
-                  <span>
-                    <strong>Auto-download new releases</strong>
-                    <small>Off means follow/discover only; releases are not added to Wanted.</small>
-                  </span>
-                </label>
-                <fieldset className={styles.artistSettingsFieldset}>
-                  <legend>Release types</legend>
-                  {(
-                    [
-                      ['include_albums', 'Albums'],
-                      ['include_eps', 'EPs'],
-                      ['include_singles', 'Singles'],
-                      ['include_live', 'Live'],
-                      ['include_remixes', 'Remixes'],
-                      ['include_acoustic', 'Acoustic'],
-                      ['include_compilations', 'Compilations'],
-                      ['include_instrumentals', 'Instrumentals'],
-                      ['include_other_artists', 'Other artists'],
-                    ] as const
-                  ).map(([field, label]) => (
-                    <label key={field} className={styles.checkOption}>
-                      <input
-                        type="checkbox"
-                        checked={watchlist[field]}
-                        onChange={(event) => setBoolean(field, event.target.checked)}
-                      />
-                      {label}
-                    </label>
-                  ))}
-                </fieldset>
-                <div className={styles.artistSettingsGrid}>
-                  <label>
-                    <span>Discovery lookback</span>
-                    <select
-                      className={styles.select}
-                      value={watchlist.lookback_days == null ? '' : String(watchlist.lookback_days)}
-                      onChange={(event) =>
-                        setDraft((current) =>
-                          current
-                            ? {
-                                ...current,
-                                lookback_days:
-                                  event.target.value === '' ? null : Number(event.target.value),
-                              }
-                            : current,
-                        )
-                      }
-                    >
-                      <option value="">Use global setting</option>
-                      <option value="0">From now on</option>
-                      <option value="7">Last 7 days</option>
-                      <option value="30">Last 30 days</option>
-                      <option value="90">Last 90 days</option>
-                      <option value="365">Last year</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span>Preferred metadata provider</span>
-                    <select
-                      className={styles.select}
-                      value={watchlist.preferred_metadata_source ?? ''}
-                      onChange={(event) =>
-                        setDraft((current) =>
-                          current
-                            ? { ...current, preferred_metadata_source: event.target.value || null }
-                            : current,
-                        )
-                      }
-                    >
-                      <option value="">
-                        App default
-                        {settingsQuery.data?.global_metadata_source
-                          ? ` (${settingsQuery.data.global_metadata_source})`
-                          : ''}
-                      </option>
-                      {sourceOptions.map((source) => (
-                        <option key={source} value={source}>
-                          {source.charAt(0).toUpperCase() + source.slice(1)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    <span>Library-v2 discography rule</span>
-                    <select
-                      className={styles.select}
-                      value={watchlist.monitor_new_items}
-                      onChange={(event) =>
-                        setDraft((current) =>
-                          current
-                            ? {
-                                ...current,
-                                monitor_new_items: event.target.value as 'all' | 'new' | 'none',
-                              }
-                            : current,
-                        )
-                      }
-                    >
-                      <option value="all">Add newly found releases to Wishlist</option>
-                      <option value="new">Only releases newer than the last sync</option>
-                      <option value="none">Don't add newly found releases to Wishlist</option>
-                    </select>
-                  </label>
+            {!artist.monitored ? (
+              <SettingsGroup title="Future releases">
+                <div className={ls.empty}>
+                  Add the artist to the Watchlist: then new releases are discovered here, with
+                  release types, lookback and auto-download set in this dialog.
                 </div>
-              </section>
-
-              <section className={styles.artistSettingsSection}>
-                <h4>Existing releases and tracks</h4>
-                <p className={styles.muted}>
-                  Change Wanted for what Library v2 already shows. Applies at once; the Watchlist
-                  and the quality profile stay as they are.
-                </p>
-                <div className={styles.artistSettingsActions}>
-                  {(
-                    [
-                      [
-                        'all',
-                        true,
-                        'Add all existing releases to Wishlist',
-                        'Wishlist all',
-                        styles.toolButton,
-                      ],
-                      [
-                        'missing',
-                        true,
-                        'Add missing releases to Wishlist',
-                        'Wishlist missing only',
-                        styles.toolButton,
-                      ],
-                      [
-                        'all',
-                        false,
-                        'Remove existing releases from Wishlist',
-                        'Remove all from Wishlist',
-                        styles.btnDanger,
-                      ],
-                    ] as const
-                  ).map(([scope, monitored, label, text, className]) => (
-                    <button
-                      key={label}
-                      type="button"
-                      className={className}
-                      data-requires-write=""
-                      disabled={bulkBusy !== null || !canWrite}
-                      onClick={() => void applyExistingReleaseStrategy(scope, monitored, label)}
-                    >
-                      {bulkBusy === label ? 'Applying…' : text}
-                    </button>
-                  ))}
-                </div>
-                {bulkMessage ? (
-                  <div
-                    className={
-                      bulkMessage.tone === 'ok' ? styles.mutationSuccess : styles.mutationError
-                    }
-                    role={bulkMessage.tone === 'ok' ? 'status' : 'alert'}
-                  >
-                    {bulkMessage.text}
+              </SettingsGroup>
+            ) : settingsQuery.isError ? (
+              <div className={styles.mutationError} role="alert">
+                {mutationErrorMessage(settingsQuery.error, 'Artist settings could not be loaded')}
+              </div>
+            ) : !watchlist ? (
+              <div className={styles.inlineLoading}>Loading Watchlist Artist Settings…</div>
+            ) : (
+              <>
+                <SettingsGroup
+                  title="Future releases"
+                  hint="The Watchlist scanner’s settings: what is discovered, and whether new releases enter the download pipeline."
+                >
+                  <div className={ls.rows}>
+                    <SwitchRow
+                      label="Auto-download new releases"
+                      sub="Off means follow/discover only; releases are not added to Wanted."
+                      checked={watchlist.auto_download}
+                      onChange={(checked) => setBoolean('auto_download', checked)}
+                    />
                   </div>
-                ) : null}
-              </section>
-            </>
-          )}
-        </div>
+                  <fieldset className={ls.group}>
+                    <legend className={ls.groupHint}>Release types</legend>
+                    <div className={ls.chips}>
+                      {(
+                        [
+                          ['include_albums', 'Albums'],
+                          ['include_eps', 'EPs'],
+                          ['include_singles', 'Singles'],
+                          ['include_live', 'Live albums'],
+                          ['include_live_tracks', 'Live tracks'],
+                          ['include_remixes', 'Remixes'],
+                          ['include_acoustic', 'Acoustic'],
+                          ['include_compilations', 'Compilations'],
+                          ['include_instrumentals', 'Instrumentals'],
+                          ['include_other_artists', 'Other artists'],
+                        ] as const
+                      ).map(([field, label]) => (
+                        <ChipCheck
+                          key={field}
+                          label={label}
+                          checked={watchlist[field]}
+                          onChange={(checked) => setBoolean(field, checked)}
+                        />
+                      ))}
+                    </div>
+                  </fieldset>
+                  <div className={ls.fields}>
+                    <label className={ls.field}>
+                      <span>Discovery lookback</span>
+                      <select
+                        className={styles.select}
+                        value={
+                          watchlist.lookback_days == null ? '' : String(watchlist.lookback_days)
+                        }
+                        onChange={(event) =>
+                          setDraft((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  lookback_days:
+                                    event.target.value === '' ? null : Number(event.target.value),
+                                }
+                              : current,
+                          )
+                        }
+                      >
+                        <option value="">Use global setting</option>
+                        <option value="0">From now on</option>
+                        <option value="7">Last 7 days</option>
+                        <option value="30">Last 30 days</option>
+                        <option value="90">Last 90 days</option>
+                        <option value="365">Last year</option>
+                      </select>
+                    </label>
+                    <label className={ls.field}>
+                      <span>Preferred metadata provider</span>
+                      <select
+                        className={styles.select}
+                        value={watchlist.preferred_metadata_source ?? ''}
+                        onChange={(event) =>
+                          setDraft((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  preferred_metadata_source: event.target.value || null,
+                                }
+                              : current,
+                          )
+                        }
+                      >
+                        <option value="">
+                          App default
+                          {settingsQuery.data?.global_metadata_source
+                            ? ` (${settingsQuery.data.global_metadata_source})`
+                            : ''}
+                        </option>
+                        {sourceOptions.map((source) => (
+                          <option key={source} value={source}>
+                            {source.charAt(0).toUpperCase() + source.slice(1)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className={ls.field}>
+                      <span>Discography rule</span>
+                      <select
+                        className={styles.select}
+                        disabled={!canWrite}
+                        value={watchlist.monitor_new_items}
+                        onChange={(event) =>
+                          setDraft((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  monitor_new_items: event.target.value as 'all' | 'new' | 'none',
+                                }
+                              : current,
+                          )
+                        }
+                      >
+                        <option value="all">Add newly found releases to Wishlist</option>
+                        <option value="new">Only releases newer than the last sync</option>
+                        <option value="none">Don't add newly found releases to Wishlist</option>
+                      </select>
+                    </label>
+                  </div>
+                </SettingsGroup>
 
-        <aside className={styles.artistSettingsSide}>
-          <ArtistSettingsIdentity
-            artist={artist}
-            stats={settingsQuery.data?.artist_stats}
-            watchlist={watchlist}
-          />
-          <AudiobookRouteSetting name={artist.name} />
-        </aside>
+                <SettingsGroup
+                  title="Existing releases and tracks"
+                  hint="Change Wanted for what the Library already shows. Applies at once; the Watchlist and the quality profile stay as they are."
+                >
+                  <div className={ls.chips}>
+                    {(
+                      [
+                        ['all', true, 'Add all existing releases to Wishlist', 'Wishlist all', ''],
+                        [
+                          'missing',
+                          true,
+                          'Add missing releases to Wishlist',
+                          'Wishlist missing only',
+                          '',
+                        ],
+                        [
+                          'all',
+                          false,
+                          'Remove existing releases from Wishlist',
+                          'Remove all from Wishlist',
+                          ls.capsuleDanger,
+                        ],
+                      ] as const
+                    ).map(([scope, monitored, label, text, tone]) => (
+                      <button
+                        key={label}
+                        type="button"
+                        className={`${ls.capsule} ${tone}`}
+                        title={label}
+                        data-requires-write=""
+                        disabled={bulkBusy !== null || !canWrite}
+                        onClick={() => void applyExistingReleaseStrategy(scope, monitored, label)}
+                      >
+                        {bulkBusy === label ? 'Applying…' : text}
+                      </button>
+                    ))}
+                  </div>
+                  {bulkMessage ? (
+                    <div
+                      className={
+                        bulkMessage.tone === 'ok' ? styles.mutationSuccess : styles.mutationError
+                      }
+                      role={bulkMessage.tone === 'ok' ? 'status' : 'alert'}
+                    >
+                      {bulkMessage.text}
+                    </div>
+                  ) : null}
+                </SettingsGroup>
+              </>
+            )}
+          </div>
+
+          <aside className={ls.stack}>
+            <ArtistSettingsIdentity artist={artist} watchlist={watchlist} />
+            <AudiobookRouteSetting name={artist.name} />
+          </aside>
+        </div>
       </div>
     </LibraryToolDialog>
   );
 }
 
-/** Who these settings are for: the artist as Library v2 and, when monitored,
- *  the Watchlist know it -- ids, matches and a few of its releases. */
-function ArtistSettingsIdentity({
+/** Whose settings these are, leading the sheet: the artist's photo and name,
+ *  what the Watchlist knows of it, and every id it goes by. */
+function ArtistSettingsHero({
   artist,
   stats,
   watchlist,
@@ -2585,73 +2515,95 @@ function ArtistSettingsIdentity({
 }) {
   const name = stats?.name || watchlist?.watchlist_name || artist.name;
   const genres = stats?.genres?.length ? stats.genres : artist.genres;
+  const matchStat = stats ? formatMatchStat(stats) : null;
   const providerIds = Object.entries(watchlist?.provider_ids ?? artist.provider_ids ?? {}).filter(
     (entry): entry is [string, string] => Boolean(entry[1]),
   );
-  const releases = [...artist.albums, ...(artist.eps ?? []), ...artist.singles];
   return (
-    <section className={styles.artistSettingsSection}>
-      <h4>{watchlist ? 'Watchlist identity' : 'Artist'}</h4>
-      <div className={styles.artistSettingsIdentity}>
-        <div className={styles.artistSettingsIdentityHead}>
-          <Artwork
-            src={artist.image_url || stats?.image_url || watchlist?.watchlist_image_url || ''}
-            alt={name}
-            className={styles.artistSettingsPhoto}
-            thumb
-          />
-          <div className={styles.artistSettingsIdentityBody}>
-            <strong className={styles.artistSettingsIdentityName}>{name}</strong>
-            {genres.length > 0 ? (
-              <span className={styles.artistSettingsGenres}>{genres.join(' · ')}</span>
-            ) : null}
-            {stats && formatMatchStat(stats) ? (
-              <span className={styles.muted}>{formatMatchStat(stats)}</span>
-            ) : null}
-            <span className={styles.muted}>
-              {watchlist ? 'Linked to the admin Watchlist.' : 'Not on the Watchlist.'}
+    <>
+      <div className={ls.hero}>
+        <Artwork
+          src={artist.image_url || stats?.image_url || watchlist?.watchlist_image_url || ''}
+          alt={name}
+          className={ls.heroPhoto}
+          thumb
+        />
+        <div className={ls.heroWho}>
+          <strong className={ls.heroName}>{name}</strong>
+          {genres.length > 0 ? (
+            <span className={ls.heroSub} title={genres.join(' · ')}>
+              {genres.join(' · ')}
             </span>
-          </div>
+          ) : null}
+          {matchStat ? <span className={ls.heroSub}>{matchStat}</span> : null}
         </div>
-        {providerIds.length > 0 ? (
-          <div className={styles.artistSettingsProviderIds}>
-            {providerIds.map(([provider, id]) => {
-              // A service with no artist page (Amazon) keeps the copy button.
-              const url = getServiceUrl(provider, 'artist', id);
-              return url ? (
-                <a
-                  key={provider}
-                  href={url}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  title={`Open on ${provider}: ${id}`}
-                >
-                  <strong>{provider}</strong>
-                  <span>{id}</span>
-                  <small>Open</small>
-                </a>
-              ) : (
-                <button
-                  type="button"
-                  key={provider}
-                  title={`Copy ${provider} ID: ${id}`}
-                  onClick={() => void navigator.clipboard?.writeText(id)}
-                >
-                  <strong>{provider}</strong>
-                  <span>{id}</span>
-                  <small>Copy</small>
-                </button>
-              );
-            })}
-          </div>
-        ) : null}
+        <span className={`${ls.state} ${artist.monitored ? '' : ls.stateOff}`}>
+          {artist.monitored ? 'On your Watchlist' : 'Not on your Watchlist'}
+        </span>
+      </div>
+      {providerIds.length > 0 ? (
+        <div className={ls.ids}>
+          {providerIds.map(([provider, id]) => {
+            // A service with no artist page (Amazon) keeps the copy button.
+            const url = getServiceUrl(provider, 'artist', id);
+            return url ? (
+              <a
+                key={provider}
+                className={ls.idChip}
+                href={url}
+                target="_blank"
+                rel="noreferrer noopener"
+                title={`Open on ${provider}: ${id}`}
+              >
+                <strong>{provider}</strong>
+                <span>{id}</span>
+                <small>Open</small>
+              </a>
+            ) : (
+              <button
+                type="button"
+                key={provider}
+                className={ls.idChip}
+                title={`Copy ${provider} ID: ${id}`}
+                onClick={() => void navigator.clipboard?.writeText(id)}
+              >
+                <strong>{provider}</strong>
+                <span>{id}</span>
+                <small>Copy</small>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+/** Who these settings are for, as Library v2 and, when monitored, the
+ *  Watchlist know it: its matches and a few of its releases. */
+function ArtistSettingsIdentity({
+  artist,
+  watchlist,
+}: {
+  artist: LibraryV2ArtistDetail;
+  watchlist: LibraryV2ArtistSettings | null;
+}) {
+  // each release once: an album held twice is not two of the four shown
+  const releases = releaseLeads([...artist.albums, ...(artist.eps ?? []), ...artist.singles]);
+  return (
+    <>
+      <SettingsGroup
+        title={watchlist ? 'Watchlist identity' : 'Artist'}
+        hint={watchlist ? 'Linked to the admin Watchlist.' : 'Not on the Watchlist.'}
+      >
         <ArtistMatchChips
           artist={artist}
           watchlistRowId={watchlist?.watchlist_row_id ?? undefined}
         />
-        {releases.length ? (
-          <div className={styles.artistSettingsReleaseContext}>
-            <span>Release context in Library v2</span>
+      </SettingsGroup>
+      {releases.length ? (
+        <SettingsGroup title="Releases in your Library">
+          <div className={ls.context}>
             <MatchReleaseStrip
               albums={releases.slice(0, 4).map((album) => ({
                 id: String(album.id),
@@ -2663,9 +2615,9 @@ function ArtistSettingsIdentity({
               }))}
             />
           </div>
-        ) : null}
-      </div>
-    </section>
+        </SettingsGroup>
+      ) : null}
+    </>
   );
 }
 
@@ -3224,11 +3176,16 @@ export function AlbumOverflowMenu({
       .catch(() => window.showToast?.('Could not copy the link', 'error'));
   };
   const canWrite = useLibraryV2CanWrite();
+  // tags and loudness touch files only: a profile may in a library of its own
+  // (the server checks every file is its own)
+  const canTag = useLibraryV2CanWish();
   const [open, setOpen] = useState(false);
   const [showSubmenu, setShowSubmenu] = useState(false);
   const [showRetag, setShowRetag] = useState(false);
+  const [showUseFileTags, setShowUseFileTags] = useState(false);
   const [showReorganize, setShowReorganize] = useState(false);
   const [showReassign, setShowReassign] = useState(false);
+  const [showVersions, setShowVersions] = useState(false);
   const [showArtPicker, setShowArtPicker] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
@@ -3319,22 +3276,36 @@ export function AlbumOverflowMenu({
                 type="button"
                 className={styles.overflowMenuItem}
                 data-requires-write=""
-                disabled={!canWrite}
+                disabled={!canTag}
                 onClick={() => {
-                  if (!canWrite) return;
+                  if (!canTag) return;
                   setShowRetag(true);
                   setOpen(false);
                 }}
               >
                 Preview Retag
               </button>
+              {/* #2070: the other direction, the Library takes what the files say */}
               <button
                 type="button"
                 className={styles.overflowMenuItem}
                 data-requires-write=""
-                disabled={replaygain.isPending || !canWrite}
+                disabled={!canTag}
                 onClick={() => {
-                  if (!canWrite) return;
+                  if (!canTag) return;
+                  setShowUseFileTags(true);
+                  setOpen(false);
+                }}
+              >
+                Use File Tags
+              </button>
+              <button
+                type="button"
+                className={styles.overflowMenuItem}
+                data-requires-write=""
+                disabled={replaygain.isPending || !canTag}
+                onClick={() => {
+                  if (!canTag) return;
                   replaygain.mutate();
                   setOpen(false);
                 }}
@@ -3371,6 +3342,21 @@ export function AlbumOverflowMenu({
                 }}
               >
                 Reassign to another artist…
+              </button>
+              {/* #2145: picard's "other versions": point the album at the right edition */}
+              <button
+                type="button"
+                className={styles.overflowMenuItem}
+                data-requires-write=""
+                disabled={!canWrite}
+                title="Pick which edition this album is (deluxe, remaster, a release with more tracks)"
+                onClick={() => {
+                  if (!canWrite) return;
+                  setShowVersions(true);
+                  setOpen(false);
+                }}
+              >
+                Other versions…
               </button>
               <button
                 type="button"
@@ -3435,7 +3421,7 @@ export function AlbumOverflowMenu({
                     entity="albums"
                     entityId={album.id}
                     entityName={album.title}
-                    wrapperRef={wrapRef}
+                    insideRefs={[wrapRef, menuRef]}
                     align="right"
                     submenu
                     onClose={() => {
@@ -3469,9 +3455,9 @@ export function AlbumOverflowMenu({
             type="button"
             className={styles.inlineRetry}
             data-requires-write=""
-            disabled={replaygain.isPending || !canWrite}
+            disabled={replaygain.isPending || !canTag}
             onClick={() => {
-              if (canWrite) replaygain.mutate();
+              if (canTag) replaygain.mutate();
             }}
           >
             Retry
@@ -3487,6 +3473,14 @@ export function AlbumOverflowMenu({
           id={album.id}
           title={album.title}
           onClose={() => setShowRetag(false)}
+        />
+      ) : null}
+      {showUseFileTags ? (
+        <UseFileTagsModal
+          entity="albums"
+          id={album.id}
+          title={album.title}
+          onClose={() => setShowUseFileTags(false)}
         />
       ) : null}
       {showReorganize ? (
@@ -3510,6 +3504,14 @@ export function AlbumOverflowMenu({
           onApplied={() => {
             void queryClient.invalidateQueries({ queryKey: LIBRARY_V2_QUERY_KEY });
           }}
+        />
+      ) : null}
+      {showVersions ? (
+        <AlbumVersionsModal
+          albumId={album.id}
+          albumTitle={album.title}
+          artistName={String(album.artist_name || '')}
+          onClose={() => setShowVersions(false)}
         />
       ) : null}
       {showArtPicker ? (
@@ -3669,6 +3671,26 @@ const MAINTENANCE_JOBS: Array<{
     id: 'album_tag_consistency',
     label: 'Check Album Tags',
     desc: 'Find inconsistent album artist, year and artwork tags for this artist.',
+    scope: 'artist',
+  },
+  // #2004: the cleanup checks, run against this artist's files instead of a
+  // multi-terabyte library. each one only files findings to review.
+  {
+    id: 'dead_file_cleaner',
+    label: 'Find Dead File Paths',
+    desc: 'Check that every file linked to this artist still exists. A file missed on two runs in a row becomes a finding; approve it to drop the dead reference.',
+    scope: 'artist',
+  },
+  {
+    id: 'path_drift_reconcile',
+    label: 'Find Renamed Files',
+    desc: 'Find this artist’s tracks whose stored path no longer exists because the file was renamed in its folder, and propose the new path. Nothing on disk changes.',
+    scope: 'artist',
+  },
+  {
+    id: 'native_duplicate_detector',
+    label: 'Find Duplicates',
+    desc: 'Find duplicate releases and duplicate files for this artist, to review and merge.',
     scope: 'artist',
   },
   // No "Find Quality Upgrades" entry: queueing a track that sits below its
@@ -4920,10 +4942,15 @@ function UnmatchedImportsBanner() {
   );
 }
 
+/** #2108: the grids' card sizes; base is what their css picks on a desktop */
+const ARTIST_CARD_SIZES: CardSizeRange = { min: 130, max: 360, base: 200 };
+const ALBUM_CARD_SIZES: CardSizeRange = { min: 110, max: 320, base: 160 };
+
 function ArtistIndexView() {
   const search = Route.useSearch();
   const navigate = useNavigate();
   const canWrite = useLibraryV2CanWrite();
+  const canWish = useLibraryV2CanWish();
   // Debounce the filter box: navigating per keystroke fires a request each key.
   const artistFilter = useUrlSyncedFilter(
     search.q,
@@ -4966,17 +4993,53 @@ function ArtistIndexView() {
       letter: search.letter,
       source: search.source,
       quality: search.quality,
+      review: search.review,
+      dir: search.dir,
+      completion: search.completion,
+      missingMin: search.missingMin,
+      missingMax: search.missingMax,
+      pctMin: search.pctMin,
+      pctMax: search.pctMax,
+      credit: search.credit,
     }),
   );
 
   const artists = artistsQuery.data?.artists ?? [];
+  // #2109: pick several artists, run one action on them all. shift-click
+  // ranges follow the page's order
+  const pageOrder = useMemo(() => artists.map((a) => a.id), [artists]);
+  const selection = useArtistSelection(pageOrder);
+  // #2108: each grid keeps its own card size, through a trip to the table
+  const [cardSize, setCardSize] = useCardSize(
+    'soulsync:library-card-size:artists',
+    ARTIST_CARD_SIZES,
+  );
+  // #2107: the overview is optional and stays how you left it
+  const [overviewOpen, setOverviewOpen] = useOverviewOpen();
+  // #2107: the next plain visit to the Library opens this list the same way
+  const profileId = useProfile()?.profileId;
+  useEffect(() => {
+    rememberIndex(profileId, search);
+  }, [profileId, search]);
+  // ...and the trip to an artist and back lands where you were
+  const scrollAnchor = useIndexScrollMemory(
+    JSON.stringify([search.view, search.sort, search.dir, search.page, search.q]),
+    !artistsQuery.isLoading && artists.length > 0,
+  );
   const pagination = artistsQuery.data?.pagination;
   const hasActiveArtistFilters =
     Boolean(search.q.trim()) ||
     search.monitored !== 'all' ||
     search.letter !== 'all' ||
     Boolean(search.source) ||
-    search.quality === 'upgradable';
+    search.quality === 'upgradable' ||
+    Boolean(search.review) ||
+    Boolean(search.completion) ||
+    search.missingMin !== undefined ||
+    search.missingMax !== undefined ||
+    search.pctMin !== undefined ||
+    search.pctMax !== undefined ||
+    Boolean(search.credit);
   const hasNoArtistResults =
     !artistsQuery.isLoading &&
     !artistsQuery.isError &&
@@ -4987,8 +5050,15 @@ function ArtistIndexView() {
   // render "Your library is empty — Import library" to a user with 900 artists
   // and offer them a full re-import. `AlbumDetailView` already reads `isError`;
   // this was the inconsistency, not the house style.
+  // review 5 R5-L-2: empty means the library has no artists at all. a filter
+  // (watched, letter, source, could be better) with no hits, or a page past
+  // the end, is "no artists match", not "import your library"
   const isEmpty =
-    !artistsQuery.isLoading && !artistsQuery.isError && artists.length === 0 && !search.q;
+    !artistsQuery.isLoading &&
+    !artistsQuery.isError &&
+    artists.length === 0 &&
+    !hasActiveArtistFilters &&
+    (pagination?.total_count ?? 0) === 0;
 
   // showLibraryDownloadsSection (shared-helpers.js) renders the per-artist
   // download bubbles on the library page. It is bound to `artistDownloadBubbles`
@@ -5015,6 +5085,7 @@ function ArtistIndexView() {
         </div>
         <div className={styles.headerActions}>
           <LibraryRadioButton />
+          {canWrite ? <LibraryRecycleBinButton /> : null}
           <LibraryMoreMenu />
           <ImportButton
             hasArtists={
@@ -5036,26 +5107,7 @@ function ArtistIndexView() {
           value={artistFilter.value}
           onChange={artistFilter.onChange}
         />
-        <select
-          aria-label="Sort artists"
-          id="library-sort"
-          className={styles.select}
-          value={search.sort}
-          onChange={(e) =>
-            void navigate({
-              search: (p) => ({
-                ...p,
-                sort: e.target.value as typeof p.sort,
-                page: 1,
-              }),
-            })
-          }
-        >
-          <option value="name">Name</option>
-          <option value="added">Recently added</option>
-          <option value="albums">Album count</option>
-          <option value="tracks">Track count</option>
-        </select>
+        <ArtistSortControl />
         <LibraryFilterMenu />
         <div className={styles.viewToggle} id="library-view-toggle">
           <button
@@ -5075,12 +5127,48 @@ function ArtistIndexView() {
         </div>
         {isTableView ? (
           <ArtistTableOptionsMenu columns={artistTableColumns} columnOrder={artistColumnOrder} />
-        ) : null}
+        ) : (
+          <CardSizeSlider
+            label="Artist card size"
+            size={cardSize}
+            range={ARTIST_CARD_SIZES}
+            onChange={setCardSize}
+          />
+        )}
+        <OverviewToggle open={overviewOpen} onToggle={() => setOverviewOpen(!overviewOpen)} />
       </div>
+
+      {overviewOpen ? <LibraryOverview /> : null}
 
       <LibraryActiveFilters count={pagination?.total_count} />
 
+      <ArtistBulkBar
+        selection={selection}
+        pageArtists={artists}
+        totalMatching={pagination?.total_count ?? 0}
+        canWrite={canWrite}
+        canWish={canWish}
+        filters={{
+          q: search.q,
+          sort: search.sort,
+          monitored: search.monitored,
+          letter: search.letter,
+          source: search.source,
+          quality: search.quality,
+          review: search.review,
+          dir: search.dir,
+          completion: search.completion,
+          missingMin: search.missingMin,
+          missingMax: search.missingMax,
+          pctMin: search.pctMin,
+          pctMax: search.pctMax,
+          credit: search.credit,
+        }}
+      />
+
       <LibraryAlphabetBar />
+
+      <div ref={scrollAnchor} aria-hidden="true" />
 
       {/* Host for the vanilla download bubbles — see the note above. Sits
           directly above the artist list, where the vanilla page put it. */}
@@ -5124,6 +5212,13 @@ function ArtistIndexView() {
                   letter: 'all',
                   source: '',
                   quality: '' as const,
+                  review: '' as const,
+                  completion: '' as const,
+                  missingMin: undefined,
+                  missingMax: undefined,
+                  pctMin: undefined,
+                  pctMax: undefined,
+                  credit: '' as const,
                   page: 1,
                 }),
               });
@@ -5133,15 +5228,20 @@ function ArtistIndexView() {
           </button>
           <LibrarySearchFallback noun="artists" />
         </div>
-      ) : search.view === 'table' ? (
-        <ArtistTable
-          artists={artists}
-          columns={artistTableColumns}
-          columnOrder={artistColumnOrder}
-          profileNameById={profileNameById}
-        />
       ) : (
-        <ArtistCards artists={artists} />
+        <ShowMissingProvider>
+          {search.view === 'table' ? (
+            <ArtistTable
+              artists={artists}
+              columns={artistTableColumns}
+              columnOrder={artistColumnOrder}
+              profileNameById={profileNameById}
+              selection={selection}
+            />
+          ) : (
+            <ArtistCards artists={artists} cardSize={cardSize} selection={selection} />
+          )}
+        </ShowMissingProvider>
       )}
 
       <PageNav
@@ -5165,6 +5265,11 @@ const ALBUM_SORT_LABELS: Record<LibraryV2AlbumSort, string> = {
 function AlbumIndexView() {
   const search = Route.useSearch();
   const navigate = useNavigate();
+  // #2108: its own size: smaller artist cards and bigger covers can coexist
+  const [albumCardSize, setAlbumCardSize] = useCardSize(
+    'soulsync:library-card-size:albums',
+    ALBUM_CARD_SIZES,
+  );
   const openArtist = useOpenArtist();
   const canWrite = useLibraryV2CanWrite();
   const albumFilter = useUrlSyncedFilter(
@@ -5202,6 +5307,7 @@ function AlbumIndexView() {
         </div>
         <div className={styles.headerActions}>
           <LibraryRadioButton />
+          {canWrite ? <LibraryRecycleBinButton /> : null}
         </div>
       </header>
 
@@ -5232,6 +5338,12 @@ function AlbumIndexView() {
           ))}
         </select>
         <LibraryFilterMenu albums />
+        <CardSizeSlider
+          label="Album card size"
+          size={albumCardSize}
+          range={ALBUM_CARD_SIZES}
+          onChange={setAlbumCardSize}
+        />
       </div>
 
       <LibraryActiveFilters albums count={pagination?.total_count} />
@@ -5257,7 +5369,11 @@ function AlbumIndexView() {
           <LibrarySearchFallback noun="albums" />
         </div>
       ) : (
-        <div className="library-artists-grid" id="library-albums-grid">
+        <div
+          className="library-artists-grid"
+          id="library-albums-grid"
+          style={cardGridStyle(albumCardSize)}
+        >
           {albums.map((album, index) => (
             <AlbumListCard
               key={album.id}
@@ -5524,19 +5640,18 @@ function SongIndexView() {
         </div>
         <div className={styles.headerActions}>
           <LibraryRadioButton />
+          {canWrite ? <LibraryRecycleBinButton /> : null}
         </div>
       </header>
 
       <div className={styles.toolbar}>
         <LibraryScopePicker />
         <LibrarySectionTabs />
-        <input
-          aria-label="Filter songs"
-          className={styles.searchInput}
-          type="text"
+        <LibrarySearchInput
+          label="Filter songs"
           placeholder="Filter songs or artists…"
           value={songFilter.value}
-          onChange={(e) => songFilter.onChange(e.target.value)}
+          onChange={songFilter.onChange}
         />
         <select
           aria-label="Sort songs"
@@ -5646,7 +5761,9 @@ export function librarySectionSearch<T extends Record<string, unknown>>(
     ...previous,
     ...songOnly,
     section,
-    q: '',
+    // G15-8: "beatles" on Artists, then Songs, finds the Beatles' songs, as
+    // 3.6.1's switchView did. Wanted has no search of its own
+    q: section === 'wanted' ? '' : typeof previous.q === 'string' ? previous.q : '',
     artist: undefined,
     album: undefined,
     page: 1,
@@ -5763,10 +5880,19 @@ function WantedIndexView() {
       q: search.q,
       page: search.page,
       wantedKind: search.wantedKind,
+      wantedArtist: search.wantedArtist,
     }),
   );
   const rows = wantedQuery.data?.tracks ?? [];
   const pagination = wantedQuery.data?.pagination;
+  // #2106: one artist's missing tracks (from their count on the list), with
+  // what the download queue is doing with each
+  const artistQueue = useQuery({
+    ...libraryV2QueueStatusQueryOptions('artists', search.wantedArtist ?? 0),
+    enabled: Boolean(search.wantedArtist),
+  });
+  const queueTracks = artistQueue.data?.tracks ?? {};
+  const showQueue = Boolean(search.wantedArtist);
 
   function setKind(kind: LibraryV2WantedKind) {
     void navigate({ search: (p) => ({ ...p, wantedKind: kind, page: 1 }) });
@@ -5818,6 +5944,29 @@ function WantedIndexView() {
         />
       </div>
 
+      {search.wantedArtist ? (
+        <div className={extrasStyles.chips}>
+          <button
+            type="button"
+            className={extrasStyles.chip}
+            aria-label={`Show every artist again, not only ${search.wantedArtistName ?? 'this one'}`}
+            onClick={() =>
+              void navigate({
+                search: (p) => ({
+                  ...p,
+                  wantedArtist: undefined,
+                  wantedArtistName: undefined,
+                  page: 1,
+                }),
+              })
+            }
+          >
+            Only {search.wantedArtistName ?? 'this artist'}
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+      ) : null}
+
       {wantedQuery.isLoading ? (
         <div className={styles.loading}>Loading…</div>
       ) : wantedQuery.isError ? (
@@ -5850,6 +5999,7 @@ function WantedIndexView() {
                 <th>Album</th>
                 <th>Track</th>
                 {search.wantedKind === 'cutoff_unmet' ? <th>Quality</th> : null}
+                {showQueue ? <th>Status</th> : null}
                 <th />
               </tr>
             </thead>
@@ -5891,6 +6041,15 @@ function WantedIndexView() {
                   {search.wantedKind === 'cutoff_unmet' ? (
                     <td>{formatWantedFileQuality(row.file) ?? '—'}</td>
                   ) : null}
+                  {showQueue ? (
+                    <td>
+                      {queueTracks[row.track_id] ? (
+                        <QueueStatusBadge status={queueTracks[row.track_id]} />
+                      ) : (
+                        <span className={styles.wantedIdle}>Not searching</span>
+                      )}
+                    </td>
+                  ) : null}
                   <td className={styles.trackActions}>
                     <IconActionButton
                       icon="automatic"
@@ -5922,13 +6081,17 @@ export function ArtistCard({
   index = 0,
   onOpen,
   upgradable,
+  selection,
 }: {
   artist: LibraryV2ArtistSummary;
   index?: number;
   onOpen: (artistId: number) => void;
   /** tracks that could be better, once counted */
   upgradable?: number;
+  /** #2109: the list's multi-select, when it has one */
+  selection?: ArtistSelection;
 }) {
+  const picked = selection?.selected.has(artist.id) ?? false;
   // dev's artist tile, with nick's monitor toggle and the media-server tag on
   // top. the open button and the toggle stay siblings, never nested
   const better = upgradable ?? artist.upgradable_count;
@@ -5937,6 +6100,8 @@ export function ArtistCard({
       className="library-artist-card"
       data-artist-id={String(artist.id)}
       data-artist-name={artist.name}
+      data-collection=""
+      data-selected={picked ? '' : undefined}
       style={{
         ...CARD_FRAME,
         animation: cardFadeIn(index),
@@ -5968,9 +6133,6 @@ export function ArtistCard({
             {artist.name}
           </h3>
           <div className="library-artist-stats">
-            {artist.tracks_present ? (
-              <span className="library-artist-stat">{tracksLabel(artist.tracks_present)}</span>
-            ) : null}
             {better ? (
               <span
                 className="library-artist-stat library-artist-upgradable"
@@ -5982,6 +6144,16 @@ export function ArtistCard({
           </div>
         </div>
       </button>
+      {/* #2106: outside the open button, so its missing count can be a link */}
+      <CollectionMeter artist={artist} variant="card" />
+      {selection ? (
+        <SelectBox
+          className={bulkStyles.cardCheck}
+          checked={picked}
+          label={`Select ${artist.name}`}
+          onToggle={(shift) => selection.toggle(artist.id, shift)}
+        />
+      ) : null}
       <ClassicCardBadges ids={artist.provider_ids} entity="artist" />
       <ArtistCardPlayButton artist={artist} className={`library-artist-play-btn ${classic.play}`} />
       <span className={`${styles.cardMonitor} ${classic.monitor}`}>
@@ -5996,17 +6168,31 @@ export function ArtistCard({
   );
 }
 
-function ArtistCards({ artists }: { artists: LibraryV2ArtistSummary[] }) {
+function ArtistCards({
+  artists,
+  cardSize = null,
+  selection,
+}: {
+  artists: LibraryV2ArtistSummary[];
+  cardSize?: number | null;
+  selection?: ArtistSelection;
+}) {
   const openArtist = useOpenArtist();
   const upgradable = useUpgradableCounts(artists);
   return (
-    <div className="library-artists-grid" id="library-artists-grid">
+    <div
+      className="library-artists-grid"
+      id="library-artists-grid"
+      style={cardGridStyle(cardSize)}
+      data-selecting={selection && selection.selected.size > 0 ? '' : undefined}
+    >
       {artists.map((artist, index) => (
         <ArtistCard
           key={artist.id}
           index={index}
           artist={artist}
           upgradable={upgradable.get(artist.id)}
+          selection={selection}
           onOpen={openArtist}
         />
       ))}
@@ -6019,11 +6205,13 @@ function ArtistTable({
   columns,
   columnOrder,
   profileNameById,
+  selection,
 }: {
   artists: LibraryV2ArtistSummary[];
   columns: LibraryV2ArtistTableColumns;
   columnOrder: (keyof LibraryV2ArtistTableColumns)[];
   profileNameById: Map<number, string>;
+  selection?: ArtistSelection;
 }) {
   const openArtist = useOpenArtist();
 
@@ -6112,19 +6300,47 @@ function ArtistTable({
       <table className={`${styles.table} ${styles.artistTable}`} id="library-artists-grid">
         <thead>
           <tr>
+            {selection ? (
+              <th className={styles.colSelect}>
+                <SelectBox
+                  checked={artists.length > 0 && artists.every((a) => selection.selected.has(a.id))}
+                  label="Select every artist on this page"
+                  onToggle={() =>
+                    selection.setMany(
+                      artists.map((a) => a.id),
+                      !artists.every((a) => selection.selected.has(a.id)),
+                    )
+                  }
+                />
+              </th>
+            ) : null}
             <th className={styles.colMonitor} title="On the Wishlist">
               Wish
             </th>
             <th>Artist</th>
-            <th className={styles.colNum}>Albums</th>
-            <th className={styles.colNum}>Singles</th>
-            <th className={styles.colNum}>Tracks</th>
+            <th className={`${styles.colNum} ${styles.colReleaseCount}`}>Albums</th>
+            <th className={`${styles.colNum} ${styles.colReleaseCount}`}>Singles</th>
+            <th className={styles.colCollection}>Collection</th>
             {orderedKeys.map(renderHeaderCell)}
           </tr>
         </thead>
         <tbody>
           {artists.map((artist) => (
-            <tr key={artist.id} className={styles.tableRow} onClick={() => openArtist(artist.id)}>
+            <tr
+              key={artist.id}
+              className={styles.tableRow}
+              data-selected={selection?.selected.has(artist.id) ? '' : undefined}
+              onClick={() => openArtist(artist.id)}
+            >
+              {selection ? (
+                <td className={styles.colSelect}>
+                  <SelectBox
+                    checked={selection.selected.has(artist.id)}
+                    label={`Select ${artist.name}`}
+                    onToggle={(shift) => selection.toggle(artist.id, shift)}
+                  />
+                </td>
+              ) : null}
               <td>
                 <MonitorToggle entity="artists" id={artist.id} monitored={artist.monitored} />
               </td>
@@ -6155,10 +6371,12 @@ function ArtistTable({
                   <MediaServerRecognitionBadge sources={artist.media_server_sources} />
                 </span>
               </td>
-              <td className={styles.colNum}>{artist.album_count}</td>
-              <td className={styles.colNum}>{artist.single_count}</td>
-              <td className={styles.colNum}>
-                <TrackPresence present={artist.tracks_present} total={artist.track_count} />
+              <td className={`${styles.colNum} ${styles.colReleaseCount}`}>{artist.album_count}</td>
+              <td className={`${styles.colNum} ${styles.colReleaseCount}`}>
+                {artist.single_count}
+              </td>
+              <td className={styles.colCollection}>
+                <CollectionMeter artist={artist} variant="row" />
               </td>
               {orderedKeys.map((key) => renderBodyCell(artist, key))}
             </tr>
@@ -6183,6 +6401,7 @@ function AlbumDetailView({ albumId }: { albumId: number }) {
   const canWish = useLibraryV2CanWish();
   const previousArtist = Route.useSearch().artist;
   const openTrackArtist = useOpenTrackArtist();
+  const lockedIds = useLockedIds();
   // `resolve` materializes the provider tracklist for a release that has no
   // track rows yet. The inline expand always did this; opening the same
   // release as its own page did not, so a discography-only release (a
@@ -6273,6 +6492,19 @@ function AlbumDetailView({ albumId }: { albumId: number }) {
                 <h1 className={styles.title} title={album.title}>
                   {album.title}
                 </h1>
+                {/* #2046: reviewed and locked. only for what is on disk */}
+                {album.tracks_present > 0 ? (
+                  <ReviewLockButton
+                    entity="album"
+                    id={album.id}
+                    name={album.title}
+                    artistId={album.primary_artist?.id}
+                    variant="hero"
+                    onOpenAlbum={(next) =>
+                      void navigate({ search: (previous) => ({ ...previous, album: next }) })
+                    }
+                  />
+                ) : null}
                 <AlbumOverflowMenu
                   album={{
                     id: album.id,
@@ -6311,7 +6543,11 @@ function AlbumDetailView({ albumId }: { albumId: number }) {
                     ? profileLabel(album.quality_profile.name, album.quality_profile_source)
                     : 'No quality profile'}
                 </span>
-                <TrackPresence present={album.tracks_present} total={album.track_count} />
+                <TrackPresence
+                  present={album.tracks_present}
+                  total={album.track_count}
+                  locked={lockedIds.albums.has(album.id)}
+                />
 
                 {album.total_size_bytes > 0 ? (
                   <span className={styles.detailLabel}>
@@ -6421,11 +6657,12 @@ function visibleReleases(
   entries: LibraryV2AlbumSummary[],
   mode: 'library' | 'all',
 ): LibraryV2AlbumSummary[] {
-  if (mode === 'all') return entries;
+  // Discovery is the discography: a release held twice is one release
+  if (mode === 'all') return releaseLeads(entries);
   // Guide §5: "My Library" is `origin='library' OR monitored`. A wanted TRACK
   // counts as much as a monitored release — bookmarking one top track used to
   // write a wishlist row the user could then not find anywhere in the library.
-  return entries.filter(
+  return withoutShadowEntries(entries).filter(
     (e) => e.origin !== 'discography' || e.monitored || (e.monitored_tracks ?? 0) > 0,
   );
 }
@@ -6471,96 +6708,100 @@ const PROFILE_SECTIONS = new Set(['artist_toolbar', 'artist_page']);
  *  releases and whether tracks offer Add to playlist. Each pick saves at once. */
 function ArtistPageOptions({ prefs }: { prefs: LibraryV2UiPreferences | undefined }) {
   const mutation = useUiPreferencesMutation();
-  const checkbox = (
-    key: string,
-    label: string,
-    checked: boolean,
-    patch: Parameters<typeof mutation.mutate>[0],
-    example?: string,
-  ) => (
-    <label key={key} className={styles.tableOptionsItem}>
-      <input type="checkbox" checked={checked} onChange={() => mutation.mutate(patch)} />
-      {label}
-      {example ? <span className={styles.tableOptionsExample}>{example}</span> : null}
-    </label>
-  );
   const addToPlaylist = prefs?.artist_page?.add_to_playlist !== false;
   const headerChoice = (key: 'header' | 'header_elsewhere', label: string) => {
     const current = prefs?.artist_page?.[key] ?? 'rich';
     return (
-      <>
-        <p className={styles.tableOptionsHint}>{label}</p>
-        <div className={styles.tableOptionsChoicePair} role="radiogroup" aria-label={label}>
+      <div className={ls.stack}>
+        <p className={ls.groupHint}>{label}</p>
+        <div className={ls.choices} role="radiogroup" aria-label={label}>
           {(
             [
               ['rich', 'Rich header', 'Photo, bio and top tracks.'],
               ['compact', 'Compact header', 'A slim bar, straight to the releases.'],
             ] as const
           ).map(([value, title, text]) => (
-            <label
+            <ChoiceCard
               key={value}
-              className={`${styles.tableOptionsChoice} ${current === value ? styles.tableOptionsChoiceActive : ''}`}
-            >
-              <input
-                type="radio"
-                name={`artist-page-${key}`}
-                className={styles.srOnly}
-                checked={current === value}
-                onChange={() => mutation.mutate({ artist_page: { [key]: value } })}
-              />
-              <span className={styles.tableOptionsChoiceTitle}>{title}</span>
-              <span className={styles.tableOptionsChoiceText}>{text}</span>
-            </label>
+              name={`artist-page-${key}`}
+              picture={value}
+              title={title}
+              text={text}
+              checked={current === value}
+              onChange={() => mutation.mutate({ artist_page: { [key]: value } })}
+            />
           ))}
         </div>
-      </>
+      </div>
     );
   };
   return (
     <>
-      <section className={styles.tableOptionsSection}>
-        <div className={styles.tableOptionsGroupLabel}>Artist toolbar</div>
-        <p className={styles.tableOptionsHint}>
-          The buttons this profile sees on an artist page. Tools always stays.
-        </p>
-        {Object.entries(ARTIST_TOOLBAR_BUTTONS).map(([key, label]) => {
-          const checked = prefs?.artist_toolbar?.[key as ArtistToolbarButton] !== false;
-          return checkbox(
-            key,
-            label,
-            checked,
-            { artist_toolbar: { [key]: !checked } },
-            key === 'enhance_quality' ? 'when files can be upgraded' : undefined,
-          );
-        })}
-      </section>
-      <section className={styles.tableOptionsSection}>
-        <div className={styles.tableOptionsGroupLabel}>Artist header</div>
-        {headerChoice('header', 'Opening an artist from the library')}
-        {headerChoice('header_elsewhere', 'From Search, Discover and elsewhere')}
-      </section>
-      <section className={styles.tableOptionsSection}>
-        <div className={styles.tableOptionsGroupLabel}>My Library</div>
-        <p className={styles.tableOptionsHint}>
-          What an artist's My Library view shows below its releases. Discovery shows them all.
-        </p>
-        {Object.entries(LIBRARY_VIEW_SECTIONS).map(([key, label]) => {
-          const checked =
-            prefs?.artist_page?.library_sections?.[key as LibraryViewSection] !== false;
-          return checkbox(key, label, checked, {
-            artist_page: { library_sections: { [key]: !checked } },
-          });
-        })}
-      </section>
-      <section className={styles.tableOptionsSection}>
-        <div className={styles.tableOptionsGroupLabel}>Track actions</div>
-        <p className={styles.tableOptionsHint}>
-          The buttons next to search in the track table's Actions column.
-        </p>
-        {checkbox('add_to_playlist', 'Add to playlist', addToPlaylist, {
-          artist_page: { add_to_playlist: !addToPlaylist },
-        })}
-      </section>
+      <SettingsGroup
+        title="Artist toolbar"
+        hint="The buttons this profile sees on an artist page. Tools always stays."
+      >
+        {/* the page's own row of buttons: press one to hide it */}
+        <div className={ls.toolbar}>
+          {Object.entries(ARTIST_TOOLBAR_BUTTONS).map(([key, label]) => {
+            const checked = prefs?.artist_toolbar?.[key as ArtistToolbarButton] !== false;
+            return (
+              <ChipCheck
+                key={key}
+                label={label}
+                note={key === 'enhance_quality' ? 'when files can be upgraded' : undefined}
+                title={key === 'enhance_quality' ? 'Shown when files can be upgraded' : undefined}
+                checked={checked}
+                onChange={() => mutation.mutate({ artist_toolbar: { [key]: !checked } })}
+              />
+            );
+          })}
+          <span className={`${ls.chip} ${ls.chipKeep}`} title="Tools always stays">
+            Tools
+          </span>
+        </div>
+      </SettingsGroup>
+      <SettingsGroup title="Artist header">
+        <div className={ls.cols2}>
+          {headerChoice('header', 'Opening an artist from the library')}
+          {headerChoice('header_elsewhere', 'From Search, Discover and elsewhere')}
+        </div>
+      </SettingsGroup>
+      <div className={ls.cols2}>
+        <SettingsGroup
+          title="My Library"
+          hint="What an artist's My Library view shows below its releases. Discovery shows them all."
+        >
+          <div className={ls.rows}>
+            {Object.entries(LIBRARY_VIEW_SECTIONS).map(([key, label]) => {
+              const checked =
+                prefs?.artist_page?.library_sections?.[key as LibraryViewSection] !== false;
+              return (
+                <SwitchRow
+                  key={key}
+                  label={label}
+                  checked={checked}
+                  onChange={() =>
+                    mutation.mutate({ artist_page: { library_sections: { [key]: !checked } } })
+                  }
+                />
+              );
+            })}
+          </div>
+        </SettingsGroup>
+        <SettingsGroup
+          title="Track actions"
+          hint="The buttons next to search in the track table's Actions column."
+        >
+          <div className={ls.rows}>
+            <SwitchRow
+              label="Add to playlist"
+              checked={addToPlaylist}
+              onChange={() => mutation.mutate({ artist_page: { add_to_playlist: !addToPlaylist } })}
+            />
+          </div>
+        </SettingsGroup>
+      </div>
     </>
   );
 }
@@ -6579,8 +6820,10 @@ function ViewSettingsDialog({ onClose }: { onClose: () => void }) {
         description="Applies across the whole Library, on every artist and album, for this profile."
         onClose={onClose}
       >
-        <div className={styles.tableOptionsStack}>
-          <ArtistPageOptions prefs={prefs} />
+        <div className={ls.sheetShell}>
+          <div className={ls.pane}>
+            <ArtistPageOptions prefs={prefs} />
+          </div>
         </div>
       </ModalShell>
     );
@@ -6609,6 +6852,7 @@ function ArtistToolsMenu({
   artistId,
   artistName,
   onRetag,
+  onUseFileTags,
   onReorganizeAll,
   onMaintenance,
   onManualImport,
@@ -6624,6 +6868,8 @@ function ArtistToolsMenu({
   artistId: number;
   artistName: string;
   onRetag: () => void;
+  /** #2070: the Library takes what the artist's files say */
+  onUseFileTags: () => void;
   onReorganizeAll: () => void;
   onMaintenance: () => void;
   onManualImport: () => void;
@@ -6662,7 +6908,7 @@ function ArtistToolsMenu({
       entity="artists"
       entityId={artistId}
       entityName={artistName}
-      wrapperRef={wrapRef}
+      insideRefs={[wrapRef]}
       onClose={() => {
         setOpen(false);
         setShowSubmenu(false);
@@ -6739,6 +6985,7 @@ function ArtistToolsMenu({
           <div className={styles.toolMenuHeading}>Files</div>
           {item('Manage Tracks', 'tracks', onManageTracks, false)}
           {item('Preview Retag', 'edit', onRetag)}
+          {item('Use File Tags', 'edit', onUseFileTags)}
           {item('Preview Rename / Organize', 'organize', onReorganizeAll)}
           {item('Manual Import', 'download', onManualImport)}
           {onServerSync ? item('Sync from media server', 'refresh', onServerSync) : null}
@@ -6826,6 +7073,9 @@ interface DiscographyCard {
   monitored: boolean;
   /** #1067: set only on a "+ Other sources" card — the source that lists it. */
   gapSource?: string;
+  /** #2050: with "+ Other sources" on, a release you don't own says which
+   *  source lists it, so a page of mixed sources reads the same on every card */
+  listedOn?: string;
   title: string;
   albumType: string;
   year: string;
@@ -6839,6 +7089,8 @@ interface DiscographyCard {
   totalTracks: number;
   releaseDate?: string | null;
   musicbrainzId?: string | null;
+  /** "2 copies": the release is in the library more than once */
+  copies?: string;
 }
 
 function catalogueCard(album: LibraryV2AlbumSummary): DiscographyCard {
@@ -6858,6 +7110,7 @@ function catalogueCard(album: LibraryV2AlbumSummary): DiscographyCard {
     ownedTracks: album.tracks_present,
     totalTracks: album.track_count,
     musicbrainzId: album.musicbrainz_id ?? null,
+    copies: copiesNote(album),
   };
 }
 
@@ -6881,11 +7134,17 @@ function providerCard(release: ProviderRelease): DiscographyCard {
 }
 
 /** The completion badge pinned to a card's corner (`library.js:2181-2220`). */
-function completionOverlay(card: DiscographyCard): {
+export function completionOverlay(
+  card: Pick<DiscographyCard, 'owned' | 'ownedTracks' | 'totalTracks'>,
+  locked = false,
+): {
   cls: string;
   label: string;
 } {
   if (card.owned === null) return { cls: 'checking', label: 'Checking…' };
+  // #2119: locked means done, so it reads like a finished album
+  if (locked && card.ownedTracks > 0)
+    return { cls: 'completed', label: `${card.ownedTracks}/${card.ownedTracks}` };
   if (card.totalTracks === 0)
     return { cls: card.owned ? 'completed' : 'missing', label: card.owned ? 'Owned' : 'Missing' };
   return {
@@ -6912,6 +7171,7 @@ function ReleaseCardGrid({
   /** play button and musicbrainz link, dev's release card extras */
   extras?: (card: DiscographyCard) => ReactNode;
 }) {
+  const lockedIds = useLockedIds();
   if (cards.length === 0) return null;
   return (
     <div className="releases-grid">
@@ -6920,7 +7180,7 @@ function ReleaseCardGrid({
           title: card.title,
           album_type: card.albumType,
         });
-        const overlay = completionOverlay(card);
+        const overlay = completionOverlay(card, lockedIds.albums.has(card.albumId ?? -1));
         const state = card.owned ? '' : card.owned === null ? ' checking' : ' missing';
         return (
           <div
@@ -6968,14 +7228,32 @@ function ReleaseCardGrid({
                 {card.title}
                 {card.explicit ? <span className="explicit-badge">E</span> : null}
               </div>
-              {card.year ? <div className="album-card-year">{card.year}</div> : null}
+              {card.year || card.copies ? (
+                <div
+                  className="album-card-year"
+                  title={
+                    card.copies
+                      ? `You have this release as ${card.copies}. My Library shows each one.`
+                      : undefined
+                  }
+                >
+                  {[card.year, card.copies].filter(Boolean).join(' · ')}
+                </div>
+              ) : null}
             </div>
             {card.gapSource ? (
               <div
                 className="gapfill-source-badge"
-                title={`Only listed on ${card.gapSource} — opens and downloads from there`}
+                title={`Only listed on ${gapSourceLabel(card.gapSource)}: opens and downloads from there`}
               >
-                {card.gapSource}
+                {gapSourceLabel(card.gapSource)}
+              </div>
+            ) : card.listedOn ? (
+              <div
+                className="gapfill-source-badge"
+                title={`Listed on ${gapSourceLabel(card.listedOn)}`}
+              >
+                {gapSourceLabel(card.listedOn)}
               </div>
             ) : null}
             {extras?.(card)}
@@ -7015,16 +7293,22 @@ function DiscographySection({
   );
 }
 
-const CATEGORY_LABELS = {
-  albums: 'Albums',
-  eps: 'EPs',
-  singles: 'Singles',
-} as const;
 const CONTENT_LABELS = {
-  live: 'Live',
-  compilations: 'Compilations',
   featured: 'Featured',
 } as const;
+
+/** How a release card reads to the section sorter. */
+function describeCard(card: DiscographyCard) {
+  return { title: card.title, album_type: card.albumType };
+}
+
+/** The Show pills: Albums, EPs and Singles always, and each further kind the
+ *  artist has a release of (#2055). */
+function shownSections(counts: Readonly<Record<DiscographySection, number>>) {
+  return DISCOGRAPHY_SECTIONS.filter(
+    (section) => (BASE_SECTIONS as readonly string[]).includes(section) || counts[section] > 0,
+  );
+}
 const OWNERSHIP_LABELS = {
   all: 'All',
   owned: 'Owned',
@@ -7035,12 +7319,15 @@ const OWNERSHIP_LABELS = {
 function DiscographyFilterBar({
   state,
   onChange,
+  counts,
   otherSources,
   onToggleOtherSources,
   otherSourcesBusy,
 }: {
   state: DiscographyFilterState;
   onChange: (next: DiscographyFilterState) => void;
+  /** how many releases each section holds, before any filter */
+  counts: Readonly<Record<DiscographySection, number>>;
   /** #1067 "+ Other sources": omitted when there is no provider id to ask
    *  with, because the endpoint refuses to name-search on purpose. */
   otherSources?: boolean;
@@ -7051,11 +7338,13 @@ function DiscographyFilterBar({
     <div className="discography-filters">
       <div className="filter-group">
         <span className="filter-label">Show</span>
-        {(Object.keys(CATEGORY_LABELS) as (keyof typeof CATEGORY_LABELS)[]).map((key) => (
+        {shownSections(counts).map((key) => (
           <button
             key={key}
             type="button"
             className={`discography-filter-btn${state.categories[key] ? ' active' : ''}`}
+            aria-pressed={state.categories[key]}
+            data-section={key}
             onClick={() =>
               onChange({
                 ...state,
@@ -7066,7 +7355,12 @@ function DiscographyFilterBar({
               })
             }
           >
-            {CATEGORY_LABELS[key]}
+            {SECTION_LABELS[key]}
+            {counts[key] > 0 ? (
+              <span className="filter-count" aria-hidden="true">
+                {counts[key]}
+              </span>
+            ) : null}
           </button>
         ))}
       </div>
@@ -7650,6 +7944,11 @@ function LegacyArtistHero({
   );
 }
 
+/** The source an unowned catalogue release is listed on, for its badge. */
+function listedSource(ids: Record<string, string> | undefined): string | undefined {
+  return ['spotify', 'deezer', 'itunes', 'musicbrainz'].find((source) => ids?.[source]);
+}
+
 /** #1067 "+ Other sources": releases only OTHER configured metadata sources
  *  list, appended to the normal sections with a source badge. Opt-in and
  *  lazy — it costs one provider round trip per extra source. */
@@ -7657,23 +7956,38 @@ function useOtherSources(input: {
   providerId: string | null;
   artistName: string;
   baseSource?: string | null;
+  /** the Library artist page names its artist: the releases are then worked
+   *  out against the catalogue the page lists, not a provider's live list */
+  libraryArtistId?: number | null;
+  /** what the page already shows. the last word on a duplicate (#2050): a
+   *  release on the page is never added again, whatever the server compared */
+  rendered?: ReadonlyArray<{ title?: string | null; year?: unknown; release_date?: unknown }>;
 }) {
   const [enabled, setEnabled] = useState(false);
   const query = useQuery({
-    queryKey: [...LIBRARY_V2_QUERY_KEY, 'gap-fill', input.providerId, input.artistName],
+    queryKey: [
+      ...LIBRARY_V2_QUERY_KEY,
+      'gap-fill',
+      input.providerId,
+      input.artistName,
+      input.libraryArtistId ?? null,
+    ],
     queryFn: () =>
       fetchArtistDiscographyGapFill({
         providerId: input.providerId ?? '',
         artistName: input.artistName,
         baseSource: input.baseSource,
+        libraryArtistId: input.libraryArtistId,
       }),
     enabled: enabled && Boolean(input.providerId) && Boolean(input.artistName),
     staleTime: 10 * 60_000,
   });
+  const rendered = input.rendered ?? [];
   const byBucket = (bucket: 'album' | 'ep' | 'single'): DiscographyCard[] =>
     enabled
       ? (query.data ?? [])
           .filter((r) => r._bucket === bucket)
+          .filter((r) => !rendered.some((shown) => gapSameRelease(r, shown)))
           .map((r) => ({ ...providerCard(r), gapSource: r.gap_source }))
       : [];
   return {
@@ -7687,12 +8001,22 @@ function useOtherSources(input: {
 
 /** Everything the two "All Releases" render modes share: one filter bar, one
  *  set of visible releases (ldp-03/ldp-04 both apply in either mode). */
-function useDiscographyFilters() {
-  const [filters, setFilters] = useState<DiscographyFilterState>(DEFAULT_DISCOGRAPHY_FILTERS);
+export function useDiscographyFilters(source?: string | null) {
+  // a MusicBrainz discography starts with the non-studio releases hidden
+  const [filters, setFilters] = useState<DiscographyFilterState>(() =>
+    applyMusicBrainzDeclutter(DEFAULT_DISCOGRAPHY_FILTERS, source),
+  );
+  // review 4 R4-E-2: one provider artist to another in place (no remount)
+  // kept the first one's filters: Deezer to MusicBrainz showed the whole MB
+  // catalogue, MusicBrainz to Deezer read flags Deezer releases don't have
+  const shownSource = useRef(source);
+  useEffect(() => {
+    if (shownSource.current === source) return;
+    shownSource.current = source;
+    setFilters(applyMusicBrainzDeclutter(DEFAULT_DISCOGRAPHY_FILTERS, source));
+  }, [source]);
   return { filters, setFilters };
 }
-
-type GroupLabel = 'Albums' | 'EPs' | 'Singles';
 
 /** ldp-05: the rich hero for an artist that IS in the catalogue. Same layout
  *  as the discovery hero — that is the point, a user arriving from search
@@ -7704,11 +8028,14 @@ function CatalogueArtistHero({
   onPickImage,
   headerToggle,
   facts,
+  otherSourceCounts,
 }: {
   artist: LibraryV2ArtistDetail;
   onPickImage: () => void;
   headerToggle: ReactNode;
   facts?: ReactNode;
+  /** #2012: releases "+ Other sources" adds to the page count in the total */
+  otherSourceCounts?: { album: number; ep: number; single: number };
 }) {
   const matchStatus = useQuery(libraryV2ArtistMatchStatusQueryOptions(artist.id));
   const canWish = useLibraryV2CanWish();
@@ -7727,11 +8054,15 @@ function CatalogueArtistHero({
   // Only Spotify and Deezer expose a popularity ranking at all; for anything
   // else the sidebar falls through to Last.fm by name, exactly like legacy.
   const source = providerIds.spotify ? 'spotify' : providerIds.deezer ? 'deezer' : '';
-  const countOwned = (label: string, entries: LibraryV2AlbumSummary[]) => ({
-    label,
-    owned: entries.filter((e) => e.tracks_present > 0).length,
-    total: entries.length,
-  });
+  // releases, not rows: an album held twice is one album owned
+  const countOwned = (label: string, rows: LibraryV2AlbumSummary[], extra = 0) => {
+    const entries = releaseLeads(rows);
+    return {
+      label,
+      owned: entries.filter((e) => e.tracks_present > 0).length,
+      total: entries.length + extra,
+    };
+  };
   return (
     <LegacyArtistHero
       name={artist.name}
@@ -7743,9 +8074,9 @@ function CatalogueArtistHero({
       playcount={info.data?.playcount ?? null}
       followers={info.data?.followers ?? null}
       sections={[
-        countOwned('Albums', artist.albums),
-        countOwned('EPs', artist.eps ?? []),
-        countOwned('Singles', artist.singles),
+        countOwned('Albums', artist.albums, otherSourceCounts?.album),
+        countOwned('EPs', artist.eps ?? [], otherSourceCounts?.ep),
+        countOwned('Singles', artist.singles, otherSourceCounts?.single),
       ]}
       providerId={providerIds.spotify ?? providerIds.deezer ?? null}
       source={source}
@@ -7851,25 +8182,21 @@ function AudiobookRouteSetting({ name }: { name: string }) {
   // switching off always works; switching on needs a folder to file into
   const noFolder = !useAudiobookFolderConfigured() && !routed;
   return (
-    <section className={styles.artistSettingsSection}>
-      <h4>Audiobook library</h4>
-      <label className={styles.artistSettingsToggle}>
-        <input
-          type="checkbox"
+    <SettingsGroup title="Audiobook library">
+      <div className={ls.rows}>
+        <SwitchRow
+          label="Treat as audiobook"
+          sub={
+            noFolder
+              ? 'Set the audiobook folder first (Settings > Library > Folders).'
+              : 'File downloads by this artist in the audiobook library instead of the music library, for spoken-word releases.'
+          }
           checked={routed}
           disabled={!canWrite || query.isPending || query.isError || noFolder || toggle.isPending}
-          onChange={(event) => toggle.mutate(event.target.checked)}
+          onChange={(checked) => toggle.mutate(checked)}
         />
-        <span>
-          <strong>Treat as audiobook</strong>
-          <small>
-            {noFolder
-              ? 'Set the audiobook folder first (Settings > Library > Folders).'
-              : 'File downloads by this artist in the audiobook library instead of the music library, for spoken-word releases.'}
-          </small>
-        </span>
-      </label>
-    </section>
+      </div>
+    </SettingsGroup>
   );
 }
 
@@ -8019,7 +8346,7 @@ function ProviderArtistView({
   const heroHeader =
     search.header ??
     (prefs.isSuccess ? (prefs.data?.artist_page?.header_elsewhere ?? 'rich') : undefined);
-  const { filters, setFilters } = useDiscographyFilters();
+  const { filters, setFilters } = useDiscographyFilters(source);
   const providerIds = { [source]: providerId };
   const discography = useReadOnlyProviderDiscography({
     enabled: true,
@@ -8069,19 +8396,41 @@ function ProviderArtistView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search.discoverAlbum, artistName]);
 
-  const buckets = (['albums', 'eps', 'singles'] as const).map((bucket) => ({
+  // #2055: live records, soundtracks and the rest get sections of their own
+  const describeRelease = (release: ProviderRelease) => ({
+    title: release.title,
+    album_type: release.album_type,
+    secondary_types: release.secondary_types,
+  });
+  const releasesBySection = groupReleases(
+    {
+      albums: discography.releasesFor('albums'),
+      eps: discography.releasesFor('eps'),
+      singles: discography.releasesFor('singles'),
+    },
+    describeRelease,
+    Boolean(filters.musicbrainz),
+  );
+  const otherBySection = groupReleases(
+    {
+      albums: otherSources.byBucket('album'),
+      eps: otherSources.byBucket('ep'),
+      singles: otherSources.byBucket('single'),
+    },
+    describeCard,
+  );
+  const sectionCounts = Object.fromEntries(
+    DISCOGRAPHY_SECTIONS.map((s) => [s, releasesBySection[s].length + otherBySection[s].length]),
+  ) as Record<DiscographySection, number>;
+  const buckets = DISCOGRAPHY_SECTIONS.map((bucket) => ({
     bucket,
-    title: ({ albums: 'Albums', eps: 'EPs', singles: 'Singles' } as const)[bucket],
-    cards: discography
-      .releasesFor(bucket)
+    title: SECTION_LABELS[bucket],
+    others: otherBySection[bucket].filter((card) =>
+      passesDiscographyFilters(describeCard(card), filters, card.owned === true, bucket),
+    ),
+    cards: releasesBySection[bucket]
       .filter((release) =>
-        filters.categories[bucket]
-          ? passesDiscographyFilters(
-              { title: release.title, album_type: release.album_type },
-              filters,
-              release.owned === true,
-            )
-          : false,
+        passesDiscographyFilters(describeRelease(release), filters, release.owned === true, bucket),
       )
       .map(providerCard),
   }));
@@ -8113,10 +8462,17 @@ function ProviderArtistView({
                 listeners={heroStats.data?.listeners ?? null}
                 playcount={heroStats.data?.playcount ?? null}
                 followers={heroStats.data?.followers ?? null}
-                sections={buckets.map(({ title, bucket }) => ({
-                  label: title,
+                // the collection card counts by release type, as the library
+                // artist's does: a live album is still one of the albums
+                sections={BASE_SECTIONS.map((bucket) => ({
+                  label: SECTION_LABELS[bucket],
                   owned: discography.releasesFor(bucket).filter((r) => r.owned).length,
-                  total: discography.releasesFor(bucket).length,
+                  // #2012: "+ Other sources" releases are on the page, so in the total
+                  total:
+                    discography.releasesFor(bucket).length +
+                    otherSources.byBucket(
+                      ({ albums: 'album', eps: 'ep', singles: 'single' } as const)[bucket],
+                    ).length,
                 }))}
                 providerId={providerId}
                 source={source}
@@ -8175,19 +8531,15 @@ function ProviderArtistView({
             <DiscographyFilterBar
               state={filters}
               onChange={setFilters}
+              counts={sectionCounts}
               otherSources={otherSources.enabled}
               otherSourcesBusy={otherSources.busy}
               onToggleOtherSources={otherSources.available ? otherSources.toggle : undefined}
             />
 
             <DiscographySections>
-              {buckets.map(({ bucket, title, cards }) => {
-                const all = [
-                  ...cards,
-                  ...otherSources.byBucket(
-                    ({ albums: 'album', eps: 'ep', singles: 'single' } as const)[bucket],
-                  ),
-                ];
+              {buckets.map(({ bucket, title, cards, others }) => {
+                const all = [...cards, ...others];
                 if (all.length === 0) return null;
                 return (
                   <DiscographySection
@@ -8269,17 +8621,18 @@ function ProfileWatchlistButton({
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const watchlistId = watchlist?.id ?? null;
+  const watchlistSource = watchlist?.source;
   useEffect(() => {
     setWatching(null);
     if (!watchlistId) return;
     let cancelled = false;
-    void checkWatchlistRequest(watchlistId).then((state) => {
+    void checkWatchlistRequest(watchlistId, watchlistSource).then((state) => {
       if (!cancelled) setWatching(state);
     });
     return () => {
       cancelled = true;
     };
-  }, [watchlistId]);
+  }, [watchlistId, watchlistSource]);
   if (!watchlist) return null;
   const toggle = async () => {
     if (busy) return;
@@ -8336,17 +8689,18 @@ function ProviderArtistActions({
   const [adding, setAdding] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const watchlistId = watchlist?.id ?? null;
+  const watchlistSource = watchlist?.source;
   useEffect(() => {
     setWatching(null);
     if (!watchlistId) return;
     let cancelled = false;
-    void checkWatchlistRequest(watchlistId).then((state) => {
+    void checkWatchlistRequest(watchlistId, watchlistSource).then((state) => {
       if (!cancelled) setWatching(state);
     });
     return () => {
       cancelled = true;
     };
-  }, [watchlistId]);
+  }, [watchlistId, watchlistSource]);
   const artist = payload.artist ?? {};
   const image = String(artist.image_url || '');
   const toggle = async () => {
@@ -8444,9 +8798,22 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   const artistQuery = useQuery(libraryV2ArtistQueryOptions(artistId));
   const toolbarStuck = useScrolledPast(heroSentinelRef, artistQuery.data?.id);
   const artistProviderIds = artistQuery.data?.provider_ids ?? {};
+  // any source the artist is known on can answer: an artist with only a
+  // MusicBrainz or iTunes id had no "+ Other sources" at all (#2050)
   const otherSources = useOtherSources({
-    providerId: artistProviderIds.spotify ?? artistProviderIds.deezer ?? null,
+    providerId:
+      artistProviderIds.spotify ??
+      artistProviderIds.deezer ??
+      artistProviderIds.itunes ??
+      artistProviderIds.musicbrainz ??
+      null,
     artistName: artistQuery.data?.name ?? '',
+    libraryArtistId: artistId,
+    rendered: [
+      ...(artistQuery.data?.albums ?? []),
+      ...(artistQuery.data?.eps ?? []),
+      ...(artistQuery.data?.singles ?? []),
+    ],
   });
   // the provider identity a "+ other sources" card opens and plays under
   const releaseCardArtist = {
@@ -8513,11 +8880,18 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   const [showMaintenance, setShowMaintenance] = useState(false);
   const [showManageTracks, setShowManageTracks] = useState(false);
   const [showReorganizeAll, setShowReorganizeAll] = useState(false);
+  // after the page is up: it plans every album, so it never races the page itself
+  const renameCheck = useRenameCheck(
+    artistQuery.data && artistQuery.data.in_library !== false ? artistId : 0,
+  );
   const [showEditArtist, setShowEditArtist] = useState(false);
   const [showArtPicker, setShowArtPicker] = useState(false);
   // Album-scoped retag/delete now live inside each album's own
   // AlbumOverflowMenu (B1/B2) — this state is only for the artist-level
   // toolbar's own Preview Retag / Delete buttons.
+  const [useFileTagsTarget, setUseFileTagsTarget] = useState<{ id: number; title: string } | null>(
+    null,
+  );
   const [retagTarget, setRetagTarget] = useState<{
     entity: 'artists';
     id: number;
@@ -8593,21 +8967,57 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
   /** ldp-04: the filter bar governs `All Releases` in BOTH render modes, so
    *  switching Table ↔ Legacy never silently changes which releases are on
    *  screen. `My Library` is untouched by it, exactly as specified. */
-  function releasesOf(
-    entries: LibraryV2AlbumSummary[],
-    category: 'albums' | 'eps' | 'singles',
-  ): LibraryV2AlbumSummary[] {
-    const base = visibleReleases(entries, releasesMode);
+  const describeAlbum = (album: LibraryV2AlbumSummary) => ({
+    title: album.title,
+    album_type: album.album_type,
+    release_types: album.release_types,
+  });
+  // #2055: live records, soundtracks and the rest get sections of their own,
+  // on both tabs and in both render modes
+  const artistReleases = artistQuery.data;
+  const albumsBySection = groupReleases(
+    {
+      albums: visibleReleases(artistReleases?.albums ?? [], releasesMode),
+      eps: visibleReleases(artistReleases?.eps ?? [], releasesMode),
+      singles: visibleReleases(artistReleases?.singles ?? [], releasesMode),
+    },
+    describeAlbum,
+  );
+  function releasesOf(category: DiscographySection): LibraryV2AlbumSummary[] {
+    const base = albumsBySection[category];
     if (releasesMode !== 'all') return base;
-    if (!filters.categories[category]) return [];
     return base.filter((album) =>
-      passesDiscographyFilters(
-        { title: album.title, album_type: album.album_type },
-        filters,
-        album.tracks_present > 0,
-      ),
+      passesDiscographyFilters(describeAlbum(album), filters, album.tracks_present > 0, category),
     );
   }
+  const describeProviderRelease = (release: ProviderRelease) => ({
+    title: release.title,
+    album_type: release.album_type,
+    secondary_types: release.secondary_types,
+  });
+  const readOnlyBySection = groupReleases(
+    {
+      albums: readOnlyDiscography.releasesFor('albums'),
+      eps: readOnlyDiscography.releasesFor('eps'),
+      singles: readOnlyDiscography.releasesFor('singles'),
+    },
+    describeProviderRelease,
+    Boolean(filters.musicbrainz),
+  );
+  const otherBySection = groupReleases(
+    {
+      albums: otherSources.byBucket('album'),
+      eps: otherSources.byBucket('ep'),
+      singles: otherSources.byBucket('single'),
+    },
+    describeCard,
+  );
+  const sectionCounts = Object.fromEntries(
+    DISCOGRAPHY_SECTIONS.map((s) => [
+      s,
+      albumsBySection[s].length + readOnlyBySection[s].length + otherBySection[s].length,
+    ]),
+  ) as Record<DiscographySection, number>;
 
   /** a release you have opens its own page; one you don't opens dev's
    *  Download Missing Tracks modal, the way the provider page did, from the
@@ -8625,7 +9035,11 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
       const shared = ['spotify', 'deezer', 'itunes', 'musicbrainz', 'tidal', 'qobuz'].find(
         (source) => release?.provider_ids?.[source] && artistProviderIds[source],
       );
-      if (!card.owned && shared) {
+      // the download modal unless the release is complete: a part-owned
+      // album (1 of 22) went to its album page, with no way to fetch the
+      // rest from there. the album page stays on My Library
+      const complete = card.totalTracks > 0 && card.ownedTracks >= card.totalTracks;
+      if (!complete && shared) {
         void openProviderRelease(
           { ...card, providerId: release!.provider_ids![shared] },
           { ...releaseCardArtist, id: artistProviderIds[shared] ?? null, source: shared },
@@ -8719,7 +9133,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
       </span>
       <span className={styles.detailLabel}>
         <SvgIcon name="tracks" />
-        {artist.albums.length + (artist.eps?.length ?? 0) + artist.singles.length} releases
+        {releaseLeads([...artist.albums, ...(artist.eps ?? []), ...artist.singles]).length} releases
       </span>
       {artist.total_size_bytes > 0 ? (
         <span className={styles.detailLabel}>
@@ -8806,9 +9220,9 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                         artistId={artistId}
                         artistName={artist.name}
                         busy={searchBusy}
-                        onEnhance={(trackIds) =>
+                        onEnhance={(trackIds, targetProfileId) =>
                           runScoped('artists', artistId, () =>
-                            startLibraryV2Enhance('artists', artistId, trackIds),
+                            startLibraryV2Enhance('artists', artistId, trackIds, targetProfileId),
                           )
                         }
                       />,
@@ -8840,6 +9254,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                         icon="settings"
                         label="Artist Settings"
                         title="Quality profile, Watchlist, new releases and audiobook filing"
+                        requiresWrite={false}
                         onClick={() => setShowArtistSettings(true)}
                       />,
                     ],
@@ -8849,6 +9264,21 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                   .map(([id, action]) => (
                     <Fragment key={id}>{action}</Fragment>
                   ))}
+                <ReviewLockButton
+                  entity="artist"
+                  id={artistId}
+                  name={artist.name}
+                  variant="toolbar"
+                />
+                {/* #2141: what Preview rename would change, without opening it */}
+                {renameCheck.total > 0 ? (
+                  <ActionButton
+                    icon="folder"
+                    label={`${renameCheck.total} to rename`}
+                    title={renameHintTitle(renameCheck.total)}
+                    onClick={() => setShowReorganizeAll(true)}
+                  />
+                ) : null}
                 <ArtistToolsMenu
                   onViewSettings={() => setShowViewSettings(true)}
                   artistId={artistId}
@@ -8856,6 +9286,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
                   onRetag={() =>
                     setRetagTarget({ entity: 'artists', id: artistId, title: artist.name })
                   }
+                  onUseFileTags={() => setUseFileTagsTarget({ id: artistId, title: artist.name })}
                   onReorganizeAll={() => setShowReorganizeAll(true)}
                   onMaintenance={() => setShowMaintenance(true)}
                   onManualImport={() => void navigate({ to: '/import' })}
@@ -8892,6 +9323,11 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               onPickImage={() => setShowArtPicker(true)}
               headerToggle={headerToggle}
               facts={libraryFacts}
+              otherSourceCounts={{
+                album: otherSources.byBucket('album').length,
+                ep: otherSources.byBucket('ep').length,
+                single: otherSources.byBucket('single').length,
+              }}
             />
           ) : (
             <header className={styles.detailHeader}>
@@ -9008,6 +9444,7 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
             <DiscographyFilterBar
               state={filters}
               onChange={setFilters}
+              counts={sectionCounts}
               otherSources={otherSources.enabled}
               otherSourcesBusy={otherSources.busy}
               onToggleOtherSources={otherSources.available ? otherSources.toggle : undefined}
@@ -9016,30 +9453,40 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
 
           {releasesMode === 'all' && !tableView ? (
             <DiscographySections>
-              {(
-                [
-                  ['Albums', releasesOf(artist.albums, 'albums')],
-                  ['EPs', releasesOf(artist.eps ?? [], 'eps')],
-                  ['Singles', releasesOf(artist.singles, 'singles')],
-                ] as Array<[GroupLabel, LibraryV2AlbumSummary[]]>
-              ).map(([title, entries]) => {
+              {DISCOGRAPHY_SECTIONS.map((section) => {
+                const title = SECTION_LABELS[section];
+                const entries = releasesOf(section);
                 const cards = [
-                  ...entries.map(catalogueCard),
-                  ...readOnlyDiscography
-                    .releasesFor(
-                      ({ Albums: 'albums', EPs: 'eps', Singles: 'singles' } as const)[title],
+                  ...entries.map((entry) => ({
+                    ...catalogueCard(entry),
+                    listedOn:
+                      otherSources.enabled && entry.tracks_present === 0
+                        ? listedSource(entry.provider_ids)
+                        : undefined,
+                  })),
+                  ...readOnlyBySection[section]
+                    .filter((release) =>
+                      passesDiscographyFilters(
+                        describeProviderRelease(release),
+                        filters,
+                        release.owned === true,
+                        section,
+                      ),
                     )
                     .map(providerCard),
-                  ...otherSources.byBucket(
-                    ({ Albums: 'album', EPs: 'ep', Singles: 'single' } as const)[
-                      title as GroupLabel
-                    ],
+                  ...otherBySection[section].filter((card) =>
+                    passesDiscographyFilters(
+                      describeCard(card),
+                      filters,
+                      card.owned === true,
+                      section,
+                    ),
                   ),
                 ];
                 if (cards.length === 0) return null;
                 return (
                   <DiscographySection
-                    key={title}
+                    key={section}
                     title={title}
                     stats={
                       <>
@@ -9062,41 +9509,28 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
             </DiscographySections>
           ) : (
             <>
-              <AlbumGroup
-                title="Albums"
-                albums={releasesOf(artist.albums, 'albums')}
-                artistId={artistId}
-                artistName={artist.name}
-                scope="albums"
-                queueStatusByAlbum={queueStatusQuery.data?.albums ?? {}}
-                queueStatusTracks={queueStatusQuery.data?.tracks ?? {}}
-                onAction={handleAction}
-              />
-              <AlbumGroup
-                title="EPs"
-                albums={releasesOf(artist.eps ?? [], 'eps')}
-                artistId={artistId}
-                artistName={artist.name}
-                scope="eps"
-                queueStatusByAlbum={queueStatusQuery.data?.albums ?? {}}
-                queueStatusTracks={queueStatusQuery.data?.tracks ?? {}}
-                onAction={handleAction}
-              />
-              <AlbumGroup
-                title="Singles"
-                albums={releasesOf(artist.singles, 'singles')}
-                artistId={artistId}
-                artistName={artist.name}
-                scope="singles"
-                queueStatusByAlbum={queueStatusQuery.data?.albums ?? {}}
-                queueStatusTracks={queueStatusQuery.data?.tracks ?? {}}
-                onAction={handleAction}
-              />
+              {DISCOGRAPHY_SECTIONS.map((section) => (
+                <AlbumGroup
+                  key={section}
+                  title={SECTION_LABELS[section]}
+                  albums={releasesOf(section)}
+                  artistId={artistId}
+                  artistName={artist.name}
+                  // a section that is not a release type of its own acts on
+                  // exactly the releases it lists (the route takes the ids)
+                  scope={
+                    section === 'albums' || section === 'eps' || section === 'singles'
+                      ? section
+                      : 'all'
+                  }
+                  queueStatusByAlbum={queueStatusQuery.data?.albums ?? {}}
+                  queueStatusTracks={queueStatusQuery.data?.tracks ?? {}}
+                  onAction={handleAction}
+                />
+              ))}
               <ReleasesEmptyState
                 hidden={
-                  releasesOf(artist.albums, 'albums').length > 0 ||
-                  releasesOf(artist.eps ?? [], 'eps').length > 0 ||
-                  releasesOf(artist.singles, 'singles').length > 0 ||
+                  DISCOGRAPHY_SECTIONS.some((section) => releasesOf(section).length > 0) ||
                   // only guest spots here, on disk or wanted: Appears On below lists them
                   (releasesMode !== 'all' && artistEyebrow(artist) === 'Featured in your library')
                 }
@@ -9198,6 +9632,14 @@ function ArtistDetailView({ artistId }: { artistId: number }) {
               id={retagTarget.id}
               title={retagTarget.title}
               onClose={() => setRetagTarget(null)}
+            />
+          ) : null}
+          {useFileTagsTarget ? (
+            <UseFileTagsModal
+              entity="artists"
+              id={useFileTagsTarget.id}
+              title={useFileTagsTarget.title}
+              onClose={() => setUseFileTagsTarget(null)}
             />
           ) : null}
           {deleteTarget ? (
@@ -9372,7 +9814,7 @@ export function SectionBulkMonitorButton({
   albumIds,
 }: {
   artistId: number;
-  scope: 'albums' | 'eps' | 'singles';
+  scope: 'albums' | 'eps' | 'singles' | 'all';
   title: string;
   allMonitored: boolean;
   albumIds: number[];
@@ -9483,7 +9925,7 @@ function AlbumGroup({
   albums: LibraryV2AlbumSummary[];
   artistId: number;
   artistName: string;
-  scope: 'albums' | 'eps' | 'singles';
+  scope: 'albums' | 'eps' | 'singles' | 'all';
   queueStatusByAlbum: Record<number, LibraryV2QueueStatusAlbum>;
   queueStatusTracks: Record<number, LibraryV2QueueStatusEntry>;
   onAction: ActionHandler;
@@ -9540,6 +9982,8 @@ function AlbumBlock({
 }) {
   const navigate = useNavigate();
   const openTrackArtist = useOpenTrackArtist();
+  const lockedIds = useLockedIds();
+  const rename = useRenameCheck(artistId);
   const [open, setOpen] = useState(false);
   // Browser `dblclick` can span changing descendants (title, cover, empty row space) and its click
   // counter carries surprising state across rerenders. A timestamp owned by THIS album makes the
@@ -9607,6 +10051,9 @@ function AlbumBlock({
               <SvgIcon name="star" />
               {profileName || 'Default'}
             </span>
+            {album.tracks_present > 0 ? (
+              <AlbumRenameBadge artistId={artistId} albumId={album.id} albumTitle={album.title} />
+            ) : null}
           </div>
         </div>
         {/* Sonarr's season toggle: in the middle of the row, out of the way of
@@ -9618,6 +10065,7 @@ function AlbumBlock({
           className={styles.albumTrackCount}
           present={album.tracks_present}
           total={album.track_count}
+          locked={lockedIds.albums.has(album.id)}
         />
         <span className={styles.albumActions}>
           <AlbumPlayButton
@@ -9627,6 +10075,11 @@ function AlbumBlock({
             tracksPresent={album.tracks_present}
           />
           <AlbumUpgradeButton albumId={album.id} albumTitle={album.title} />
+          {/* #2143: no "Lock and next" here. it opened the next album's page,
+              and on the artist page you lock one row after another in place */}
+          {album.tracks_present > 0 ? (
+            <ReviewLockButton entity="album" id={album.id} name={album.title} artistId={artistId} />
+          ) : null}
           <IconActionButton
             icon="automatic"
             title="Automatic Search — search missing/upgradable tracks on this album"
@@ -9686,6 +10139,7 @@ function AlbumBlock({
           queueStatusTracks={queueStatusTracks}
           currentArtistId={artistId}
           onOpenArtist={openTrackArtist}
+          renameTrackIds={rename.tracks}
         />
       ) : null}
     </div>
@@ -10335,7 +10789,9 @@ function ColumnsOptionsMenu<K extends string>({
   columnOrder,
   onReorder,
   lockedColumns,
-  extra,
+  preview,
+  beside,
+  panes,
   columnsFooter,
   workspace = false,
   description,
@@ -10349,7 +10805,16 @@ function ColumnsOptionsMenu<K extends string>({
   columnOrder?: K[];
   onReorder?: (newOrder: K[]) => void;
   lockedColumns?: ReadonlySet<K>;
-  extra?: ReactNode;
+  /** Above the columns: the table as these settings make it. */
+  preview?: ReactNode;
+  /** Beside the column list: the table's other settings. */
+  beside?: ReactNode;
+  /** A second pane behind a pill, for settings that are not the table's. */
+  panes?: {
+    first: { label: string; note?: string };
+    second: { label: string; note?: string };
+    content: ReactNode;
+  };
   /** Under the column list, e.g. resetting the column widths. */
   columnsFooter?: ReactNode;
   /** The size of the other library workspaces (Preview Retag, Rename,
@@ -10359,6 +10824,7 @@ function ColumnsOptionsMenu<K extends string>({
   onClose?: () => void;
 }) {
   const [gearOpen, setOpen] = useState(false);
+  const [pane, setPane] = useState<'first' | 'second'>('first');
   const open = Boolean(onClose) || gearOpen;
   const [dragKey, setDragKey] = useState<K | null>(null);
   // while a row is dragged the others make room under the pointer; the order
@@ -10398,107 +10864,129 @@ function ColumnsOptionsMenu<K extends string>({
           className={workspace ? styles.toolWorkspace : undefined}
           onClose={onClose ?? (() => setOpen(false))}
         >
-          <div className={styles.tableOptionsDialogBody}>
-            <div
-              className={`${styles.tableOptionsLayout} ${workspace ? styles.tableOptionsWorkspace : ''}`}
-            >
-              <section className={styles.tableOptionsSection}>
-                <div className={styles.tableOptionsGroupLabel}>Visible columns</div>
-                {reorderable ? (
-                  <p className={styles.tableOptionsHint}>
-                    Drag a row to change the column order, left to right.
-                  </p>
-                ) : null}
-                <div
-                  className={`${styles.tableOptionsColumnGrid} ${reorderable ? styles.tableOptionsColumnGridReorder : ''}`}
-                  onDragOver={dragKey ? (e) => e.preventDefault() : undefined}
-                  onDrop={dragKey ? (e) => e.preventDefault() : undefined}
-                >
-                  {columnKeys.map((key, index) => {
-                    const locked = lockedColumns?.has(key) ?? false;
-                    return (
-                      <div
-                        key={key}
-                        className={`${styles.tableOptionsRow} ${reorderable ? styles.tableOptionsRowDraggable : ''} ${dragKey === key ? styles.tableOptionsRowDragging : ''}`}
-                        draggable={reorderable}
-                        onDragStart={
-                          reorderable
-                            ? (e) => {
-                                e.dataTransfer.effectAllowed = 'move';
-                                // Firefox starts no drag without data
-                                e.dataTransfer.setData('text/plain', key);
-                                setDragKey(key);
-                                setDragOrder(columnOrder!);
-                              }
-                            : undefined
-                        }
-                        onDragOver={
-                          dragKey && dragOrder && dragOrder[index] !== dragKey
-                            ? () => setDragOrder(moved(dragOrder, dragKey, index))
-                            : undefined
-                        }
-                        onDragEnd={
-                          reorderable
-                            ? (e) => endDrag(e.dataTransfer.dropEffect !== 'none')
-                            : undefined
-                        }
-                      >
-                        {reorderable ? (
-                          <span
-                            className={styles.reorderHandle}
-                            title="Drag to reorder"
-                            aria-label={`Drag to reorder ${columnLabels[key]}`}
+          <div className={ls.sheetShell}>
+            {panes ? (
+              <div className={ls.band}>
+                <SettingsPills
+                  label="What to change"
+                  pills={[
+                    { key: 'first', ...panes.first },
+                    { key: 'second', ...panes.second },
+                  ]}
+                  value={pane}
+                  onChange={setPane}
+                />
+                <span className={ls.bandNote}>Each pick saves at once.</span>
+              </div>
+            ) : null}
+            {panes && pane === 'second' ? (
+              <div className={ls.pane} key="second">
+                {panes.content}
+              </div>
+            ) : (
+              <div className={ls.pane} key="first">
+                {preview}
+                <div className={beside ? ls.cols2 : undefined}>
+                  <SettingsGroup
+                    title="Visible columns"
+                    hint={
+                      reorderable
+                        ? 'Drag a row to change the column order, left to right.'
+                        : undefined
+                    }
+                  >
+                    <div
+                      className={ls.rows}
+                      onDragOver={dragKey ? (e) => e.preventDefault() : undefined}
+                      onDrop={dragKey ? (e) => e.preventDefault() : undefined}
+                    >
+                      {columnKeys.map((key, index) => {
+                        const locked = lockedColumns?.has(key) ?? false;
+                        const shown = locked || columns[key];
+                        return (
+                          <div
+                            key={key}
+                            className={`${ls.row} ${reorderable ? ls.rowDraggable : ''} ${dragKey === key ? ls.rowDragging : ''} ${shown ? '' : ls.rowOff}`}
+                            draggable={reorderable}
+                            onDragStart={
+                              reorderable
+                                ? (e) => {
+                                    e.dataTransfer.effectAllowed = 'move';
+                                    // Firefox starts no drag without data
+                                    e.dataTransfer.setData('text/plain', key);
+                                    setDragKey(key);
+                                    setDragOrder(columnOrder!);
+                                  }
+                                : undefined
+                            }
+                            onDragOver={
+                              dragKey && dragOrder && dragOrder[index] !== dragKey
+                                ? () => setDragOrder(moved(dragOrder, dragKey, index))
+                                : undefined
+                            }
+                            onDragEnd={
+                              reorderable
+                                ? (e) => endDrag(e.dataTransfer.dropEffect !== 'none')
+                                : undefined
+                            }
                           >
-                            ⠿
-                          </span>
-                        ) : null}
-                        <label
-                          className={styles.tableOptionsItem}
-                          title={locked ? `${columnLabels[key]} is always visible` : undefined}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={locked || columns[key]}
-                            disabled={locked}
-                            onChange={() => onToggle(key)}
-                          />
-                          {columnLabels[key]}
-                          {locked ? (
-                            <span className={styles.tableOptionsLocked}>Always visible</span>
-                          ) : null}
-                        </label>
-                        {reorderable ? (
-                          <div className={styles.tableOptionsReorder}>
-                            <button
-                              type="button"
-                              title="Move up"
-                              aria-label={`Move ${columnLabels[key]} up`}
-                              disabled={index === 0}
-                              onClick={() => onReorder!(moved(columnOrder!, key, index - 1))}
-                              className={styles.reorderBtn}
+                            {reorderable ? (
+                              <span
+                                className={ls.grip}
+                                title="Drag to reorder"
+                                aria-label={`Drag to reorder ${columnLabels[key]}`}
+                              >
+                                ⠿
+                              </span>
+                            ) : null}
+                            {reorderable ? (
+                              <div className={ls.move}>
+                                <button
+                                  type="button"
+                                  title="Move up"
+                                  aria-label={`Move ${columnLabels[key]} up`}
+                                  disabled={index === 0}
+                                  onClick={() => onReorder!(moved(columnOrder!, key, index - 1))}
+                                  className={ls.moveBtn}
+                                >
+                                  ▲
+                                </button>
+                                <button
+                                  type="button"
+                                  title="Move down"
+                                  aria-label={`Move ${columnLabels[key]} down`}
+                                  disabled={index === columnKeys.length - 1}
+                                  onClick={() => onReorder!(moved(columnOrder!, key, index + 1))}
+                                  className={ls.moveBtn}
+                                >
+                                  ▼
+                                </button>
+                              </div>
+                            ) : null}
+                            <label
+                              className={ls.rowLabel}
+                              title={locked ? `${columnLabels[key]} is always visible` : undefined}
                             >
-                              ▲
-                            </button>
-                            <button
-                              type="button"
-                              title="Move down"
-                              aria-label={`Move ${columnLabels[key]} down`}
-                              disabled={index === columnKeys.length - 1}
-                              onClick={() => onReorder!(moved(columnOrder!, key, index + 1))}
-                              className={styles.reorderBtn}
-                            >
-                              ▼
-                            </button>
+                              <span className={ls.rowText}>{columnLabels[key]}</span>
+                              {locked ? <span className={ls.rowNote}>Always visible</span> : null}
+                              <input
+                                type="checkbox"
+                                className={ls.switch}
+                                checked={shown}
+                                disabled={locked}
+                                onChange={() => onToggle(key)}
+                              />
+                            </label>
                           </div>
-                        ) : null}
-                      </div>
-                    );
-                  })}
+                        );
+                      })}
+                    </div>
+                    {columnsFooter}
+                  </SettingsGroup>
+                  {beside}
                 </div>
-                {columnsFooter}
-              </section>
-              {extra}
-            </div>
+              </div>
+            )}
           </div>
         </ModalShell>
       ) : null}
@@ -10531,6 +11019,10 @@ function TrackTableOptionsMenu({
   const qualityShowBitrate = prefsQuery.data?.track_table.quality_show_bitrate ?? true;
   const editViaTitle = prefsQuery.data?.track_table.edit_via_title ?? true;
 
+  const shownProviders = PROVIDERS.filter(
+    (provider) => !availableProviders || availableProviders.has(provider.key),
+  );
+
   return (
     <ColumnsOptionsMenu
       title="View Settings"
@@ -10546,22 +11038,44 @@ function TrackTableOptionsMenu({
       onReorder={(newOrder) => mutation.mutate({ track_table: { column_order: newOrder } })}
       lockedColumns={TRACK_TABLE_LOCKED_COLUMNS}
       workspace
+      panes={{
+        first: { label: 'Track table', note: 'all profiles' },
+        second: { label: 'Artist page', note: 'this profile' },
+        // the artist page's own part, kept per profile
+        content: <ArtistPageOptions prefs={prefsQuery.data} />,
+      }}
+      preview={
+        <TrackTablePreview
+          columns={columnOrder.filter((key) => key === 'title' || columns[key])}
+          labels={TRACK_TABLE_COLUMN_LABELS}
+          quality={[
+            qualityShowFormat ? 'FLAC' : '',
+            qualityShowResolution ? '16bit/44.1kHz' : '',
+            qualityShowBitrate ? '1411 kbps' : '',
+          ].filter(Boolean)}
+          providers={shownProviders
+            .filter((provider) => showAllProviders || (visibleProviders[provider.key] ?? true))
+            .map((provider) => ({
+              key: provider.key,
+              abbr: provider.abbr ?? provider.label.slice(0, 3),
+              color: provider.color,
+            }))}
+        />
+      }
       columnsFooter={
         <button
           type="button"
-          className={styles.tableOptionsReset}
+          className={`${ls.capsule} ${ls.capsuleQuiet}`}
           disabled={!Object.values(columnWidths).some((width) => width != null)}
           onClick={onResetColumnWidths}
         >
           Reset column widths
         </button>
       }
-      extra={
-        <div className={styles.tableOptionsExtraGrid}>
-          <div className={styles.tableOptionsStack}>
-            <section className={styles.tableOptionsSection}>
-              <div className={styles.tableOptionsGroupLabel}>Quality column</div>
-              <p className={styles.tableOptionsHint}>What the Quality badge of each file shows.</p>
+      beside={
+        <div className={ls.stack}>
+          <SettingsGroup title="Quality column" hint="What the Quality badge of each file shows.">
+            <div className={ls.rows}>
               {(
                 [
                   ['quality_show_format', qualityShowFormat, 'Format', 'FLAC, MP3, Opus'],
@@ -10569,114 +11083,90 @@ function TrackTableOptionsMenu({
                   ['quality_show_bitrate', qualityShowBitrate, 'Bitrate', '1411 kbps'],
                 ] as const
               ).map(([key, checked, label, example]) => (
-                <label key={key} className={styles.tableOptionsItem}>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => mutation.mutate({ track_table: { [key]: !checked } })}
-                  />
-                  {label}
-                  <span className={styles.tableOptionsExample}>{example}</span>
-                </label>
-              ))}
-            </section>
-
-            <section className={styles.tableOptionsSection}>
-              <div className={styles.tableOptionsGroupLabel}>Track editor</div>
-              <p className={styles.tableOptionsHint}>
-                How a track's metadata, tags, lyrics and quality profile open.
-              </p>
-              <div
-                className={styles.tableOptionsChoices}
-                role="radiogroup"
-                aria-label="Track editor"
-              >
-                {(
-                  [
-                    [
-                      true,
-                      'Click the title (default)',
-                      'The underlined track title opens the editor. The Actions column stays narrow.',
-                    ],
-                    [
-                      false,
-                      'Pencil button',
-                      'An edit button in the Actions column, next to search and add to playlist.',
-                    ],
-                  ] as const
-                ).map(([viaTitle, label, text]) => (
-                  <label
-                    key={label}
-                    className={`${styles.tableOptionsChoice} ${editViaTitle === viaTitle ? styles.tableOptionsChoiceActive : ''}`}
-                  >
-                    <input
-                      type="radio"
-                      name="track-edit-via"
-                      className={styles.srOnly}
-                      checked={editViaTitle === viaTitle}
-                      onChange={() =>
-                        mutation.mutate({ track_table: { edit_via_title: viaTitle } })
-                      }
-                    />
-                    <span className={styles.tableOptionsChoiceTitle}>{label}</span>
-                    <span className={styles.tableOptionsChoiceText}>{text}</span>
-                  </label>
-                ))}
-              </div>
-            </section>
-
-            <section className={styles.tableOptionsSection}>
-              <div className={styles.tableOptionsGroupLabel}>Match providers</div>
-              <p className={styles.tableOptionsHint}>
-                Which provider chips the Match column shows.
-              </p>
-              <label className={styles.tableOptionsItem}>
-                <input
-                  type="checkbox"
-                  checked={showAllProviders}
-                  onChange={() =>
-                    mutation.mutate({
-                      track_table: {
-                        show_all_match_providers: !showAllProviders,
-                      },
-                    })
-                  }
+                <SwitchRow
+                  key={key}
+                  label={label}
+                  note={example}
+                  checked={checked}
+                  onChange={() => mutation.mutate({ track_table: { [key]: !checked } })}
                 />
-                Show every provider
-              </label>
-              <div className={styles.tableOptionsProviderGrid}>
-                {PROVIDERS.filter(
-                  (provider) => !availableProviders || availableProviders.has(provider.key),
-                ).map((provider) => {
-                  const isVisible = visibleProviders[provider.key] ?? true;
-                  return (
-                    <label key={provider.key} className={styles.tableOptionsItem}>
-                      <input
-                        type="checkbox"
-                        checked={isVisible}
-                        onChange={() =>
-                          mutation.mutate({
-                            track_table: {
-                              visible_match_providers: {
-                                ...visibleProviders,
-                                [provider.key]: !isVisible,
-                              },
-                            },
-                          })
-                        }
-                      />
-                      {provider.label}
-                    </label>
-                  );
-                })}
-              </div>
-            </section>
-          </div>
+              ))}
+            </div>
+          </SettingsGroup>
 
-          {/* the artist page's own part, kept per profile */}
-          <div className={styles.tableOptionsStack}>
-            <ArtistPageOptions prefs={prefsQuery.data} />
-          </div>
+          <SettingsGroup
+            title="Track editor"
+            hint="How a track's metadata, tags, lyrics and quality profile open."
+          >
+            <div className={ls.choices} role="radiogroup" aria-label="Track editor">
+              {(
+                [
+                  [
+                    true,
+                    'title',
+                    'Click the title (default)',
+                    'The underlined track title opens the editor. The Actions column stays narrow.',
+                  ],
+                  [
+                    false,
+                    'pencil',
+                    'Pencil button',
+                    'An edit button in the Actions column, next to search and add to playlist.',
+                  ],
+                ] as const
+              ).map(([viaTitle, picture, label, text]) => (
+                <ChoiceCard
+                  key={label}
+                  name="track-edit-via"
+                  picture={picture}
+                  title={label}
+                  text={text}
+                  checked={editViaTitle === viaTitle}
+                  onChange={() => mutation.mutate({ track_table: { edit_via_title: viaTitle } })}
+                />
+              ))}
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup
+            title="Match providers"
+            hint="Which provider chips the Match column shows."
+          >
+            <div className={ls.rows}>
+              <SwitchRow
+                label="Show every provider"
+                checked={showAllProviders}
+                onChange={() =>
+                  mutation.mutate({
+                    track_table: { show_all_match_providers: !showAllProviders },
+                  })
+                }
+              />
+            </div>
+            <div className={ls.chips}>
+              {shownProviders.map((provider) => {
+                const isVisible = visibleProviders[provider.key] ?? true;
+                return (
+                  <ChipCheck
+                    key={provider.key}
+                    label={provider.label}
+                    dot={provider.color ?? ''}
+                    checked={isVisible}
+                    onChange={() =>
+                      mutation.mutate({
+                        track_table: {
+                          visible_match_providers: {
+                            ...visibleProviders,
+                            [provider.key]: !isVisible,
+                          },
+                        },
+                      })
+                    }
+                  />
+                );
+              })}
+            </div>
+          </SettingsGroup>
         </div>
       }
     />
@@ -10847,7 +11337,7 @@ export function TrackTableBulkBar({
         type="button"
         className={styles.bulkBarButton}
         data-requires-write=""
-        disabled={busy !== null || trackIds.length === 0 || !canWrite}
+        disabled={busy !== null || trackIds.length === 0 || !canWish}
         onClick={() => setShowTagPreview(true)}
       >
         Write Tags
@@ -10865,7 +11355,7 @@ export function TrackTableBulkBar({
         type="button"
         className={styles.bulkBarButton}
         data-requires-write=""
-        disabled={busy !== null || trackIds.length === 0 || !canWrite}
+        disabled={busy !== null || trackIds.length === 0 || !canWish}
         onClick={() =>
           void run('ReplayGain', () =>
             fanOut('ReplayGain', trackIds, (id) => analyzeLibraryV2TrackReplayGain(id)),
@@ -11179,6 +11669,7 @@ export function AlbumTrackTable({
   queueStatusTracks,
   currentArtistId,
   onOpenArtist,
+  renameTrackIds,
 }: {
   albumId: number;
   /** Discography-only releases materialize their provider tracklist on expand. */
@@ -11198,6 +11689,8 @@ export function AlbumTrackTable({
   currentArtistId?: number;
   /** Supplied by route-owned pages; omitted in standalone table surfaces. */
   onOpenArtist?: OpenTrackArtist;
+  /** #2141: tracks whose file Preview rename would move (the artist page's check) */
+  renameTrackIds?: ReadonlySet<number>;
 }) {
   const canWrite = useLibraryV2CanWrite();
   const albumQuery = useQuery(libraryV2AlbumQueryOptions(albumId, { resolve }));
@@ -11347,6 +11840,7 @@ export function AlbumTrackTable({
   const profileNameById = new Map((profilesQuery.data ?? []).map((p) => [p.id, p.name]));
 
   const sortedTracks = sortTracks(album.tracks, sort);
+  const slotKeepers = leftoverSlotKeepers(album.tracks);
   const selectableIds = album.tracks.filter((t) => t.id != null).map((t) => t.id as number);
   const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
   const selectedTracks = album.tracks.filter((t) => t.id != null && selected.has(t.id as number));
@@ -11719,6 +12213,7 @@ export function AlbumTrackTable({
               key={track.id ?? `missing-${i}`}
               track={track}
               albumTitle={album.title}
+              albumImageUrl={album.image_url}
               entityBase={{
                 albumId: album.id,
                 qualityProfileId: album.quality_profile?.id,
@@ -11740,6 +12235,8 @@ export function AlbumTrackTable({
               queueStatus={track.id != null ? queueTracks[track.id] : undefined}
               currentArtistId={currentArtistId}
               onOpenArtist={onOpenArtist}
+              wouldRename={track.id != null && Boolean(renameTrackIds?.has(track.id))}
+              slotKeeper={track.id != null ? slotKeepers.get(track.id) : undefined}
             />
           ))}
         </tbody>
@@ -11939,7 +12436,7 @@ export function TrackMetadataGapsCell({
     : !canWrite
       ? 'Click to inspect the file tags.'
       : checks?.edition === 'unknown'
-        ? 'Select the release in Re-identify before repairing track numbers.'
+        ? 'More than one edition of this release is on record, so track numbers can’t be repaired yet. Pick the release with Re-identify, in this track’s ⋯ menu.'
         : 'Click to repair the stored metadata findings and verify the file again.';
   return (
     <Tooltip.Root>
@@ -11964,6 +12461,8 @@ export function TrackMetadataGapsCell({
 type TrackRowProps = {
   track: LibraryV2Track;
   albumTitle: string;
+  /** the album's cover, for Now Playing */
+  albumImageUrl?: string | null;
   entityBase: Lib2EntityRef;
   matchServices: LibraryV2MatchService[];
   profileName: string | null;
@@ -11985,6 +12484,10 @@ type TrackRowProps = {
   version?: boolean;
   currentArtistId?: number;
   onOpenArtist?: OpenTrackArtist;
+  /** #2141: its file isn't where the naming template puts it */
+  wouldRename?: boolean;
+  /** #2094: a row with no file, and the row at its position that has the file */
+  slotKeeper?: { id: number; title: string };
 };
 
 type TrackArtist = { id: number; name: string };
@@ -12061,6 +12564,7 @@ function TrackRow(props: TrackRowProps) {
   const {
     track,
     albumTitle,
+    albumImageUrl,
     entityBase,
     matchServices,
     profileName,
@@ -12078,6 +12582,8 @@ function TrackRow(props: TrackRowProps) {
     version = false,
     currentArtistId,
     onOpenArtist,
+    wouldRename = false,
+    slotKeeper,
   } = props;
   const [showVersions, setShowVersions] = useState(false);
   const missing = track.file_status === 'missing';
@@ -12131,6 +12637,7 @@ function TrackRow(props: TrackRowProps) {
               ) : (
                 <span className={missing ? styles.muted : undefined}>{label}</span>
               )}
+              {track.popular ? <PopularMark /> : null}
               <InlineFileStatus status={track.file_status} linkedFrom={track.linked_from} />
               {(track.file_count ?? 0) > 1 ? (
                 <button
@@ -12365,13 +12872,21 @@ function TrackRow(props: TrackRowProps) {
             style={widthStyle('file_path')}
             title={track.file?.path ?? undefined}
           >
-            {track.file?.playlists?.length ? (
+            {track.file?.playlists?.length || wouldRename ? (
               <div className={styles.fileVersionBadges}>
-                {track.file.playlists.map((name) => (
+                {track.file?.playlists?.map((name) => (
                   <span key={name} className={styles.fileRoleBadge} title="Saved for this playlist">
                     Playlist: {name}
                   </span>
                 ))}
+                {wouldRename ? (
+                  <span
+                    className={styles.albumRenameBadge}
+                    title="This file is not where your naming template puts it. Preview Rename / Organize on the album shows where it goes."
+                  >
+                    To rename
+                  </span>
+                ) : null}
               </div>
             ) : null}
             <FilePathCellBody path={track.file?.path} display={track.file?.display_path} />
@@ -12405,6 +12920,7 @@ function TrackRow(props: TrackRowProps) {
             <TrackPlayButton
               track={track}
               albumTitle={albumTitle}
+              albumImageUrl={albumImageUrl}
               artistName={track.artists.map((a) => a.name).join(', ')}
             />
           </td>
@@ -12496,6 +13012,7 @@ function TrackRow(props: TrackRowProps) {
             albumId={entityBase.albumId}
             albumTitle={albumTitle}
             artistName={track.artists.map((a) => a.name).join(', ')}
+            slotKeeper={slotKeeper}
           />
           {track.id ? (
             <TrackDetailButton
@@ -12602,10 +13119,12 @@ function TrackVersionLabel({ track }: { track: LibraryV2Track }) {
 export function TrackPlayButton({
   track,
   albumTitle,
+  albumImageUrl,
   artistName,
 }: {
   track: LibraryV2Track;
   albumTitle: string;
+  albumImageUrl?: string | null;
   artistName: string;
 }) {
   const trackId = track.id;
@@ -12638,6 +13157,9 @@ export function TrackPlayButton({
             // album id into a legacy slot is the H-14 confusion; the player
             // gets the display strings below instead.
             album_id: null,
+            // the player used to take its cover from the title+artist
+            // re-resolve, which this v2 row no longer runs (review 5 R5-L-1)
+            _stats_image: albumImageUrl ?? null,
           },
           albumTitle,
           artistName,
@@ -12871,6 +13393,17 @@ export function TrackLyricsBadge({
 }
 
 /** Legacy parity: present/missing indicator that sits inline after the title. */
+/** #2144: plexamp's flame for an album's most played tracks (last.fm plays,
+ *  ranked inside the album by the server). */
+export function PopularMark() {
+  const text = 'Popular: one of the most played tracks on this album (Last.fm)';
+  return (
+    <span className={styles.popularMark} role="img" aria-label={text} title={text}>
+      <LineIcon name="flame" size={13} />
+    </span>
+  );
+}
+
 function InlineFileStatus({
   status,
   linkedFrom,
@@ -14465,6 +14998,10 @@ export function GlobalAutomaticSearchButton() {
  *  each, instead of four equal buttons a new user had to decode. */
 export function LibraryMoreMenu() {
   const search = useGlobalAutomaticSearch();
+  // Watch All adds to the caller's own watchlist: anyone who may wish, not
+  // only the admin (a household member watches in the shared library)
+  const canWatch = useLibraryV2CanWish();
+  const moreQueryClient = useQueryClient();
   const [exporting, setExporting] = useState(false);
   const [watching, setWatching] = useState(false);
   const item = (key: string, name: string, desc: string) => (
@@ -14483,7 +15020,7 @@ export function LibraryMoreMenu() {
             type="button"
             className={`${styles.btnGhost} ${styles.automaticSearchButton} library-more-btn`}
             aria-label="More library actions"
-            title="Automatic Search, Watch All and Export"
+            title="Automatic Search, Watch All, Export and file tag values"
             {...props}
           >
             More
@@ -14522,13 +15059,25 @@ export function LibraryMoreMenu() {
               'Watch All',
               'Add every artist in your library to your Watchlist.',
             ),
-            disabled: !search.canWrite,
+            disabled: !canWatch,
             onSelect: () => setWatching(true),
           },
           {
             key: 'export',
             label: item('export', 'Export artists', 'Save your artist list as JSON, CSV or text.'),
             onSelect: () => setExporting(true),
+          },
+          {
+            // #2084: what Use File Tags saved is kept as edits, which keeps
+            // enrichment and repairs off those fields. this lets go of all of it
+            key: 'release-file-tags',
+            label: item(
+              'release-file-tags',
+              'Release file tag values',
+              'Let metadata sources and repairs update what Use File Tags saved.',
+            ),
+            disabled: !search.canWrite,
+            onSelect: () => void releaseLibraryFileTagValues(moreQueryClient),
           },
         ]}
       />
@@ -14558,6 +15107,37 @@ export function LibraryEmptyState({ pollIntervalMs = 1000 }: { pollIntervalMs?: 
   const bootstrap = importQuery.data?.bootstrap;
   const migrating = bootstrap?.status === 'running';
   const failed = bootstrap?.status === 'failed';
+
+  // #2062: a new install has no older library. "Import your existing library"
+  // sent those users into a migration with nothing to read, which failed and
+  // told them everything was paused. They get the two real ways in instead.
+  if (importQuery.data?.has_legacy_source === false && !migrating) {
+    return (
+      <div className={styles.emptyState}>
+        <h2>Your library is empty</h2>
+        <p>
+          Find music in Search and download it, or bring in files you already have from the Import
+          page. Both show up here.
+        </p>
+        <span className={styles.importWrap}>
+          <button
+            type="button"
+            className={styles.btnPrimary}
+            onClick={() => void window.navigateToPage?.('search')}
+          >
+            Open Search
+          </button>
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() => void window.navigateToPage?.('import')}
+          >
+            Open Import
+          </button>
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div className={styles.emptyState}>

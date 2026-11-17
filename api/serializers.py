@@ -429,6 +429,10 @@ def serialize_watchlist_artist(obj, fields: Optional[Set[str]] = None) -> dict:
         "include_eps": bool(d.get("include_eps", True)),
         "include_singles": bool(d.get("include_singles", True)),
         "include_live": bool(d.get("include_live", False)),
+        # #2082: never set = it follows include_live
+        "include_live_tracks": bool(d.get("include_live", False)
+                                    if d.get("include_live_tracks") is None
+                                    else d.get("include_live_tracks")),
         "include_remixes": bool(d.get("include_remixes", False)),
         "include_acoustic": bool(d.get("include_acoustic", False)),
         "include_compilations": bool(d.get("include_compilations", False)),
@@ -585,7 +589,8 @@ _METASYNC_ARTIST_IDS = (
 )
 
 _METASYNC_ALBUM_IDS = (
-    "musicbrainz_release_id", "spotify_album_id", "itunes_album_id",
+    "musicbrainz_release_id", "musicbrainz_release_group_id",
+    "spotify_album_id", "itunes_album_id",
     "deezer_id", "discogs_id", "amazon_id", "tidal_id", "qobuz_id",
     "audiodb_id", "jiosaavn_id", "bandcamp_url", "upc",
 )
@@ -602,6 +607,7 @@ _METASYNC_TRACK_IDS = (
 _METASYNC_ID_PROVIDER = {
     "musicbrainz_id": "musicbrainz", "musicbrainz_release_id": "musicbrainz",
     "musicbrainz_recording_id": "musicbrainz",
+    "musicbrainz_release_group_id": "musicbrainz",
     "spotify_artist_id": "spotify", "spotify_album_id": "spotify",
     "spotify_track_id": "spotify",
     "itunes_artist_id": "itunes", "itunes_album_id": "itunes",

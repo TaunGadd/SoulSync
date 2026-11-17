@@ -84,6 +84,11 @@ def api(tmp_path, monkeypatch):
     conn = row_conn(db_path)
     from core.library2.schema import ensure_library_v2_schema
     ensure_library_v2_schema(conn)
+    # an install upgraded from before the cutover: its (empty) older tables
+    # are still there. a fresh install has none, and the import route answers
+    # nothing_to_import for it (#2062, tested below with them dropped)
+    for legacy in ("artists", "albums", "tracks"):
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {legacy}(id INTEGER PRIMARY KEY, name TEXT)")
 
     cur = conn.cursor()
     cur.execute("INSERT INTO lib2_artists(name, sort_name, spotify_id, monitored) "
@@ -1359,6 +1364,9 @@ def test_acquisition_grab_submits_once_and_returns_only_public_state(api):
         "candidates_evaluated",
         "force_grab",
         "grab_prepared",
+        # review 5 W2-WC-1: the submission-started journal entry is written
+        # now (it used to fail and roll back every time)
+        "grab_submission_started",
         "grab_submitted",
     ]
 
@@ -1507,6 +1515,44 @@ def test_album_cascade_still_projects_ruleless_tracks(api):
     with _conn(db) as conn:
         assert conn.execute("SELECT monitored FROM lib2_tracks WHERE id=?",
                             (ids["album_track"],)).fetchone()[0] == 0
+
+
+def test_bulk_unwish_never_touches_an_album_the_artist_only_guests_on(api):
+    """third #1062 review G07-2: "Remove everything from Wishlist" on artist X
+    wrote an unmonitor rule on Artist Y's album X guests on, and Add all
+    wanted whole compilations. 3.6.1's watchlist acted on X's own releases"""
+    import time
+    from core.library2.artist_aliases import artist_fronted_album_ids
+    client, db, ids = api
+    with _conn(db) as conn:
+        other = conn.execute("INSERT INTO lib2_artists(name) VALUES('Artist Y')").lastrowid
+        their_album = conn.execute(
+            "INSERT INTO lib2_albums(primary_artist_id, title, album_type, monitored) "
+            "VALUES(?, 'Y Album', 'album', 1)", (other,)).lastrowid
+        conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, 'primary')",
+                     (their_album, other))
+        conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, 'featured')",
+                     (their_album, ids["artist"]))
+        guest_track = conn.execute(
+            "INSERT INTO lib2_tracks(album_id, title, track_number, monitored) VALUES(?, 'Feat', 1, 1)",
+            (their_album,)).lastrowid
+        conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) VALUES(?, ?, 'featured', 1)",
+                     (guest_track, ids["artist"]))
+        conn.commit()
+        assert their_album not in artist_fronted_album_ids(conn, ids["artist"])
+        assert ids["views"] in artist_fronted_album_ids(conn, ids["artist"])
+
+    started = client.post(f"/api/library/v2/artists/{ids['artist']}/releases/monitor",
+                          json={"scope": "all", "monitored": False}).get_json()
+    for _ in _patience():
+        if not client.get("/api/library/v2/jobs/status",
+                          query_string={"job_id": started["job_id"]}).get_json()["running"]:
+            break
+        time.sleep(0.01)
+    with _conn(db) as conn:
+        assert conn.execute("SELECT monitored FROM lib2_albums WHERE id=?", (their_album,)).fetchone()[0] == 1
+        assert not conn.execute("SELECT 1 FROM lib2_monitor_rules WHERE entity_type='album' "
+                                "AND entity_id=?", (their_album,)).fetchone()
 
 
 def test_bulk_monitor_updates_rules_projection_and_sets_hand_set_tracks(api):
@@ -1880,6 +1926,32 @@ def test_delete_album_withdraws_every_profiles_wish(api):
     assert {r["profile_id"] for r in db.wishlist_removes} == {1, 3}
     # an album delete leaves the artist on everyone's watchlist
     assert db.watchlist_removes == []
+
+
+def test_deleting_a_listed_album_keeps_it_on_the_discography(api):
+    """#2012: removing an album the provider lists took it off the artist's
+    discography too, so "3 of 3" became "2 of 2". as in lidarr it stays
+    listed, not owned and not wanted; one no provider lists is deleted"""
+    client, db, ids = api
+    with _conn(db) as conn:
+        conn.execute("UPDATE lib2_albums SET spotify_id='sp-views' WHERE id=?", (ids["views"],))
+        conn.execute("UPDATE lib2_albums SET spotify_id=NULL, musicbrainz_id=NULL, external_ids='{}'"
+                     " WHERE id=?", (ids["ep"],))
+        conn.commit()
+
+    assert client.delete(f"/api/library/v2/albums/{ids['views']}").get_json()["success"] is True
+    assert client.delete(f"/api/library/v2/albums/{ids['ep']}").get_json()["success"] is True
+
+    with _conn(db) as conn:
+        views = conn.execute("SELECT origin, monitored FROM lib2_albums WHERE id=?", (ids["views"],)).fetchone()
+        assert views is not None and views["origin"] == "discography" and views["monitored"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lib2_track_files f JOIN lib2_tracks t ON t.id=f.track_id"
+            " WHERE t.album_id=?", (ids["views"],)).fetchone()[0] == 0
+        rule = conn.execute("SELECT monitored, provenance FROM lib2_monitor_rules WHERE entity_type='album'"
+                            " AND entity_id=? AND profile_id=1", (ids["views"],)).fetchone()
+        assert rule is not None and rule["monitored"] == 0 and rule["provenance"] == "user_explicit"
+        assert conn.execute("SELECT 1 FROM lib2_albums WHERE id=?", (ids["ep"],)).fetchone() is None
 
 
 def test_delete_featured_artist_keeps_owner_album(api):
@@ -4544,6 +4616,76 @@ def test_import_runs_when_the_state_says_done_but_the_catalogue_is_empty(
         time.sleep(0.01)
 
 
+def _drop_older_library(db):
+    conn = db._get_connection()
+    for legacy in ("artists", "albums", "tracks"):
+        conn.execute(f"DROP TABLE IF EXISTS {legacy}")
+    conn.commit()
+    conn.close()
+
+
+def test_a_fresh_install_has_nothing_to_import_and_is_not_marked_failed(api, monkeypatch):
+    """#2062: a new install has no older library. Import library started the
+    legacy import anyway, it failed on the missing tables ("legacy table is
+    missing required columns: id, name"), and the failed row made the page say
+    the upgrade had failed and everything was paused."""
+    from api import library_v2 as api_module
+    from core.library2 import bootstrap as lib2_bootstrap, importer
+
+    client, db, _ids = api
+    _drop_older_library(db)
+    ran = []
+    monkeypatch.setattr(importer, "import_legacy_library",
+                        lambda *_a, **_k: ran.append(1) or {})
+    api_module._import_state.update(running=False, stage=None, current=0, total=0,
+                                    stats=None, error=None, finished_at=None)
+
+    response = client.post("/api/library/v2/import", json={})
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "nothing_to_import"
+    assert not ran
+    assert lib2_bootstrap.get_state(db).get("status") != "failed"
+    status = client.get("/api/library/v2/import/status").get_json()
+    assert status["has_legacy_source"] is False and status["running"] is False
+    # reset and force have nothing to read either
+    assert client.post("/api/library/v2/import",
+                       json={"reset": True}).get_json()["code"] == "nothing_to_import"
+    assert client.post("/api/library/v2/import",
+                       json={"force": True}).get_json()["code"] == "nothing_to_import"
+
+
+def test_a_failure_an_earlier_build_left_on_a_fresh_install_is_cleared(api):
+    from core.library2 import bootstrap as lib2_bootstrap
+
+    client, db, _ids = api
+    _drop_older_library(db)
+    owner = lib2_bootstrap.try_claim(db)
+    assert lib2_bootstrap.mark_failed(
+        db, owner, "legacy table is missing required columns: id, name")
+    assert lib2_bootstrap.get_state(db)["status"] == "failed"
+
+    status = client.get("/api/library/v2/import/status").get_json()
+
+    assert status["bootstrap"]["status"] == "waiting_for_source"
+    assert not status["bootstrap"].get("last_error")
+
+
+def test_a_real_upgrade_failure_is_not_cleared(api):
+    from core.library2 import bootstrap as lib2_bootstrap
+
+    client, db, _ids = api          # the older tables are there
+    owner = lib2_bootstrap.try_claim(db)
+    lib2_bootstrap.mark_failed(db, owner, "disk full")
+
+    status = client.get("/api/library/v2/import/status").get_json()
+
+    assert status["has_legacy_source"] is True
+    assert status["bootstrap"]["status"] == "failed"
+    assert status["bootstrap"]["last_error"] == "disk full"
+    assert lib2_bootstrap.settle_failed_without_source(db) is False
+
+
 def test_the_repeat_run_refusal_is_machine_readable(api):
     """The message names ``force`` as the way through, so the Import tile has to
     be able to tell THIS refusal from every other failure to offer it. Matching
@@ -4678,6 +4820,8 @@ def test_the_songs_section_lists_owned_songs_with_catalogue_ids(api):
     assert song["album_id"] == ids["views"] and song["format"] == "FLAC"
     assert song["album_thumb_url"].startswith("/api/library/v2/artwork/album/")
     assert song["liked"] is False and song["copies"] == 1
+    # a row names the file it shows: its delete acts on that file alone
+    assert song["file_id"] in song["file_ids"]
     copies = client.get(f"/api/library/v2/songs/{ids['album_track']}/copies").get_json()
     assert [c["file_path"] for c in copies["copies"]] == ["/m/one-dance.flac"]
     assert client.get("/api/library/v2/songs?limit=501").status_code == 400
@@ -4699,6 +4843,47 @@ def test_the_artist_detail_match_writes_the_library_v2_row(api):
         "SELECT external_ids FROM lib2_albums WHERE id=?", (ids["views"],)).fetchone()[0])
     conn.close()
     assert stored["deezer"] == "dz-album" and "deezer" not in cleared
+
+
+def test_a_cleared_match_is_not_searched_back(api):
+    """second v2 review (T2): clearing a wrong match deleted its attempt row,
+    so the worker read the album as never attempted, searched by name and
+    stored the same wrong id again. 3.6.1 kept a cleared match cleared until
+    the user matched it by hand"""
+    from core.library2.match_status import apply_manual_match
+    from core.library2.provider_attempts import due_entities
+    _client, db, ids = api
+    conn = _conn(db)
+    apply_manual_match(conn, "album", ids["views"], "deezer", "dz-wrong", actor="profile:1")
+    apply_manual_match(conn, "album", ids["views"], "deezer", None, actor="profile:1")
+    conn.commit()
+    assert ids["views"] not in due_entities(conn, entity_type="album", service="deezer", limit=1000)
+    # a manual match later is still the user's answer
+    apply_manual_match(conn, "album", ids["views"], "deezer", "dz-right", actor="profile:1")
+    conn.commit()
+    row = conn.execute("SELECT status FROM lib2_provider_attempts WHERE entity_type='album'"
+                       " AND entity_id=? AND service='deezer'", (ids["views"],)).fetchone()
+    conn.close()
+    assert row[0] == "matched"
+
+
+def test_an_id_moved_to_another_release_sends_its_old_holder_back_to_the_queue(api):
+    """third #1062 review P2B-1: matching release B by hand to an id release A
+    held moves the id, but A never said its match was wrong. it must be looked
+    up again (not "cleared by user"), and a pin naming that id is lifted"""
+    from core.library2.match_status import apply_manual_match
+    from core.library2.provider_attempts import due_entities
+    _client, db, ids = api
+    conn = _conn(db)
+    apply_manual_match(conn, "album", ids["ep"], "deezer", "dz-shared", actor="profile:1")
+    conn.commit()
+    apply_manual_match(conn, "album", ids["views"], "deezer", "dz-shared", actor="profile:1")
+    conn.commit()
+    assert ids["ep"] in due_entities(conn, entity_type="album", service="deezer", limit=1000)
+    pin = conn.execute("SELECT canonical_album_id, COALESCE(canonical_locked,0) FROM lib2_albums "
+                       "WHERE id=?", (ids["ep"],)).fetchone()
+    conn.close()
+    assert pin[0] != "dz-shared" and not pin[1]
 
 
 def test_a_fixed_artist_match_moves_the_profiles_watchlist_entry(api):
@@ -4856,3 +5041,124 @@ def test_discovery_resolves_a_provider_album_link_to_the_catalogue_release(api):
 
     assert hit["album_id"] == ids["views"]
     assert miss["album_id"] is None
+
+
+def test_an_import_waits_for_the_last_ones_convergence(api):
+    """review 4 R4-D-4: the convergence after an import folds and merges rows;
+    a second import started meanwhile wrote the same rows alongside it"""
+    import threading
+    client, _db, _ids = api
+    release = threading.Event()
+    t = threading.Thread(target=release.wait, name="lib2-converge", daemon=True)
+    t.start()
+    try:
+        r = client.post("/api/library/v2/import", json={})
+        assert r.status_code == 409
+        assert "settling" in r.get_json()["error"]
+    finally:
+        release.set()
+        t.join(2)
+
+
+def test_reset_rearms_the_one_time_upgrade_carries(api):
+    """review 4 R4-A-5: the 3.6.1 carries and the twin merge kept their
+    run-once markers through a reset, so a re-run upgrade skipped them"""
+    client, db, _ids = api
+    with closing(_conn(db)) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS lib2_upgrade_repairs "
+                     "(name TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        for name in ("legacy_columns_v1", "legacy_album_kind_known_v1", "legacy_issue_ids_v1",
+                     "legacy_genre_locks_v1", "quality_profile_ids_valid_v1"):
+            conn.execute("INSERT OR IGNORE INTO lib2_upgrade_repairs(name) VALUES(?)", (name,))
+        for table in ("_lib2_import_twins_merged_v2", "_lib2_legacy_credits_carried",
+                      "_lib2_member_watchlists_carried"):
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (applied_at TEXT)")
+        conn.commit()
+
+    assert client.post("/api/library/v2/reset").status_code == 200
+
+    with closing(_conn(db)) as conn:
+        names = {r[0] for r in conn.execute("SELECT name FROM lib2_upgrade_repairs")}
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "quality_profile_ids_valid_v1" in names      # not an upgrade carry
+    assert not names & {"legacy_columns_v1", "legacy_album_kind_known_v1",
+                        "legacy_issue_ids_v1", "legacy_genre_locks_v1"}
+    assert not tables & {"_lib2_import_twins_merged_v2", "_lib2_legacy_credits_carried",
+                         "_lib2_member_watchlists_carried"}
+
+
+# ── #2070: use the files' own tags ───────────────────────────────────────────
+
+def test_use_file_tags_previews_then_applies_over_http(api, monkeypatch):
+    client, db, ids = api
+    conn = db._get_connection()
+    conn.execute("INSERT INTO lib2_track_files(track_id, path, format) VALUES(?, '/m/tagged.flac', 'flac')",
+                 (ids["album_track"],))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("core.library2.paths.resolve_lib2_path", lambda p: p)
+    monkeypatch.setattr("core.tag_writer.read_file_tags", lambda path: {
+        "title": "Tagged Title", "album": None, "year": "2016", "track_number": "9",
+        "disc_number": None, "genre": None})
+
+    preview = client.get(f"/api/library/v2/tracks/{ids['album_track']}/use-file-tags").get_json()
+
+    assert preview["success"] is True
+    changes = {c["field"]: c["file"] for c in preview["tracks"][0]["changes"]}
+    assert changes["title"] == "Tagged Title" and changes["track_number"] == 9
+    assert preview["counts"]["moves"] == 0
+
+    applied = client.post(f"/api/library/v2/tracks/{ids['album_track']}/use-file-tags").get_json()
+
+    assert applied["success"] is True and applied["tracks_changed"] == 1
+    from core.library2.metadata_overrides import get_field_overrides
+    conn = db._get_connection()
+    saved = get_field_overrides(conn, entity_type="track", entity_id=ids["album_track"])
+    conn.close()
+    assert saved["title"].value == "Tagged Title" and saved["track_number"].value == 9
+
+
+def test_file_tag_values_are_counted_and_released_over_http(api, monkeypatch):
+    # #2084: what Use File Tags saved can be let go of, for one thing or the
+    # whole Library, and a hand edit is not part of that
+    from core.library2.metadata_overrides import get_field_overrides, set_field_override
+
+    client, db, ids = api
+    conn = db._get_connection()
+    conn.execute("INSERT INTO lib2_track_files(track_id, path, format) VALUES(?, '/m/tagged.flac', 'flac')",
+                 (ids["album_track"],))
+    set_field_override(conn, entity_type="track", entity_id=ids["album_track"],
+                       field_name="disc_number", value=2, reason=None)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("core.library2.paths.resolve_lib2_path", lambda p: p)
+    monkeypatch.setattr("core.tag_writer.read_file_tags", lambda path: {
+        "title": "Tagged Title", "album": None, "year": "2016", "track_number": "9",
+        "disc_number": None, "genre": None})
+    track_url = f"/api/library/v2/tracks/{ids['album_track']}/use-file-tags"
+    client.post(track_url)
+
+    held = client.get(track_url).get_json()["counts"]["held"]
+    assert held >= 2   # the title and the number, and whatever the album took
+    assert client.get("/api/library/v2/use-file-tags").get_json() == {"success": True, "held": held}
+
+    assert client.delete(track_url).get_json() == {"success": True, "released": held}
+    assert client.get("/api/library/v2/use-file-tags").get_json()["held"] == 0
+    conn = db._get_connection()
+    left = get_field_overrides(conn, entity_type="track", entity_id=ids["album_track"])
+    conn.close()
+    assert set(left) == {"disc_number"}
+
+    client.post(track_url)
+    assert client.delete("/api/library/v2/use-file-tags").get_json() == {
+        "success": True, "released": held}
+    assert client.delete("/api/library/v2/use-file-tags").get_json() == {
+        "success": True, "released": 0}
+    assert client.delete("/api/library/v2/albums/999999/use-file-tags").status_code == 404
+
+
+def test_use_file_tags_answers_404_for_something_that_is_not_there(api):
+    client, _db, _ids = api
+    assert client.get("/api/library/v2/albums/999999/use-file-tags").status_code == 404
+    assert client.post("/api/library/v2/artists/999999/use-file-tags").status_code == 404
+    assert client.get("/api/library/v2/playlists/1/use-file-tags").status_code in (400, 404)

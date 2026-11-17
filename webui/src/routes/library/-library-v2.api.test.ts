@@ -124,6 +124,7 @@ describe('library v2 artist settings api', () => {
       include_eps: true,
       include_singles: true,
       include_live: false,
+      include_live_tracks: false,
       include_remixes: false,
       include_acoustic: false,
       include_compilations: false,
@@ -185,6 +186,7 @@ describe('library v2 artist settings api', () => {
             include_eps: true,
             include_singles: true,
             include_live: false,
+            include_live_tracks: false,
             include_remixes: false,
             include_acoustic: false,
             include_compilations: false,
@@ -848,8 +850,10 @@ describe('library v2 art picker api', () => {
         });
       }),
     );
-    await expect(applyLibraryV2AlbumArt(42, 'https://example.com/pick.jpg')).resolves.toBe(
-      '/api/library/v2/artwork/album/42',
+    await expect(applyLibraryV2AlbumArt(42, 'https://example.com/pick.jpg')).resolves.toMatchObject(
+      {
+        image_url: '/api/library/v2/artwork/album/42',
+      },
     );
   });
 
@@ -914,8 +918,10 @@ describe('library v2 artist image picker api (deep-dive A9)', () => {
         });
       }),
     );
-    await expect(applyLibraryV2ArtistArt(7, 'https://example.com/pick.jpg')).resolves.toBe(
-      '/api/library/v2/artwork/artist/7',
+    await expect(applyLibraryV2ArtistArt(7, 'https://example.com/pick.jpg')).resolves.toMatchObject(
+      {
+        image_url: '/api/library/v2/artwork/artist/7',
+      },
     );
   });
 

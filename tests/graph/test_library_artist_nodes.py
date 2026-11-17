@@ -109,3 +109,29 @@ def test_an_unnamed_row_is_no_node(conn):
     owned, meta, artists = load_library_artists(conn)
 
     assert (owned, meta, artists) == (set(), {}, [])
+
+
+def test_a_featured_credit_alone_is_not_a_library_artist(conn):
+    """review 5 W3-TD-3: the 'artist' owned predicate also counts a featured
+    credit on one owned track, so ~22k guest names became Taste Map nodes and
+    dropped out of the Discovery Web's suggestions. a release of their own,
+    or leading most of a joint album (#2142), is what makes an artist the
+    library's. an album credit marked primary alone is not."""
+    _artist(conn, 'Topic')
+    guest = _artist(conn, 'A7S', owned=False)
+    joint = _artist(conn, 'Joint Act', owned=False)
+    track = conn.execute("SELECT id FROM lib2_tracks LIMIT 1").fetchone()[0]
+    album = conn.execute("SELECT album_id FROM lib2_tracks WHERE id=?", (track,)).fetchone()[0]
+    conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+                 "VALUES(?,?,'featured',1)", (track, guest))
+    stray = _artist(conn, 'Stray Credit', owned=False)
+    conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+                 "VALUES(?,?,'primary',0)", (track, joint))
+    conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) "
+                 "VALUES(?,?,'primary')", (album, stray))
+    conn.commit()
+
+    owned, _meta, artists = load_library_artists(conn)
+
+    assert owned == {'topic', 'joint act'}
+    assert sorted(a[0] for a in artists) == ['Joint Act', 'Topic']

@@ -133,6 +133,16 @@ def _discover_dial_key():
         return '0.3'
 
 
+def _discover_source_key():
+    """The active metadata source, for shelves drawn from it. without it a
+    source switch kept serving the old source's ids until the warmer's next
+    pass or the 30-minute ttl (review 5 W3-TB-3)."""
+    try:
+        return _get_active_discovery_source()
+    except Exception:
+        return 'unknown'
+
+
 def _discover_rank_key():
     """The two re-ranked artist shelves: the dial, and this profile's more /
     less feedback, so an answer re-ranks that profile's shelf and no other."""
@@ -1364,20 +1374,23 @@ def _bylt_owned_lookup(database, sections):
 
 
 def _owned_album_keys_for(conn, artist_names):
-    """(title, artist) of the albums you own by these artists, lowercased.
+    """album_presence_key of every album you own by these artists.
 
     the shelf only ever drops albums by its 25 top artists, so it asks for
     those artists' albums and not the whole library's: 70k album keys and an
     ownership check on each was 3.9s live (Nov 4 2026). names fold in python
     because sqlite's LOWER only folds ascii, and a listened "Björk" has to
-    meet the library's "BJÖRK". ownership is the asker's own library."""
+    meet the library's "BJÖRK" (and a "Bjork"). the key is the one the shelf
+    folds its candidates with, so punctuation and a pressing tag never make
+    an owned album look missing (#2083). ownership is the asker's own library."""
     from core.library2.sql_util import owned_sql
+    from core.wishlist.presence import album_presence_key, artist_presence_key
 
-    wanted = {str(n).lower().strip() for n in artist_names if n}
+    wanted = {artist_presence_key(n) for n in artist_names if n}
     if not wanted:
         return set()
     ids = [int(r[0]) for r in conn.execute("SELECT id, name FROM lib2_artists")
-           if r[1] and str(r[1]).lower().strip() in wanted]
+           if r[1] and artist_presence_key(r[1]) in wanted]
     keys = set()
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
@@ -1389,7 +1402,7 @@ def _owned_album_keys_for(conn, artist_names):
                AND al.title IS NOT NULL
                AND {owned_sql('album', 'al')}
         """, chunk)
-        keys.update((str(t).lower().strip(), str(a).lower().strip()) for t, a in rows)
+        keys.update(album_presence_key(t, a) for t, a in rows)
     return keys
 
 
@@ -2015,7 +2028,7 @@ def get_decade_playlist(decade):
 @_hide_blocked({'tracks': WORKS})
 # a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
 # warmed by web_server's discover warmer), not redrawn on every visit
-@_discover_shelf_cache()
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_popular_picks_playlist():
     """Get high popularity tracks from discovery pool"""
     try:
@@ -2040,7 +2053,7 @@ def get_popular_picks_playlist():
 @_hide_blocked({'tracks': WORKS})
 # a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
 # warmed by web_server's discover warmer), not redrawn on every visit
-@_discover_shelf_cache()
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_hidden_gems_playlist():
     """Get hidden gems (low popularity) from discovery pool"""
     try:
@@ -2165,7 +2178,7 @@ def get_mood_mixes():
 @_hide_blocked({'tracks': WORKS})
 # a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
 # warmed by web_server's discover warmer), not redrawn on every visit
-@_discover_shelf_cache()
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_discovery_shuffle():
     """Get Discovery Shuffle playlist - random tracks from discovery pool"""
     try:
@@ -3239,14 +3252,24 @@ def get_your_artist_info(artist_id):
             database = get_database()
             conn = database._get_connection()
             cursor = conn.cursor()
-            # Check by various ID columns
-            cursor.execute("""
-                SELECT * FROM lib2_artists WHERE id = ? OR spotify_id = ?
-                   OR TRIM(CAST(json_extract(external_ids,'$.itunes') AS TEXT)) = ?
-                   OR TRIM(CAST(json_extract(external_ids,'$.deezer') AS TEXT)) = ?
-                   OR TRIM(CAST(json_extract(external_ids,'$.discogs') AS TEXT)) = ? LIMIT 1
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-            row = cursor.fetchone()
+            # by the provider ids the card carries, never the catalogue row
+            # id: a Deezer id like 13 is not lib2 artist 13 (a stranger). the
+            # canonical row wins, and a name the card sent has to agree
+            from core.library2.importer import normalize_name
+            from core.library2.provider_ids import indexed_provider_id_sql
+            row = None
+            for source in ("spotify", "itunes", "deezer", "discogs"):
+                expression = indexed_provider_id_sql(source)
+                if not expression:
+                    continue
+                cursor.execute(
+                    f"SELECT * FROM lib2_artists WHERE {expression} = ? "
+                    "ORDER BY (canonical_artist_id IS NOT NULL), id LIMIT 1", (str(artist_id),))
+                found = cursor.fetchone()
+                if found and (not artist_name
+                              or normalize_name(found["name"] or "") == normalize_name(artist_name)):
+                    row = found
+                    break
             if row:
                 r = dict(row)
                 from core.library2.provider_ids import parse_external_ids

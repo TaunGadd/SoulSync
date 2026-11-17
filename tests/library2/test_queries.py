@@ -99,12 +99,12 @@ def test_list_artists_stats(imported_conn):
     assert drake["album_count"] == 1
     assert drake["single_count"] == 1
     # §16.2: 'Views' is only partially owned (Hotline Bling has no file), so the
-    # album is no longer blanket-monitored and its missing track is not wanted —
-    # the index stat therefore counts only owned-or-wanted tracks (both present
-    # 'One Dance' cuts), not the un-wanted missing one.
-    assert drake["track_count"] == 2
+    # album is no longer blanket-monitored and its missing track is not wanted.
+    # Drake isn't on the Watchlist, so the count is the albums you have
+    # (#2106 follow-up): Views' missing track counts, as missing.
+    assert drake["track_count"] == 3
     assert drake["tracks_present"] == 2
-    assert drake["tracks_missing"] == 0
+    assert drake["tracks_missing"] == 1
     assert "Wizkid" not in by_name
     wizkid = imported_conn.execute("SELECT id FROM lib2_artists WHERE name='Wizkid'").fetchone()[0]
     assert Q.get_artist(imported_conn, wizkid)["in_library"] is True
@@ -553,7 +553,8 @@ def test_list_artists_search_and_totals_include_alias_members(imported_conn):
     assert [artist["id"] for artist in artists] == [drake_id]
     assert artists[0]["album_count"] == 2
     assert artists[0]["single_count"] == 1
-    assert artists[0]["track_count"] == 3
+    # the albums you have: Views' missing track counts too (#2106 follow-up)
+    assert artists[0]["track_count"] == 4
     assert artists[0]["tracks_present"] == 3
     assert artists[0]["total_size_bytes"] == 10777
 
@@ -743,6 +744,43 @@ def test_album_detail_batches_legacy_download_provenance(imported_conn):
     assert track["file"]["bit_depth"] is None
 
 
+
+def _provenance_table(conn):
+    conn.execute(
+        """CREATE TABLE track_downloads(
+               id INTEGER PRIMARY KEY, file_path TEXT, source_service TEXT,
+               spotify_track_id TEXT, musicbrainz_recording_id TEXT, isrc TEXT,
+               track_title TEXT, track_artist TEXT, track_album TEXT)""")
+
+
+def test_album_provenance_by_file_name_reads_indexes_not_the_history(imported_conn):
+    """review 5 perf: the album view matched a moved download by file name
+    with a "LIKE '%/name'" pair per track, a pass over the whole download
+    history for each one (0.96 s for a 468-track album on the 300k copy). the
+    name is now an indexed expression, and the match is the same"""
+    from core.library2.schema import ensure_library_v2_schema
+    conn = imported_conn
+    _provenance_table(conn)
+    ensure_library_v2_schema(conn)
+    conn.execute(
+        """INSERT INTO track_downloads(id, file_path, source_service, track_title)
+           VALUES(1, 'D:\\old\\place\\01.flac', 'moved-windows', 'Elsewhere'),
+                 (2, '/x/101.flac', 'longer-name', 'Elsewhere'),
+                 (3, '/x/01.flac.part', 'suffixed', 'Elsewhere')""")
+    views_id = conn.execute("SELECT id FROM lib2_albums WHERE title='Views'").fetchone()[0]
+    seen: list = []
+    conn.set_trace_callback(seen.append)
+    album = Q.get_album(conn, views_id)
+    conn.set_trace_callback(None)
+
+    track = next(item for item in album["tracks"] if item["title"] == "One Dance")
+    assert track["file"]["source"] == "moved-windows"
+    lookups = [s for s in seen if "FROM track_downloads" in s]
+    assert lookups
+    for sql in lookups:
+        plan = " | ".join(r[-1] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
+        assert "SCAN track_downloads" not in plan, plan
+
 def test_confirmed_missing_file_is_not_counted_as_present(imported_conn):
     album_id = imported_conn.execute(
         "SELECT id FROM lib2_albums WHERE title='Views'"
@@ -844,9 +882,11 @@ def test_get_album_preserves_unknown_present_file_quality(imported_conn):
 
     assert track["file_status"] == "present"
     assert track["meets_profile"] is None
-    # Fresh installs default to upgrades disabled, so unknown quality remains
-    # visible without becoming an automatic replacement candidate.
-    assert track["upgrade_candidate"] is False
+    # The default profile upgrades what's below it ("acceptable", 3.6.1's
+    # default), so a file of unknown quality is "unknown", not "never". It is
+    # still not queued on its own: mirror_outbox.upgrade_opted_in keeps the
+    # import's baseline from asking for any upgrade.
+    assert track["upgrade_candidate"] is None
 
 
 def test_get_album_evaluates_explicit_track_profile_not_album_profile(imported_conn):
@@ -1178,7 +1218,7 @@ def test_list_artists_can_skip_the_disk_space_rollup(imported_conn):
     # Everything the collapsed list actually renders is unchanged.
     assert by_name["Drake"]["album_count"] == 1
     assert by_name["Drake"]["single_count"] == 1
-    assert by_name["Drake"]["track_count"] == 2
+    assert by_name["Drake"]["track_count"] == 3
     assert by_name["Drake"]["tracks_present"] == 2
     assert by_name["Drake"]["total_size_bytes"] == 0
 
@@ -1238,15 +1278,100 @@ def test_a_guest_spot_is_an_appearance_and_a_collaboration_is_their_own(imported
 
 
 
+def test_featured_in_your_library_counts_the_callers_files(imported_conn, tmp_path):
+    """review 5 W2-WF-3: a member with a library of their own read "featured
+    in your library" counted from the shared library's files"""
+    from unittest import mock
+    from core.library_scope import library_scope
+
+    conn = imported_conn
+    host = conn.execute("INSERT INTO lib2_artists(name, sort_name) VALUES('Host','Host')").lastrowid
+    guest = conn.execute("INSERT INTO lib2_artists(name, sort_name) VALUES('Guest','Guest')").lastrowid
+    album = conn.execute("INSERT INTO lib2_albums(primary_artist_id, title, origin) "
+                         "VALUES(?, 'Hosted', 'library')", (host,)).lastrowid
+    conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?,?,'featured')",
+                 (album, guest))
+    track = conn.execute("INSERT INTO lib2_tracks(album_id, title, track_number) "
+                         "VALUES(?, 'Duet', 1)", (album,)).lastrowid
+    conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+                 "VALUES(?,?,'primary',0), (?,?,'featured',1)", (track, host, track, guest))
+    # the shared library's file (no owner)
+    conn.execute("INSERT INTO lib2_track_files(track_id, path, file_state) VALUES(?, ?, 'active')",
+                 (track, str(tmp_path / "Duet.flac")))
+    conn.commit()
+
+    assert Q.get_artist(conn, guest)["guest_track_count"] == 1
+    with mock.patch('core.library_scope.any_own_library_exists', return_value=True), \
+            library_scope(2):
+        own = Q.get_artist(conn, guest)
+    assert sum(e["tracks_present"] for e in own["appears_on"]) == 0
+    assert (own["guest_track_count"], own["guest_release_count"]) == (0, 0)
+
+
+def test_a_split_single_appears_on_the_second_artists_page(imported_conn):
+    """#2003: one side each is exactly half. the release is the first
+    credited artist's, and appears on the other's page, not in their Singles."""
+    from tests import lib2_seed
+    lib2_seed.artist(imported_conn, 'Lead')
+    other = lib2_seed.artist(imported_conn, 'Other')
+    lib2_seed.track(imported_conn, 'Lead', 'Lead versus Other', 'Side A', track_number=1,
+                    album_cols={'album_type': 'single'})
+    side_b = lib2_seed.track(imported_conn, 'Lead', 'Lead versus Other', 'Side B', track_number=2)
+    imported_conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+                          "VALUES (?, ?, 'primary', 0)", (side_b, other))
+    from core.library2.importer import _rebuild_album_artist_credits
+    album = imported_conn.execute(
+        "SELECT id FROM lib2_albums WHERE title='Lead versus Other'").fetchone()[0]
+    _rebuild_album_artist_credits(imported_conn.cursor(), {album})
+
+    data = Q.get_artist(imported_conn, other)
+
+    assert data["singles"] == [] and data["albums"] == []
+    assert [a["title"] for a in data["appears_on"]] == ["Lead versus Other"]
+
+
+def _views_with(conn, name, *, album_role, lead_tracks):
+    """an artist on Drake's Views (2 tracks, one on disk): an album credit
+    with ``album_role``, and the lead credit on ``lead_tracks`` of its tracks."""
+    views = conn.execute("SELECT id FROM lib2_albums WHERE title='Views'").fetchone()[0]
+    artist = conn.execute("INSERT INTO lib2_artists(name) VALUES(?)", (name,)).lastrowid
+    conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, ?)",
+                 (views, artist, album_role))
+    tracks = [r[0] for r in conn.execute(
+        "SELECT id FROM lib2_tracks WHERE album_id=? ORDER BY track_number", (views,))]
+    for position, track in enumerate(tracks):
+        lead = position < lead_tracks
+        conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+                     "VALUES(?, ?, ?, ?)", (track, artist, "primary" if lead else "featured",
+                                            0 if lead else 1))
+    return artist
+
+
 def test_a_joint_albums_second_primary_artist_is_listed(imported_conn):
-    """the index lists release artists: the album's primary artist, and a
-    primary album artist on a joint album too. Only featured guests drop out."""
-    views = imported_conn.execute("SELECT id FROM lib2_albums WHERE title='Views'").fetchone()[0]
-    partner = imported_conn.execute("INSERT INTO lib2_artists(name) VALUES('Future')").lastrowid
-    imported_conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, 'primary')",
-                          (views, partner))
+    """the index lists release artists: the album's primary artist, and the
+    lead on more than half a joint album's tracks. the artist page files that
+    album as their own too."""
+    partner = _views_with(imported_conn, "Future", album_role="featured", lead_tracks=2)
     names = {a["name"] for a in Q.list_artists(imported_conn)[0]}
     assert {"Drake", "Future"} <= names and "Wizkid" not in names
+    assert [a["title"] for a in Q.get_artist(imported_conn, partner)["albums"]] == ["Views"]
+
+
+def test_a_guest_with_a_primary_album_credit_is_not_a_library_artist(imported_conn):
+    """#2142: a 2pac library listed nate dogg, outlawz and dr. dre beside him.
+    an album credit marked primary on someone else's album, with the guest
+    leading none (or only half) of its tracks, is not a release of their own:
+    their page files it under Appears On, and the index agrees."""
+    guest = _views_with(imported_conn, "Nate Dogg", album_role="primary", lead_tracks=0)
+    half = _views_with(imported_conn, "Outlawz", album_role="primary", lead_tracks=1)
+
+    names = {a["name"] for a in Q.list_artists(imported_conn)[0]}
+
+    assert "Drake" in names
+    assert "Nate Dogg" not in names and "Outlawz" not in names
+    for artist in (guest, half):
+        page = Q.get_artist(imported_conn, artist)
+        assert page["albums"] == [] and [a["title"] for a in page["appears_on"]] == ["Views"]
 
 
 def test_library_index_membership_searches_each_ownership_branch_by_index(imported_conn):
@@ -1262,5 +1387,79 @@ def test_library_index_membership_searches_each_ownership_branch_by_index(import
         )
     )
     assert "SCAN owned_al" not in plan, plan
+    assert "SCAN owned_ta" not in plan and "SCAN owned_la" not in plan, plan
     assert "INDEX idx_lib2_albums_artist (primary_artist_id=?)" in plan, plan
-    assert "INDEX idx_lib2_album_artists_artist (artist_id=?)" in plan, plan
+    # #2142: the lead-credit branch starts from the artist's own credits
+    assert "INDEX idx_lib2_track_artists_artist (artist_id=?)" in plan, plan
+
+
+def test_an_artists_counts_are_their_own_releases_and_live_files(imported_conn):
+    """second v2 review (L1, L2): the library table counted every album an
+    artist was credited on (a compilation feature made "23 albums" beside "3
+    albums" on their page), and a file the user deleted stayed in the track
+    total ("40/52" as if 12 were missing). 3.6.1 counted album-artist albums,
+    and a delete took the track out"""
+    conn = imported_conn
+    drake = conn.execute("SELECT id FROM lib2_artists WHERE name='Drake'").fetchone()[0]
+    other = conn.execute("INSERT INTO lib2_artists(name, sort_name) VALUES('DJ Comp', 'DJ Comp')").lastrowid
+    comp = conn.execute("INSERT INTO lib2_albums(primary_artist_id, title, album_type, origin)"
+                        " VALUES(?, 'Summer Hits', 'compilation', 'library')", (other,)).lastrowid
+    conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, 'primary')", (comp, other))
+    conn.execute("INSERT INTO lib2_album_artists(album_id, artist_id, role) VALUES(?, ?, 'featured')", (comp, drake))
+    guest = conn.execute("INSERT INTO lib2_tracks(album_id, title, track_number) VALUES(?, 'Guest Verse', 1)",
+                         (comp,)).lastrowid
+    conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id, role, position) VALUES(?, ?, 'featured', 1)",
+                 (guest, drake))
+    conn.execute("UPDATE lib2_tracks SET monitored=0")
+    conn.execute("UPDATE lib2_wanted_tracks SET wanted=0")
+    conn.commit()
+    before = {a["name"]: a for a in Q.list_artists(conn)[0]}["Drake"]
+    assert before["album_count"] == 1
+
+    # delete one of his present files: the total drops with it
+    file_id = conn.execute("""SELECT f.id FROM lib2_track_files f JOIN lib2_tracks t ON t.id=f.track_id
+                              JOIN lib2_albums al ON al.id=t.album_id WHERE al.primary_artist_id=?
+                              ORDER BY f.id LIMIT 1""", (drake,)).fetchone()[0]
+    conn.execute("UPDATE lib2_track_files SET file_state='deleted' WHERE id=?", (file_id,))
+    conn.commit()
+    after = {a["name"]: a for a in Q.list_artists(conn)[0]}["Drake"]
+    # the guest verse on someone else's album he holds nothing of never counts
+    assert before["track_count"] == before["tracks_present"] + 1
+    # nothing of that release is left, so it no longer counts at all (the
+    # albums you have, #2106 follow-up), and nothing reads as missing
+    assert after["track_count"] < before["track_count"]
+    assert after["tracks_missing"] == 0
+
+
+def test_the_server_stream_id_is_the_active_servers_own(tmp_path, monkeypatch):
+    """review 5 R5-X3-3: the payload handed out the 3.6.1 id as the server
+    stream id. a track imported from plex and since mapped on navidrome
+    streamed the plex ratingKey from navidrome, which has no such song."""
+    from core.library2.media_mappings import upsert_mapping
+    from database.music_database import MusicDatabase
+    from tests import lib2_seed
+
+    MusicDatabase(str(tmp_path / "m.db"))
+    conn = lib2_seed.row_conn(str(tmp_path / "m.db"))
+    track = lib2_seed.track(conn, "Artist", "Album", "Song", path="/mnt/plexonly/Song.flac")
+    album_id = conn.execute("SELECT album_id FROM lib2_tracks WHERE id=?", (track,)).fetchone()[0]
+    upsert_mapping(conn.cursor(), "track", track, "navidrome", "0IOchBY6UeMfO9StCNxMil")
+    # the row's own server columns (a one-slot projection) still say plex
+    conn.execute("UPDATE lib2_tracks SET legacy_track_id=584278, server_source='plex', "
+                 "server_id='584278' WHERE id=?", (track,))
+    conn.commit()
+
+    def ids(active):
+        monkeypatch.setattr(Q, "_active_media_server", lambda: active)
+        album_row = next(t for t in Q.get_album(conn, album_id)["tracks"] if t["id"] == track)
+        return (album_row["server_track_id"], Q.get_track(conn, track)["server_track_id"],
+                [v["server_track_id"] for v in Q.track_versions(conn, track)])
+
+    nav = "0IOchBY6UeMfO9StCNxMil"
+    assert ids("navidrome") == (nav, nav, [nav])
+    # the row's own server id when it came from the active server
+    assert ids("plex") == ("584278", "584278", ["584278"])
+    # nothing better known: the 3.6.1 id, as before
+    assert ids("jellyfin") == (584278, 584278, [584278])
+    # the 3.6.1 id itself is unchanged
+    assert Q.get_track(conn, track)["legacy_track_id"] == 584278

@@ -114,6 +114,26 @@ def test_does_not_touch_non_download_history():
     assert [r[0] for r in rows] == ["import"]
 
 
+def test_clear_everything_takes_an_import_off_the_review_queue_and_keeps_its_history():
+    """Storm, Nov 14 2026: imports still flagged unverified showed on the
+    Downloads page (it lists every row waiting for review) and no clear took
+    them. The import's history row stays, without the flag that listed it."""
+    db = _InMemoryDB()
+    db._add("import", "unverified", title="Junjou Spectra")
+    db._add("import", "force_imported")
+    db._add("import", "verified")
+    assert db.clear_completed_download_history() == 2
+    assert db._statuses() == [None, None, "verified"]
+    assert db.clear_completed_download_history() == 0       # and it is done
+
+
+def test_clear_finished_leaves_an_import_in_the_review_queue():
+    db = _InMemoryDB()
+    db._add("import", "unverified")
+    assert db.clear_completed_download_history(keep_review=True) == 0
+    assert db._statuses() == ["unverified"]
+
+
 def test_empty_history_returns_zero():
     db = _InMemoryDB()
     assert db.clear_completed_download_history() == 0
@@ -172,3 +192,21 @@ def test_clear_finished_keeps_an_origin_row_in_review_visible(tmp_path):
     assert db.clear_completed_download_history(keep_review=True) == 1
 
     assert [e["title"] for e in db.get_library_history_unverified()] == ["Waiting"]
+
+
+def test_the_dashboard_count_matches_the_full_stats(tmp_path):
+    """the 10s dashboard beat reads only the download count; it has to be the
+    same number the full stats give, cleared rows left out."""
+    import sqlite3
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(str(tmp_path / "history.db"))
+    conn = sqlite3.connect(str(tmp_path / "history.db"))
+    for event_type, cleared in (("download", None), ("download", None), ("download", "2026-01-01"),
+                                ("import", None), ("podcast", None)):
+        conn.execute("INSERT INTO library_history(event_type, title, cleared_at) VALUES(?, 't', ?)",
+                     (event_type, cleared))
+    conn.commit()
+    conn.close()
+    assert db.count_library_history_downloads() == 2
+    assert db.get_library_history_stats()["downloads"] == 2

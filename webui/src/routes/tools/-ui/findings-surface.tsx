@@ -31,7 +31,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import type { FindingAlbumGroup } from '../-tools.api';
+import { SHELL_LIBRARY_SCOPE_CHANGED_EVENT } from '@/platform/shell/bridge';
+
+import type { FindingAlbumGroup, FindingsQuery, FindingsViewScope } from '../-tools.api';
 import type { FindingGroup, FindingTypeInfo } from '../-tools.groups';
 import type {
   BulkFixStatus,
@@ -45,10 +47,8 @@ import {
   bulkFindingAction,
   clearFindings,
   dismissFinding,
-  dismissFindingChecked,
   dismissFindingType,
   fetchBulkFixStatus,
-  findExactArtist,
   fetchCacheHealth,
   fetchFindingCounts,
   fetchFindingGroups,
@@ -56,8 +56,8 @@ import {
   fetchRepairFindings,
   fixFinding,
   reopenFinding,
+  undoFinding,
   reopenFindingsBulk,
-  searchLibraryArtists,
   startBulkFix,
   stopBulkFix,
 } from '../-tools.api';
@@ -69,7 +69,6 @@ import {
   findingFilePath,
   findingRedownloadTrackId,
   findingRowFixLabel,
-  findingSeverityIcon,
   findingStatusBadge,
   findingTypeLabel,
   findingsBulkBarState,
@@ -80,12 +79,29 @@ import {
   REPAIR_DEFAULT_PAGE_SIZE,
   REPAIR_PAGE_SIZE_OPTIONS,
 } from '../-tools.core';
-import { safeFixablePending, visibleGroups } from '../-tools.groups';
+import { describeFinding, readApplied, tagChangeLabel } from '../-tools.finding-copy';
+import {
+  fixAllSafePlan,
+  jobFilterOptions,
+  safeFixablePending,
+  visibleGroups,
+} from '../-tools.groups';
 import { useToolsMedia } from '../-tools.media';
 import { RedownloadModal } from '../../artist-detail/-ui/redownload-modal';
-import { ReidentifyModal } from '../../artist-detail/-ui/reidentify-modal';
-import { AlbumInspectionTray } from './album-inspection-tray';
+import { AlbumInspectionTray, groupIdentity } from './album-inspection-tray';
+import { FindingArt } from './finding-art';
 import { FindingDetail } from './finding-detail';
+import {
+  ReidentifyFindingModal,
+  needsReidentify,
+  TYPE_ACOUSTID,
+  TYPE_BACKFILL,
+  TYPE_DEAD,
+  TYPE_ORPHAN,
+  TYPE_QUALITY,
+  TYPE_RETAG,
+  useFindingFix,
+} from './finding-fix';
 import { useFindingPrompts } from './finding-prompts';
 import { FindingsAlbumGrid } from './findings-album-grid';
 import { FindingsInbox } from './findings-inbox';
@@ -96,42 +112,8 @@ function toast(message: string, type = 'info') {
   window.showToast?.(message, type);
 }
 
-/**
- * A poisoned album holds tracks by many artists, so it can't be re-identified
- * as one release. Open it in the library instead, where each track has its own
- * Re-identify (#1567). Findings from before the artist id was stored find the
- * artist by the album artist's name.
- */
-export async function openSuspectAlbum(finding: RepairFinding): Promise<void> {
-  const d = (finding.details as Record<string, any>) || {};
-  const router = window.SoulSyncWebRouter;
-  // native findings name the album as `lib2:<id>`; the library route wants the id
-  const albumId =
-    finding.entity_id != null ? String(finding.entity_id).replace(/^lib2:/, '') : null;
-  let artistId = d.artist_id != null && d.artist_id !== '' ? String(d.artist_id) : '';
-  let artistName = String(d.album_artist_name || '');
-  if (!artistId && artistName) {
-    try {
-      const exact = findExactArtist(await searchLibraryArtists(artistName), artistName);
-      if (exact) {
-        artistId = String(exact.id);
-        artistName = exact.name || artistName;
-      }
-    } catch {
-      // falls through to the toast below
-    }
-  }
-  if (!artistId || !router) {
-    toast("Couldn't find this album in your library", 'error');
-    return;
-  }
-  toast('Open each track there and pick Re-identify from its menu', 'info');
-  await router.navigateToPage('artist-detail', {
-    artistId,
-    artistName,
-    focusAlbumId: albumId ?? undefined,
-  });
-}
+// moved to finding-fix, which Simple mode shares (review 5 W3-TT-3)
+export { openSuspectAlbum } from './finding-fix';
 
 /** The vanilla's poll interval for a background Fix All run. */
 const BULK_FIX_POLL_MS = 2000;
@@ -177,16 +159,6 @@ function readStoredPageSize(): number {
     return REPAIR_DEFAULT_PAGE_SIZE;
   }
 }
-
-/** Finding types whose fix needs a question answered before it can run. Keyed
- *  by TYPE now, not by job — a job can emit more than one type. */
-const TYPE_ORPHAN = 'orphan_file';
-const TYPE_DEAD = 'dead_file';
-const TYPE_ACOUSTID = 'acoustid_mismatch';
-const TYPE_RETAG = 'library_retag';
-const TYPE_BACKFILL = 'missing_discography_track';
-const TYPE_QUALITY = 'quality_upgrade';
-const TYPE_SUSPECT_ALBUM = 'suspect_album_tag';
 
 /** Above this many files, a whole-group orphan DELETE goes through the
  *  type-the-phrase dialog. Same number the filter-wide Fix All has always
@@ -321,8 +293,20 @@ export function FindingsSurface({
   // list | album | artist. Resets whenever a different type is opened, because
   // a grouping that made sense for upgrades rarely does for the next type.
   const [groupView, setGroupView] = useState<'list' | 'album' | 'artist'>('list');
+  /** an album or artist card drilled into from the grouped view: the open
+   *  type's rows of that one group, by the grid's own key. it used to put the
+   *  name in the search box, which escaped the type and listed every type's
+   *  rows whose text held the name, for select all and Fix Selected to act
+   *  on (review 5 W3-TT-2). */
+  const [drill, setDrill] = useState<NonNullable<FindingsQuery['group']> | null>(null);
 
   const [groups, setGroups] = useState<FindingGroup[]>([]);
+  /** the inbox rows: `groups` again, unless a job or severity filter is set,
+   *  then counted by the server for those filters. a row's count is what its
+   *  Fix all / Dismiss all / Reopen all act on, and only the server knows how
+   *  many of a type's rows came from one job (review 5 W3-TT). the hero
+   *  keeps the whole library. */
+  const [inboxGroups, setInboxGroups] = useState<FindingGroup[]>([]);
   const [groupsLoaded, setGroupsLoaded] = useState(false);
   const [types, setTypes] = useState<FindingTypeInfo[]>([]);
   const [items, setItems] = useState<RepairFinding[] | null>(null);
@@ -394,6 +378,27 @@ export function FindingsSurface({
    *  the failure the inbox is supposed to remove. */
   const searching = query.trim().length > 0;
   const listType = searching ? '' : openType;
+  /** a drill-in only narrows the open type's list; a search leaves both */
+  const activeDrill = !searching && openType ? drill : null;
+
+  /** what the list shows, sent with Fix Selected / Dismiss Selected so the
+   *  server can refuse a row the view no longer lists (review 5 W3-TT) */
+  const viewScope = useMemo<FindingsViewScope>(
+    () => ({
+      jobId: jobFilter,
+      status: statusFilter,
+      severity: severityFilter,
+      findingType: listType,
+      q: query.trim(),
+      group: activeDrill ?? undefined,
+    }),
+    [activeDrill, jobFilter, listType, query, severityFilter, statusFilter],
+  );
+  /** the inbox's filters, for the group-row bulk buttons */
+  const groupFilters = useMemo(
+    () => ({ jobId: jobFilter || undefined, severity: severityFilter || undefined }),
+    [jobFilter, severityFilter],
+  );
 
   // ── Loading ────────────────────────────────────────────────────────────────
 
@@ -418,16 +423,29 @@ export function FindingsSurface({
     if (!video) setCacheHealth(await fetchCacheHealth());
   }, [video]);
 
+  const groupsToken = useRef(0);
   const loadGroups = useCallback(async () => {
-    setGroups(await fetchFindingGroups());
+    // a filter changed while an older load was out: the newest wins
+    const token = ++groupsToken.current;
+    const filtered = Boolean(jobFilter || severityFilter);
+    const [all, narrowed] = await Promise.all([
+      fetchFindingGroups(),
+      filtered ? fetchFindingGroups({ jobId: jobFilter, severity: severityFilter }) : null,
+    ]);
+    if (token !== groupsToken.current) return;
+    setGroups(all);
+    setInboxGroups(narrowed ?? all);
     setGroupsLoaded(true);
-  }, []);
+  }, [jobFilter, severityFilter]);
 
   const loadFindings = useCallback(async () => {
     // Nothing is open and nothing is being searched: the inbox IS the view,
     // and fetching 30 rows nobody asked to see was most of what made the old
     // page slow to arrive.
-    if (!searching && !openType) {
+    // the flat list is the one view that asks for every finding at once. it
+    // sat on "Loading findings..." for good, because this early return only
+    // knew about a search and an opened type.
+    if (!searching && !openType && viewMode !== 'table') {
       setItems(null);
       setTotal(0);
       return;
@@ -440,6 +458,7 @@ export function FindingsSurface({
         findingType: listType,
         sort,
         q: query.trim(),
+        group: activeDrill ?? undefined,
         page,
         limit: pageSize,
       });
@@ -454,6 +473,7 @@ export function FindingsSurface({
       setLoadError(error instanceof Error ? error.message : String(error));
     }
   }, [
+    activeDrill,
     jobFilter,
     listType,
     openType,
@@ -464,6 +484,7 @@ export function FindingsSurface({
     severityFilter,
     sort,
     statusFilter,
+    viewMode,
   ]);
 
   const refreshAll = useCallback(() => {
@@ -490,6 +511,21 @@ export function FindingsSurface({
       clearTimeout(timer);
     };
   }, [loadCounts, loadGroups, loadFindings]);
+
+  // G16-4: another library picked in the header. every count, group and row
+  // was the old library's, and Fix All acted on what was on screen; a
+  // selection from the old library is dropped, never carried over
+  // review 4 R4-E-1: the album grids load on their own token, and an open
+  // album tray is a selection too
+  useEffect(() => {
+    const switched = () => {
+      setSelectedAlbum(null);
+      setRefreshToken((token) => token + 1);
+      refreshAll();
+    };
+    window.addEventListener(SHELL_LIBRARY_SCOPE_CHANGED_EVENT, switched);
+    return () => window.removeEventListener(SHELL_LIBRARY_SCOPE_CHANGED_EVENT, switched);
+  }, [refreshAll]);
 
   // a job finished: its findings only showed after a page refresh (#1386).
   // any change after the first render counts, even from no runs at all (a
@@ -554,9 +590,15 @@ export function FindingsSurface({
 
   useEffect(() => {
     void loadCounts();
+  }, [loadCounts]);
+
+  useEffect(() => {
     void loadGroups();
+  }, [loadGroups]);
+
+  useEffect(() => {
     void fetchFindingTypes().then(setTypes);
-  }, [loadCounts, loadGroups]);
+  }, []);
 
   useEffect(() => {
     void loadFindings();
@@ -675,6 +717,44 @@ export function FindingsSurface({
     refreshAll();
   }, [refreshAll, undo]);
 
+  /** Take back a fix: the old tag values go into the file again. It asks
+   *  first, with every value it will write, because it changes the file. */
+  const undoOne = useCallback(
+    async (finding: RepairFinding) => {
+      const applied = readApplied(finding.details);
+      if (!applied) return;
+      const lines = applied.files.flatMap((file) =>
+        file.fields.map(
+          (field) =>
+            `${tagChangeLabel(field)}: ${field.after || 'empty'} → ${field.before || 'empty'}`,
+        ),
+      );
+      const cover = applied.files.some((file) => file.cover);
+      const confirmed = await window.showConfirmDialog?.({
+        title: 'Undo these tag changes?',
+        message:
+          `The old values are written back into the file and this finding reopens.\n\n${lines.join('\n')}` +
+          (cover ? '\n\nThe cover that was embedded stays. The old picture was not kept.' : ''),
+        confirmText: 'Undo changes',
+        cancelText: 'Cancel',
+      });
+      if (!confirmed) return;
+      const result = await undoFinding(finding.id);
+      if (!result.success) {
+        toast(result.error || 'Could not undo that', 'error');
+        return;
+      }
+      toast(
+        result.kept?.length
+          ? `Old tags are back. ${result.kept.join(', ')} had no value before and stayed.`
+          : 'Old tags are back in the file',
+        'success',
+      );
+      refreshAll();
+    },
+    [refreshAll],
+  );
+
   /** The undo half of dismiss. Dismiss suppresses that finding forever, which
    *  is only safe to offer freely because this exists. */
   const reopenOne = useCallback(
@@ -689,164 +769,32 @@ export function FindingsSurface({
     [refreshAll],
   );
 
-  /** `fixRepairFinding`. The per-type prompts run BEFORE the button is disabled.
-   *  `override` is a non-default action picked in the detail panel (the video
-   *  ghost's Forget); it skips the prompts because the user just chose. */
-  const fixOne = useCallback(
-    async (finding: RepairFinding, override?: string) => {
-      const type = finding.finding_type;
-      let fixAction: string | null = override ?? null;
-      if (video) {
-        // video types share some slugs with music (quality_upgrade) but none
-        // of music's questions. a fix that changes a file on disk asks once,
-        // in the words the catalog has for it.
-        const info = typeInfo(type);
-        if (!override && info?.destructive) {
-          const confirmed = await window.showConfirmDialog?.({
-            title: `${info.verb || 'Fix'}: ${finding.title}`,
-            message: info.confirm || 'This changes a file on disk.',
-            confirmText: info.verb || 'Fix',
-            destructive: true,
-          });
-          if (!confirmed) return;
-        }
-      } else if (!override) {
-        if (type === 'native_duplicate_releases') {
-          setExpanded((current) => new Set([...current, finding.id]));
-          return;
-        }
-        if (type === TYPE_ORPHAN) {
-          fixAction = await prompts.promptOrphan();
-          if (!fixAction) return;
-        }
-        if (type === TYPE_DEAD) {
-          fixAction = await prompts.promptDeadFile();
-          if (!fixAction) return;
-        }
-        if (type === TYPE_ACOUSTID) {
-          // an ambiguous finding carries its candidate recordings - hand them to
-          // the dialog so the user can pick which one to retag/relocate as
-          const d = (finding.details || {}) as {
-            ambiguous?: boolean;
-            candidates?: string[];
-          };
-          fixAction = await prompts.promptAcoustid(d.ambiguous ? d.candidates : undefined);
-          if (!fixAction) return;
-        }
-        if (type === TYPE_QUALITY) {
-          fixAction = await prompts.promptQuality();
-          if (!fixAction) return;
-          if (fixAction === 'ignore') {
-            await dismissOne(finding.id);
-            return;
-          }
-        }
-        if (type === TYPE_RETAG && !finding.details?.has_manual_conflict) {
-          // Nothing to settle on this row — the plain apply is the whole action.
-        } else if (type === TYPE_RETAG) {
-          fixAction = await prompts.promptRetag(1, 1);
-          if (!fixAction) return;
-          if (fixAction === 'safe') fixAction = null;
-        }
-        if (type === TYPE_BACKFILL) {
-          const choice = await prompts.promptBackfill(1);
-          if (!choice) return;
-          if (choice === 'dismiss') {
-            await dismissOne(finding.id);
-            return;
-          }
-          // 'add_to_wishlist' falls through with no fix_action — the handler
-          // already adds to the wishlist by default.
-        }
-        if (type === TYPE_SUSPECT_ALBUM && finding.entity_type === 'album') {
-          await openSuspectAlbum(finding);
-          return;
-        }
-        if (type === TYPE_SUSPECT_ALBUM) {
-          setReidentifyingFinding(finding);
-          return;
-        }
-      }
-
-      if (!video && type === 'native_duplicate_tracks') {
-        const weak = Boolean(finding.details?.requires_recording_confirmation);
-        const confirmed = await window.showConfirmDialog?.({
-          title: weak ? 'Confirm Recording & Keep Best' : 'Keep Best',
-          message: weak
-            ? 'After comparing these files, confirm they contain the same recording. Keep the recommended file and move redundant copies to recoverable quarantine? Protected copies stay.'
-            : 'Keep the recommended file and move redundant copies to recoverable quarantine? Protected companions, shared files and playlist copies stay.',
-          confirmText: weak ? 'Confirm Recording & Keep Best' : 'Keep Best',
-          destructive: true,
-        });
-        if (!confirmed) return;
-        fixAction = weak ? 'keep_best:confirmed' : 'keep_best';
-      }
-
-      // A finding with no catalogue subject cannot be re-downloaded — the fix
-      // is a plain delete, and unlike every prompt above it has no dialog of
-      // its own to stop at. Confirm it here rather than let one click remove a
-      // file from disk.
-      if (!video && !override && findingRowFixLabel(finding) === 'Delete File') {
-        const quarantined = type === 'corrupt_audio' || type === 'fake_lossless';
-        const confirmed = await window.showConfirmDialog?.({
-          title: 'Delete File',
-          message: quarantined
-            ? `Move ${findingFilePath(finding) || 'this file'} to the deleted-files folder? It is not in your library, so nothing will be queued to replace it.`
-            : `Permanently delete ${findingFilePath(finding) || 'this file'} from disk? It is not in your library, so nothing will be queued to replace it.`,
-          confirmText: 'Delete',
-          destructive: true,
-        });
-        if (!confirmed) return;
-        // Fake lossless refuses to remove an uncatalogued file without being
-        // told to: its default action is a re-download.
-        fixAction = 'delete';
-      }
-
-      setBusyFix((current) => new Set(current).add(finding.id));
-      try {
-        let result = await fixFinding(finding.id, fixAction);
-        if (result.needs_confirm) {
-          // a library track has the same filename somewhere else. show it and
-          // let the user decide, instead of a dead end
-          const paths = result.library_paths ?? [];
-          const confirmed = await window.showConfirmDialog?.({
-            title: 'Same Filename In Library',
-            message: paths.length
-              ? `Your library already has a file with this name:\n\n${paths.join('\n')}\n\nIf it's the same song, this orphan is a leftover copy. Delete it from disk?`
-              : 'Your library already has a file with this name in another folder. If it is the same song, this orphan is a leftover copy. Delete it from disk?',
-            confirmText: 'Delete anyway',
-            destructive: true,
-          });
-          if (!confirmed) {
-            setBusyFix((current) => {
-              const next = new Set(current);
-              next.delete(finding.id);
-              return next;
-            });
-            refreshAll();
-            return;
-          }
-          result = await fixFinding(finding.id, 'delete_confirmed');
-        }
-        toast(
-          result.success ? result.message || 'Fixed successfully' : result.error || 'Fix failed',
-          result.success ? 'success' : 'error',
-        );
-        refreshAll();
-      } catch {
-        toast('Error applying fix', 'error');
-        // Restored ONLY on the error path. On success the button stays
-        // disabled until the reload lands — which is what stops a second
-        // click firing a second fix while the request is in flight.
-        setBusyFix((current) => {
-          const next = new Set(current);
-          next.delete(finding.id);
-          return next;
-        });
-      }
-    },
-    [dismissOne, prompts, refreshAll, typeInfo, video],
-  );
+  /** `fixRepairFinding`, shared with Simple mode's album tray so both ask the
+   *  same per-type questions (review 5 W3-TT-3). The per-type prompts run
+   *  BEFORE the button is disabled. `override` is a non-default action picked
+   *  in the detail panel (the video ghost's Forget); it skips the prompts
+   *  because the user just chose. */
+  const expandFinding = useCallback((finding: RepairFinding) => {
+    setExpanded((current) => new Set([...current, finding.id]));
+  }, []);
+  const setFixBusy = useCallback((id: number, busy: boolean) => {
+    setBusyFix((current) => {
+      const next = new Set(current);
+      if (busy) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  const fixOne = useFindingFix({
+    video,
+    typeInfo,
+    prompts,
+    dismiss: dismissOne,
+    refresh: refreshAll,
+    onExpand: expandFinding,
+    onReidentify: setReidentifyingFinding,
+    setBusy: setFixBusy,
+  });
 
   const handleInspectRedownload = useCallback((finding: RepairFinding) => {
     setRedownloadFinding(finding);
@@ -907,16 +855,22 @@ export function FindingsSurface({
 
   const bulkDismiss = useCallback(async () => {
     if (selected.size === 0) return;
-    const count = selected.size;
     const ids = [...selected];
     try {
-      await bulkFindingAction(ids, 'dismiss');
-      offerUndo(ids, `${count.toLocaleString()} findings dismissed`);
+      const { updated, refused } = await bulkFindingAction(ids, 'dismiss', viewScope);
+      // the server dismissed only what this view still lists
+      if (refused) {
+        toast(
+          `${refused.toLocaleString()} selected finding${refused === 1 ? ' is' : 's are'} no longer in this list and ${refused === 1 ? 'was' : 'were'} left alone`,
+          'info',
+        );
+      }
+      offerUndo(ids, `${(updated || ids.length - refused).toLocaleString()} findings dismissed`);
       refreshAll();
     } catch {
       toast('Error updating findings', 'error');
     }
-  }, [offerUndo, refreshAll, selected]);
+  }, [offerUndo, refreshAll, selected, viewScope]);
 
   /** `bulkFixFindings` — ask once per finding KIND, then fix one id at a time. */
   const bulkFix = useCallback(async () => {
@@ -1013,31 +967,42 @@ export function FindingsSurface({
     let fixed = 0;
     let failed = 0;
     let skipped = 0;
+    let partial = 0;
+    let refused = 0;
     let otherArtistSkipped = 0;
     let lastError = '';
     toast(`Fixing ${ids.length} findings...`, 'info');
 
+    // Backfill "Just Clear" and quality "Ignore" both dismiss rather than
+    // fix, so they bypass the fix endpoint entirely. one scoped dismiss, so
+    // the server checks them against this view like every other row
+    // (review 5 W3-TT).
+    const dismissIds = ids.filter(
+      (id) =>
+        (typeOf(id) === TYPE_BACKFILL && backfillAction === 'dismiss') ||
+        (typeOf(id) === TYPE_QUALITY && qualityAction === 'ignore'),
+    );
+    if (dismissIds.length) {
+      try {
+        const result = await bulkFindingAction(dismissIds, 'dismiss', viewScope);
+        fixed += result.updated;
+        refused += result.refused;
+        const lost = dismissIds.length - result.updated - result.refused;
+        if (lost > 0) {
+          failed += lost;
+          lastError = 'dismiss failed';
+        }
+      } catch {
+        failed += dismissIds.length;
+        lastError = 'dismiss failed';
+      }
+    }
+    const dismissed = new Set(dismissIds);
+
     for (const id of ids) {
+      if (dismissed.has(id)) continue;
       const findingType = typeOf(id);
       try {
-        // Backfill "Just Clear" and quality "Ignore" both dismiss rather than
-        // fix, so they bypass the fix endpoint entirely.
-        if (
-          (findingType === TYPE_BACKFILL && backfillAction === 'dismiss') ||
-          (findingType === TYPE_QUALITY && qualityAction === 'ignore')
-        ) {
-          try {
-            if (await dismissFindingChecked(id)) fixed++;
-            else {
-              failed++;
-              lastError = 'dismiss failed';
-            }
-          } catch {
-            failed++;
-          }
-          continue;
-        }
-
         let fixAction: string | null = null;
         if (findingType === TYPE_ORPHAN && orphanAction) fixAction = orphanAction;
         else if (findingType === TYPE_DEAD && deadAction) fixAction = deadAction;
@@ -1052,12 +1017,16 @@ export function FindingsSurface({
         // would count as an explicit single fix, and the album gate
         // would let a select-all wishlist every other artist on every
         // compilation in the selection.
-        const result = await fixFinding(id, fixAction, { bulk: true });
+        // scope: the server refuses a row this view no longer lists
+        const result = await fixFinding(id, fixAction, { bulk: true, scope: viewScope });
         // Counted even on a successful fix: a partial gate resolves the
         // finding, and without this the held-back tracks are silent here
         // (the background Fix All reports them in its run note).
         otherArtistSkipped += result.other_artist_skipped || 0;
-        if (result.success) fixed++;
+        if (result.refused) refused++;
+        // blank tags filled, the tags that differ left on the row: still open
+        else if (result.partial) partial++;
+        else if (result.success) fixed++;
         else if (result.skipped_by_design) skipped++;
         else {
           failed++;
@@ -1074,10 +1043,17 @@ export function FindingsSurface({
       lastError,
       skipped,
       otherArtistSkipped,
+      partial,
     );
     toast(message, type);
+    if (refused) {
+      toast(
+        `${refused.toLocaleString()} selected finding${refused === 1 ? ' is' : 's are'} no longer in this list and ${refused === 1 ? 'was' : 'were'} left alone`,
+        'info',
+      );
+    }
     refreshAll();
-  }, [items, prompts, refreshAll, selected, typeInfo, video]);
+  }, [items, prompts, refreshAll, selected, typeInfo, video, viewScope]);
 
   // ── Group-scoped actions ───────────────────────────────────────────────────
 
@@ -1142,10 +1118,12 @@ export function FindingsSurface({
                     // finding types would lose all of its pending rows when
                     // you cleared one group (the #1142 family).
                     findingType: group.finding_type,
+                    // and to the severity the row counted (review 5 W3-TT)
+                    severity: groupFilters.severity,
                   })
                 : {
                     success: true,
-                    deleted: (await dismissFindingType(group.finding_type)).updated,
+                    deleted: (await dismissFindingType(group.finding_type, groupFilters)).updated,
                   };
             toast(
               result.success
@@ -1164,8 +1142,18 @@ export function FindingsSurface({
         // Two requests wear one button: write the library's values, and write
         // them even over the fields this user edited by hand. The count comes
         // with the group so the choice is informed rather than a coin toss.
-        fixAction = await prompts.promptRetag(count, group.manual_conflicts || 0);
+        fixAction = await prompts.promptRetag(count, group.manual_conflicts || 0, true);
         if (!fixAction) return;
+        if (fixAction === 'replace_differences') {
+          // the one bulk answer that throws a file's own tag away: asked twice
+          const confirmed = await window.showConfirmDialog?.({
+            title: 'Replace tags that differ',
+            message: `Write the library's value over every tag that differs, in up to ${count.toLocaleString()} files? The file's own genre, year, artist or album is replaced wherever the library says something else, and the library is not always right. Each change is kept on its finding and can be undone there, one finding at a time.`,
+            confirmText: 'Replace them',
+            destructive: true,
+          });
+          if (!confirmed) return;
+        }
         // 'safe' IS the default the handler takes with no action at all;
         // sending it would only add a string nothing reads.
         if (fixAction === 'safe') fixAction = null;
@@ -1179,7 +1167,7 @@ export function FindingsSurface({
         fixAction = await prompts.promptQuality();
         if (!fixAction) return;
         if (fixAction === 'ignore') {
-          const updated = (await dismissFindingType(group.finding_type)).updated || 0;
+          const updated = (await dismissFindingType(group.finding_type, groupFilters)).updated || 0;
           toast(`Dismissed ${updated.toLocaleString()} quality findings`, 'success');
           refreshAll();
           return;
@@ -1220,9 +1208,13 @@ export function FindingsSurface({
       }
 
       try {
+        // the inbox's job / severity filters: the run fixes the rows the
+        // row counted, not every row of the type (review 5 W3-TT)
         const result = await startBulkFix({
           findingType: group.finding_type,
           fixAction,
+          jobId: groupFilters.jobId,
+          severity: groupFilters.severity,
         });
         if (result.started) {
           toast(`Fixing ${result.total} ${label.toLowerCase()} in the background…`, 'info');
@@ -1237,7 +1229,7 @@ export function FindingsSurface({
         toast('Error starting bulk fix', 'error');
       }
     },
-    [prompts, refreshAll, video, watchBulkFixRun],
+    [groupFilters, prompts, refreshAll, video, watchBulkFixRun],
   );
 
   const dismissGroup = useCallback(
@@ -1251,7 +1243,7 @@ export function FindingsSurface({
       });
       if (!confirmed) return;
       try {
-        const result = await dismissFindingType(group.finding_type);
+        const result = await dismissFindingType(group.finding_type, groupFilters);
         toast(
           result.success
             ? `Dismissed ${(result.updated || 0).toLocaleString()} findings`
@@ -1263,7 +1255,7 @@ export function FindingsSurface({
         toast('Error dismissing findings', 'error');
       }
     },
-    [refreshAll],
+    [groupFilters, refreshAll],
   );
 
   /** Reopen all dismissed/resolved findings of one type — the bulk undo for
@@ -1280,7 +1272,11 @@ export function FindingsSurface({
       });
       if (!confirmed) return;
       try {
-        const count = await reopenFindingsBulk(undefined, group.finding_type);
+        const count = await reopenFindingsBulk(
+          groupFilters.jobId,
+          group.finding_type,
+          groupFilters.severity,
+        );
         toast(
           count > 0 ? `Reopened ${count.toLocaleString()} findings` : 'No findings to reopen',
           count > 0 ? 'success' : 'info',
@@ -1290,7 +1286,7 @@ export function FindingsSurface({
         toast(e instanceof Error ? e.message : 'Error reopening findings', 'error');
       }
     },
-    [refreshAll],
+    [groupFilters, refreshAll],
   );
 
   const safeCount = useMemo(() => safeFixablePending(groups, typeInfo), [groups, typeInfo]);
@@ -1298,12 +1294,14 @@ export function FindingsSurface({
   /** Every safe type in one run. The backend drops destructive types itself
    *  (`safe_only`), so this cannot become "fix everything" through drift. */
   const fixAllSafe = useCallback(async () => {
+    // the question names every kind of finding in the run and what a tag fix
+    // writes: one yes here can reach tens of thousands of files
+    const plan = fixAllSafePlan(groups, typeInfo, video);
     const confirmed = await window.showConfirmDialog?.({
-      title: 'Fix all safe findings',
-      message: video
-        ? `Apply the default fix to all ${safeCount.toLocaleString()} findings that only change SoulSync's own data? Nothing on disk is touched and nothing is downloaded; those findings are skipped.`
-        : `Apply the default fix to all ${safeCount.toLocaleString()} findings that only write metadata? Nothing is deleted or moved — anything that touches a file on disk is skipped.`,
-      confirmText: 'Fix all safe',
+      title: 'Fix all safe findings?',
+      message: plan.message,
+      confirmText: plan.confirmText,
+      cancelText: 'Not now',
       destructive: false,
     });
     if (!confirmed) return;
@@ -1321,7 +1319,7 @@ export function FindingsSurface({
     } catch {
       toast('Error starting bulk fix', 'error');
     }
-  }, [safeCount, video, watchBulkFixRun]);
+  }, [groups, typeInfo, video, watchBulkFixRun]);
 
   /** `clearRepairFindings` — deletes rows outright, filter-scoped. */
   const clearAll = useCallback(async () => {
@@ -1332,9 +1330,18 @@ export function FindingsSurface({
     // and its old message named only the job and status — so a user who had
     // narrowed by severity or search read a prompt describing a far wider
     // delete than they expected, and got one (#1142).
+    // a drilled-in card is a filter too: its type and its album or artist
+    // (review 5 W3-TT-2)
+    const drillType = activeDrill ? typeInfo(listType)?.label || listType.replace(/_/g, ' ') : '';
     const extra = [
       severityFilter ? `severity ${severityFilter}` : '',
       needle ? `matching "${needle}"` : '',
+      activeDrill ? `${drillType} only` : '',
+      activeDrill
+        ? activeDrill.groupBy === 'album'
+          ? `on "${activeDrill.album}" by ${activeDrill.artist}`
+          : `by ${activeDrill.artist}`
+        : '',
     ].filter(Boolean);
     const extraLabel = extra.length ? `, ${extra.join(', ')}` : '';
     const confirmed = await window.showConfirmDialog?.({
@@ -1350,6 +1357,8 @@ export function FindingsSurface({
         status: statusFilter,
         severity: severityFilter,
         q: needle,
+        findingType: activeDrill ? listType : undefined,
+        group: activeDrill ?? undefined,
       });
       toast(
         result.success
@@ -1361,7 +1370,17 @@ export function FindingsSurface({
     } catch {
       toast('Error clearing findings', 'error');
     }
-  }, [jobFilter, jobLabel, query, refreshAll, severityFilter, statusFilter]);
+  }, [
+    activeDrill,
+    jobFilter,
+    jobLabel,
+    listType,
+    query,
+    refreshAll,
+    severityFilter,
+    statusFilter,
+    typeInfo,
+  ]);
 
   // ── Keyboard triage ────────────────────────────────────────────────────────
   //
@@ -1435,12 +1454,12 @@ export function FindingsSurface({
 
   const shown = useMemo(
     () =>
-      visibleGroups(groups, {
+      visibleGroups(inboxGroups, {
         jobId: jobFilter,
         severity: severityFilter,
         status: statusFilter,
       }),
-    [groups, jobFilter, severityFilter, statusFilter],
+    [inboxGroups, jobFilter, severityFilter, statusFilter],
   );
 
   /**
@@ -1452,9 +1471,16 @@ export function FindingsSurface({
     if (openType && !shown.some((group) => group.finding_type === openType)) setOpenType('');
   }, [openType, shown]);
 
+  /** one type is open in the inbox: the surface shows that type alone */
+  const focused = Boolean(openType) && !searching && viewMode === 'inbox';
   const bar = findingsBulkBarState(selected.size, items?.length || 0, total);
   const pagination = findingsPagination(total, serverPage, pageSize);
   const runningJobs = jobs.filter((job) => job.is_running).length;
+  /** the job filter in the list's own words, A to Z, only what has results (#2113) */
+  const jobOptions = useMemo(
+    () => jobFilterOptions(jobs, groups, types, statusFilter, jobFilter),
+    [jobs, groups, types, statusFilter, jobFilter],
+  );
   const statusCount = (value: string) => {
     if (!counts) return null;
     if (value === 'pending') return counts.pending || 0;
@@ -1512,6 +1538,7 @@ export function FindingsSurface({
      upgrade backlog and rarely does for the next type along. */
   useEffect(() => {
     setGroupView('list');
+    setDrill(null);
   }, [openType]);
 
   /* The list/album/artist switch. Only offered inside an opened type - grouping
@@ -1530,8 +1557,12 @@ export function FindingsSurface({
           <button
             type="button"
             key={value}
-            aria-pressed={groupView === value}
-            onClick={() => setGroupView(value)}
+            aria-pressed={groupView === value && !(value === 'list' && activeDrill)}
+            onClick={() => {
+              setGroupView(value);
+              setDrill(null);
+              setPage(0);
+            }}
           >
             {label}
           </button>
@@ -1539,28 +1570,71 @@ export function FindingsSurface({
       </div>
     ) : null;
 
-  /* Drilling into a card reuses the search box, which already matches
-     details_json - so the album name filters straight to that album's rows and
-     every existing control (select all, bulk fix, sort) keeps working on it. */
+  /* Drilling into a card lists the open type's rows of that one album (or
+     artist) by the grid's own key, and every existing control (select all,
+     bulk fix, sort) keeps working on exactly those rows. It used to put the
+     name in the search box, which dropped the type and listed any finding
+     whose text held the name (review 5 W3-TT-2). */
   const groupedView =
     openType && groupView !== 'list' ? (
       <FindingsAlbumGrid
         groupBy={groupView}
+        jobId={jobFilter || undefined}
         status={statusFilter}
         findingType={openType}
         refreshToken={refreshToken}
         onOpen={(group) => {
-          const needle = groupView === 'artist' ? group.artist : group.album;
-          if (needle) setQuery(needle);
+          const identity = groupIdentity(group);
+          if (!identity) {
+            toast(
+              'This card has no artist or album name, so its findings can’t be listed alone',
+              'info',
+            );
+            return;
+          }
+          setDrill(identity);
           setGroupView('list');
           setPage(0);
         }}
       />
     ) : null;
 
+  const drillChip = activeDrill ? (
+    <span className="repair-drill-chip" data-testid="repair-drill-chip">
+      <span className="repair-drill-chip-label">
+        {activeDrill.groupBy === 'album' ? (
+          <>
+            <b>{activeDrill.album}</b> by {activeDrill.artist}
+          </>
+        ) : (
+          <>
+            by <b>{activeDrill.artist}</b>
+          </>
+        )}
+      </span>
+      <button
+        type="button"
+        className="repair-drill-chip-clear"
+        aria-label="Show every finding of this type again"
+        title="Show every finding of this type again"
+        onClick={() => {
+          setDrill(null);
+          setPage(0);
+        }}
+      >
+        &times;
+      </button>
+    </span>
+  ) : null;
+
   const findingList = (
     <>
-      {viewSwitch ? <div className="repair-findings-toolbar">{viewSwitch}</div> : null}
+      {viewSwitch ? (
+        <div className="repair-findings-toolbar">
+          {viewSwitch}
+          {groupView === 'list' ? drillChip : null}
+        </div>
+      ) : null}
       {groupedView}
       {groupedView ? null : (
         <>
@@ -1659,6 +1733,8 @@ export function FindingsSurface({
                   onFix={fixOne}
                   onDismiss={dismissOne}
                   onReopen={reopenOne}
+                  onUndo={(target) => void undoOne(target)}
+                  onReidentify={setReidentifyingFinding}
                   onKeepDuplicate={(findingId, trackId) => void keepDuplicate(findingId, trackId)}
                   onApplyCoverArt={(findingId, target) => void applyCoverArt(findingId, target)}
                   onInspectRedownload={handleInspectRedownload}
@@ -1726,24 +1802,28 @@ export function FindingsSurface({
   );
 
   return (
-    <div className="repair-findings-surface" ref={surfaceRef}>
-      <HealthHero
-        groups={groups}
-        typeInfo={typeInfo}
-        trackCount={trackCount}
-        sizeLabel={sizeLabel}
-        loading={!groupsLoaded}
-        runs={runs}
-        runningJobs={runningJobs}
-        safeCount={safeCount}
-        onFixAllSafe={() => void fixAllSafe()}
-        fixAllBusy={Boolean(bulkRun?.running)}
-        onPickType={pickType}
-      />
+    <div className={`repair-findings-surface${focused ? ' focused' : ''}`} ref={surfaceRef}>
+      {/* one type is open: the page is that type now, and the library's
+          health is a click back. kept mounted so its numbers don't reload. */}
+      <div className="repair-findings-overview" hidden={focused}>
+        <HealthHero
+          groups={groups}
+          typeInfo={typeInfo}
+          trackCount={trackCount}
+          sizeLabel={sizeLabel}
+          loading={!groupsLoaded}
+          runs={runs}
+          runningJobs={runningJobs}
+          safeCount={safeCount}
+          onFixAllSafe={() => void fixAllSafe()}
+          fixAllBusy={Boolean(bulkRun?.running)}
+          onPickType={pickType}
+        />
+      </div>
 
       {bulkRunBar}
 
-      {cacheHealth && (cacheHealth.total_entities || cacheHealth.total_searches) ? (
+      {!focused && cacheHealth && (cacheHealth.total_entities || cacheHealth.total_searches) ? (
         <div className="repair-cache-health">
           {/* The modal stays vanilla: `openCacheHealthModal` is reached from
               the Metadata Cache card too, and it opens onward into the
@@ -1759,44 +1839,6 @@ export function FindingsSurface({
           </div>
         </div>
       ) : null}
-
-      <div className="repair-findings-header-row">
-        <div className="repair-view-mode-tabs" role="tablist" aria-label="Findings View Mode">
-          {/* issue types first: it's the view that holds every finding */}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'inbox'}
-            className={`repair-view-mode-tab${viewMode === 'inbox' ? ' active' : ''}`}
-            onClick={() => changeViewMode('inbox')}
-          >
-            <span className="repair-view-mode-icon">📂</span>
-            <span>Issue Types</span>
-          </button>
-          {video ? null : (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={viewMode === 'albums'}
-              className={`repair-view-mode-tab${viewMode === 'albums' ? ' active' : ''}`}
-              onClick={() => changeViewMode('albums')}
-            >
-              <span className="repair-view-mode-icon">💿</span>
-              <span>Albums & Releases</span>
-            </button>
-          )}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'table'}
-            className={`repair-view-mode-tab${viewMode === 'table' ? ' active' : ''}`}
-            onClick={() => changeViewMode('table')}
-          >
-            <span className="repair-view-mode-icon">📋</span>
-            <span>Flat List</span>
-          </button>
-        </div>
-      </div>
 
       {/* The section anchor lands here rather than on the inbox: the toolbar
           is always present, and the inbox is not (a search replaces it). */}
@@ -1835,6 +1877,43 @@ export function FindingsSurface({
           }}
         />
 
+        {/* inside one type the question is how to group ITS rows (the List /
+            Albums / Artists switch below), not which view of everything */}
+        {focused ? null : (
+          <div className="repair-view-mode-tabs" role="tablist" aria-label="Findings View Mode">
+            {/* issue types first: it's the view that holds every finding */}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === 'inbox'}
+              className={`repair-view-mode-tab${viewMode === 'inbox' ? ' active' : ''}`}
+              onClick={() => changeViewMode('inbox')}
+            >
+              Issue types
+            </button>
+            {video ? null : (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={viewMode === 'albums'}
+                className={`repair-view-mode-tab${viewMode === 'albums' ? ' active' : ''}`}
+                onClick={() => changeViewMode('albums')}
+              >
+                Albums
+              </button>
+            )}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === 'table'}
+              className={`repair-view-mode-tab${viewMode === 'table' ? ' active' : ''}`}
+              onClick={() => changeViewMode('table')}
+            >
+              Flat list
+            </button>
+          </div>
+        )}
+
         <div className="repair-findings-filters">
           <select
             id="repair-findings-job-filter"
@@ -1844,10 +1923,10 @@ export function FindingsSurface({
               setPage(0);
             }}
           >
-            <option value="">All Jobs</option>
-            {jobs.map((job) => (
-              <option value={job.job_id} key={job.job_id}>
-                {job.display_name}
+            <option value="">All findings</option>
+            {jobOptions.map((option) => (
+              <option value={option.value} key={option.value}>
+                {option.label}
               </option>
             ))}
           </select>
@@ -1888,6 +1967,8 @@ export function FindingsSurface({
             <AlbumInspectionTray
               group={selectedAlbum}
               status={statusFilter}
+              jobId={jobFilter || undefined}
+              findingType={listType || undefined}
               onClose={() => setSelectedAlbum(null)}
               onFixFinding={fixOne}
               onDismissFinding={dismissOne}
@@ -1939,6 +2020,7 @@ export function FindingsSurface({
           groups={shown}
           typeInfo={typeInfo}
           status={statusFilter}
+          severity={severityFilter}
           openType={openType}
           onToggleOpen={toggleOpenGroup}
           onFixGroup={(group, info) => void fixGroup(group, info)}
@@ -1950,30 +2032,46 @@ export function FindingsSurface({
         </FindingsInbox>
       )}
 
+      {/* the same findings by the record they are on. a shelf, not the whole
+          grid: the Albums view is one click away and holds the rest. the
+          section only shows once there is an album to show. */}
+      {viewMode === 'inbox' && !searching && !focused && !video ? (
+        <section className="repair-shelf">
+          <div className="tools-section-head">
+            <h3 className="tools-section-title">Albums with findings</h3>
+            <span className="tools-section-blurb">Open one to work on it track by track.</span>
+            <button
+              type="button"
+              className="repair-shelf-all"
+              onClick={() => changeViewMode('albums')}
+            >
+              See all
+            </button>
+          </div>
+          <FindingsAlbumGrid
+            shelf
+            groupBy="album"
+            jobId={jobFilter || undefined}
+            status={statusFilter || undefined}
+            refreshToken={refreshToken}
+            onOpen={(group) => {
+              setSelectedAlbum(group);
+              changeViewMode('albums');
+            }}
+          />
+        </section>
+      ) : null}
+
       {prompts.promptNode}
 
       {reidentifyingFinding ? (
-        <ReidentifyModal
-          trackId={reidentifyingFinding.entity_id}
-          trackTitle={String(
-            (reidentifyingFinding.details as Record<string, any>)?.track_title ||
-              reidentifyingFinding.title ||
-              '',
-          )}
-          artistName={String(
-            (reidentifyingFinding.details as Record<string, any>)?.artist_name || '',
-          )}
-          albumTitle={String(
-            (reidentifyingFinding.details as Record<string, any>)?.album_title || '',
-          )}
-          imageUrl={String(
-            (reidentifyingFinding.details as Record<string, any>)?.album_thumb_url || '',
-          )}
-          initialQuery={String(
-            (reidentifyingFinding.details as Record<string, any>)?.reidentify_query || '',
-          )}
+        <ReidentifyFindingModal
+          finding={reidentifyingFinding}
           onApplied={async () => {
-            if (reidentifyingFinding) {
+            // a suspect-album finding is settled by the re-identify. a re-tag
+            // finding is not: the track is re-filed and the next scan closes
+            // it, and a dismiss would silence that file for good
+            if (reidentifyingFinding.finding_type !== TYPE_RETAG) {
               await dismissOne(reidentifyingFinding.id);
             }
           }}
@@ -2097,6 +2195,8 @@ function FindingCard({
   onReopen,
   onKeepDuplicate,
   onApplyCoverArt,
+  onUndo,
+  onReidentify,
   onInspectRedownload,
 }: {
   finding: RepairFinding;
@@ -2118,6 +2218,8 @@ function FindingCard({
   onReopen: (id: number) => Promise<void>;
   onKeepDuplicate: (findingId: number, trackId: string) => void;
   onApplyCoverArt: (findingId: number, target: 'album' | 'artist') => void;
+  onUndo: (finding: RepairFinding) => void;
+  onReidentify: (finding: RepairFinding) => void;
   onInspectRedownload?: (finding: RepairFinding) => void;
 }) {
   const details = finding.details || {};
@@ -2125,10 +2227,13 @@ function FindingCard({
   const statusBadge = findingStatusBadge(finding.status, finding.user_action);
   const typeLabel = info?.label || findingTypeLabel(finding.finding_type);
   const age = formatCacheAge(finding.created_at);
+  const copy = describeFinding(finding, fixLabel);
 
   return (
     <div
-      className={`repair-finding-card ${finding.severity}${active ? ' kb-active' : ''}`}
+      className={`repair-finding-card ${finding.severity}${active ? ' kb-active' : ''}${
+        expanded ? ' expanded' : ''
+      }`}
       data-id={finding.id}
       data-job-id={finding.job_id}
       data-mass-orphan={String(Boolean(details.mass_orphan))}
@@ -2142,37 +2247,39 @@ function FindingCard({
             onChange={(event) => onToggleSelect(finding.id, event.target.checked)}
           />
         </div>
+        <FindingArt
+          album={finding.album_thumb_url}
+          artist={finding.artist_thumb_url}
+          file={finding.entity_type === 'file' || finding.entity_type === 'folder'}
+        />
         <div className="repair-finding-content">
           <div className="repair-finding-title">
-            <span className="repair-finding-icon">{findingSeverityIcon(finding.severity)}</span>
-            {finding.title}
+            {finding.severity === 'info' ? null : (
+              <span
+                className={`repair-finding-icon ${finding.severity}`}
+                title={finding.severity}
+              />
+            )}
+            <span className="repair-finding-name">{copy.title}</span>
             <span className="repair-finding-type-badge">{typeLabel}</span>
             {statusBadge ? (
               <span className={`repair-finding-status-badge ${finding.status}`}>{statusBadge}</span>
             ) : null}
+            {finding.locked && finding.status === 'pending' ? (
+              <span
+                className="repair-finding-status-badge locked"
+                title={`This ${finding.locked.entity_type} is reviewed and locked. Fix all leaves it alone. The button on this row still works.`}
+              >
+                Locked
+              </span>
+            ) : null}
           </div>
-          <div className="repair-finding-desc">{finding.description || ''}</div>
-          {filePath ? <div className="repair-finding-path">{filePath}</div> : null}
-          <div className="repair-finding-meta">
-            {/* The display name the filter dropdown uses — a row showing the
-                raw snake_case id meant the same job went by two different
-                names on one screen. The entity id is for us, not the user:
-                it lives in the tooltip now. */}
-            <span
-              title={
-                finding.entity_id
-                  ? `${finding.entity_type || 'item'} ${finding.entity_id}`
-                  : undefined
-              }
-            >
-              {jobLabel(finding.job_id)}
-            </span>
-            <span>&middot;</span>
-            <span>
-              {age === 'now' ? 'found just now' : age === '—' ? 'found' : `found ${age} ago`}
-            </span>
-          </div>
+          {copy.sub ? <div className="repair-finding-sub">{copy.sub}</div> : null}
         </div>
+        {/* what is wrong, as a sentence, in the middle of the row where a wide
+            screen used to leave a gap */}
+        <div className="repair-finding-desc">{copy.problem}</div>
+        <span className="repair-finding-age">{age === '—' ? '' : age === 'now' ? 'now' : age}</span>
         {/* This wrapper swallows clicks so the row toggle doesn't undo them. */}
         <div className="repair-finding-actions" onClick={(event) => event.stopPropagation()}>
           {finding.status === 'pending' ? (
@@ -2200,6 +2307,31 @@ function FindingCard({
                   {fixing ? '...' : fixLabel}
                 </button>
               ) : null}
+              {/* #2086: a file moved away on purpose has nothing to download.
+                  the row's one button opened the re-download picker, so
+                  taking the track out was only reachable through Fix Selected */}
+              {!video && fixLabel && finding.finding_type === TYPE_DEAD ? (
+                <button
+                  className="repair-finding-btn alt"
+                  type="button"
+                  title="Take this track out of your library. Nothing is downloaded."
+                  disabled={fixing}
+                  onClick={() => {
+                    // the row comes off the library for good, so it asks once
+                    void (async () => {
+                      const confirmed = await window.showConfirmDialog?.({
+                        title: 'Remove from library',
+                        message: `Take "${copy.title}" out of your library? Its file is already gone, and nothing is downloaded.`,
+                        confirmText: 'Remove',
+                        destructive: true,
+                      });
+                      if (confirmed) await onFix(finding, 'remove');
+                    })();
+                  }}
+                >
+                  Remove
+                </button>
+              ) : null}
               <button
                 className="repair-finding-btn dismiss"
                 type="button"
@@ -2207,7 +2339,18 @@ function FindingCard({
                 aria-label={`Dismiss ${finding.title}`}
                 onClick={() => void onDismiss(finding.id)}
               >
-                &times;
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
               </button>
             </>
           ) : (
@@ -2237,25 +2380,39 @@ function FindingCard({
               onToggleDetail(finding.id);
             }}
           >
-            &#9660;
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
           </button>
         </div>
       </div>
       {finding.last_error ? (
-        <div className="repair-finding-error-banner" onClick={(event) => event.stopPropagation()}>
-          <div className="repair-finding-error-header">
-            <span className="repair-finding-error-icon">⚠️</span>
-            <span className="repair-finding-error-title">Resolution Attempt Failed</span>
-          </div>
-          <div className="repair-finding-error-text">{finding.last_error}</div>
-          <button
-            type="button"
-            className="repair-finding-error-retry"
-            disabled={fixing}
-            onClick={() => void onFix(finding)}
-          >
-            Retry Fix
-          </button>
+        // the row's own fix button is the way to try again; a second button
+        // here said the same thing in different words
+        <div className="repair-finding-error-banner" role="note">
+          <span className="repair-finding-error-title">Last try failed</span>
+          <span className="repair-finding-error-text">{finding.last_error}</span>
+          {/* an error that says "use Re-identify" opens it right here. it used
+              to send you to a menu on another page (#2043) */}
+          {needsReidentify(finding) ? (
+            <button
+              type="button"
+              className="repair-finding-btn undo"
+              onClick={() => onReidentify(finding)}
+            >
+              Re-identify…
+            </button>
+          ) : null}
         </div>
       ) : null}
       <div
@@ -2267,6 +2424,9 @@ function FindingCard({
               full 20-branch detail tree and fetch its album/artist art, hidden
               behind max-height:0 — so a 100-row page rendered 100 invisible
               panels and hammered the thumbnail endpoints for them. */}
+          {expanded && copy.fix && finding.status === 'pending' ? (
+            <p className="repair-finding-fixline">{copy.fix}</p>
+          ) : null}
           {expanded ? (
             video ? (
               <VideoFindingDetail
@@ -2278,8 +2438,34 @@ function FindingCard({
                 finding={finding}
                 onKeepDuplicate={onKeepDuplicate}
                 onApplyCoverArt={onApplyCoverArt}
+                onUndo={onUndo}
+                onFixAction={(target, action) => void onFix(target, action)}
               />
             )
+          ) : null}
+          {expanded ? (
+            <div className="repair-finding-foot">
+              {filePath ? <div className="repair-finding-path">{filePath}</div> : null}
+              <div className="repair-finding-meta">
+                {/* The display name the filter dropdown uses — a row showing the
+                    raw snake_case id meant the same job went by two different
+                    names on one screen. The entity id is for us, not the user:
+                    it lives in the tooltip now. */}
+                <span
+                  title={
+                    finding.entity_id
+                      ? `${finding.entity_type || 'item'} ${finding.entity_id}`
+                      : undefined
+                  }
+                >
+                  {jobLabel(finding.job_id)}
+                </span>
+                <span>&middot;</span>
+                <span>
+                  {age === 'now' ? 'found just now' : age === '—' ? 'found' : `found ${age} ago`}
+                </span>
+              </div>
+            </div>
           ) : null}
         </div>
       </div>

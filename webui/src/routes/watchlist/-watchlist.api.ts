@@ -3,6 +3,8 @@ import { queryOptions } from '@tanstack/react-query';
 import { apiClient, readJson } from '@/app/api-client';
 
 import type {
+  WatchlistFoundRelease,
+  WatchlistScanRun,
   ProviderSearchResult,
   WatchlistArtist,
   WatchlistArtistConfigResponse,
@@ -85,6 +87,20 @@ export function watchlistRecentReleasesQueryOptions(profileId: number, limit = 1
   });
 }
 
+export function watchlistFoundQueryOptions(profileId: number, limit = 24) {
+  return queryOptions({
+    queryKey: [...WATCHLIST_QUERY_KEY, 'found', profileId, limit] as const,
+    queryFn: () => fetchWatchlistFound(limit),
+  });
+}
+
+export function watchlistLastRunQueryOptions(profileId: number) {
+  return queryOptions({
+    queryKey: [...WATCHLIST_QUERY_KEY, 'last-run', profileId] as const,
+    queryFn: () => fetchWatchlistLastRun(),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
@@ -156,6 +172,9 @@ export function withEditionDefaults(config: WatchlistGlobalConfig): WatchlistGlo
         ? (rawPreference as (typeof EDITION_PREFERENCES)[number])
         : 'all',
     prefer_explicit_edition: config.prefer_explicit_edition ?? true,
+    // #2082: an older server has one Live rule for albums and tracks
+    include_live_tracks:
+      (config as { include_live_tracks?: boolean }).include_live_tracks ?? config.include_live,
   };
 }
 
@@ -184,6 +203,29 @@ export async function fetchWatchlistRecentReleases(
     throw new Error(payload.error || 'Failed to load recent watchlist releases');
   }
   return payload.releases ?? [];
+}
+
+export async function fetchWatchlistFound(limit = 24): Promise<WatchlistFoundRelease[]> {
+  const payload = await readJson<{
+    success?: boolean;
+    error?: string;
+    releases?: WatchlistFoundRelease[];
+  }>(apiClient.get(`watchlist/found?limit=${encodeURIComponent(String(limit))}`));
+  if (!payload.success) {
+    throw new Error(payload.error || 'Failed to load what the watchlist found');
+  }
+  return payload.releases ?? [];
+}
+
+/** the newest saved scan run, so the page still knows after a restart */
+export async function fetchWatchlistLastRun(): Promise<WatchlistScanRun | null> {
+  const payload = await readJson<{ success?: boolean; error?: string; runs?: WatchlistScanRun[] }>(
+    apiClient.get('watchlist/scan/history?limit=1'),
+  );
+  if (!payload.success) {
+    throw new Error(payload.error || 'Failed to load the last scan');
+  }
+  return payload.runs?.[0] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +356,8 @@ export interface WatchlistArtistConfigUpdate {
   include_eps: boolean;
   include_singles: boolean;
   include_live: boolean;
+  /** #2082: live versions on other releases. Left out, the server keeps it. */
+  include_live_tracks?: boolean;
   include_remixes: boolean;
   include_acoustic: boolean;
   include_compilations: boolean;

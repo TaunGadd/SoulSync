@@ -10,13 +10,19 @@ import { describe, expect, it } from 'vitest';
 
 import { createTestQueryClient } from '@/test/query-client';
 
-import { LibraryMoreMenu, LibraryV2CanWriteContext } from './library-v2-page';
+import {
+  LibraryMoreMenu,
+  LibraryV2CanWishContext,
+  LibraryV2CanWriteContext,
+} from './library-v2-page';
 
-function renderMenu(canWrite = true) {
+function renderMenu(canWrite = true, canWish = false) {
   render(
     <QueryClientProvider client={createTestQueryClient()}>
       <LibraryV2CanWriteContext.Provider value={canWrite}>
-        <LibraryMoreMenu />
+        <LibraryV2CanWishContext.Provider value={canWish}>
+          <LibraryMoreMenu />
+        </LibraryV2CanWishContext.Provider>
       </LibraryV2CanWriteContext.Provider>
     </QueryClientProvider>,
   );
@@ -25,12 +31,13 @@ function renderMenu(canWrite = true) {
 }
 
 describe('the library More menu', () => {
-  it('lists the three library-wide jobs, each saying what it does', () => {
+  it('lists the library-wide jobs, each saying what it does', () => {
     const items = renderMenu();
     expect(items.map((i) => i.querySelector('.sync-more-name')?.textContent)).toEqual([
       'Automatic Search',
       'Watch All',
       'Export artists',
+      'Release file tag values',
     ]);
     for (const i of items) expect(i.querySelector('.sync-more-desc')?.textContent).toBeTruthy();
   });
@@ -41,6 +48,16 @@ describe('the library More menu', () => {
     expect(items[1]).toBeDisabled();
     // export only reads
     expect(items[2]).toBeEnabled();
+    // #2084: releasing what Use File Tags saved changes the library
+    expect(items[3]).toBeDisabled();
+  });
+
+  it('a household member watches all on their own watchlist, without the admin-only search', () => {
+    // X1: Watch All adds to the caller's own watchlist; it was gated on the
+    // admin flag, so a member in the shared library could not use it
+    const items = renderMenu(false, true);
+    expect(items[0]).toBeDisabled();
+    expect(items[1]).toBeEnabled();
   });
 
   it('Export opens its window', () => {

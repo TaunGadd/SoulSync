@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { VdlDownload } from './-vdl.types';
 
 import {
+  vdlBinCountLabel,
   vdlBinDisplayName,
   vdlBlockSxe,
   vdlBlockWhat,
@@ -27,6 +28,7 @@ import {
   vdlIsFail,
   vdlIsPackRow,
   vdlIsRetryable,
+  vdlLangLabel,
   vdlKindIcon,
   vdlMatchesFilter,
   vdlMetaURL,
@@ -227,6 +229,15 @@ describe('formatters', () => {
     expect(vdlFmtBytes(15 * 1024)).toBe('15 KB');
     expect(vdlFmtBytes(0)).toBe('');
   });
+  it('vdlBinCountLabel names folder entries as folders', () => {
+    expect(vdlBinCountLabel([{}, {}])).toBe('2 files');
+    expect(vdlBinCountLabel([{}])).toBe('1 file');
+    expect(vdlBinCountLabel([])).toBe('0 files');
+    expect(vdlBinCountLabel([{ is_folder: true }, { is_folder: true }])).toBe('2 folders');
+    expect(vdlBinCountLabel([{ is_folder: true }, {}, { is_folder: false }])).toBe(
+      '1 folder · 2 files',
+    );
+  });
   it('vdlFmtHistorySize keeps 1 decimal only at GB+', () => {
     expect(vdlFmtHistorySize(1500 * 1024)).toBe('1 MB');
     expect(vdlFmtHistorySize(2.5 * 1024 ** 3)).toBe('2.5 GB');
@@ -302,5 +313,22 @@ describe('row text', () => {
     expect(vdlBlockWhat({ id: 1 })).toBe('Unknown release');
     expect(vdlBlockSxe({ id: 1, season_number: 2, episode_number: 4 })).toBe('S02E04');
     expect(vdlBlockSxe({ id: 1 })).toBe('');
+  });
+});
+
+describe('vdlLangLabel (#2120)', () => {
+  it('says the audio and the subtitles in scene shorthand', () => {
+    expect(vdlLangLabel({ audio: ['fr'], multi: true, subs: [], subbed: false })).toBe('MULTi FR');
+    expect(vdlLangLabel({ audio: [], multi: false, subs: ['fr'], subbed: true })).toBe('FR subs');
+    expect(vdlLangLabel({ audio: [], multi: true, subs: ['fr'], subbed: true })).toBe(
+      'MULTi · FR subs',
+    );
+    expect(vdlLangLabel({ audio: ['it', 'en'], multi: false })).toBe('IT EN');
+    expect(vdlLangLabel({ audio: [], subs: [], subbed: true })).toBe('subs');
+  });
+
+  it('is empty when the name tags nothing', () => {
+    expect(vdlLangLabel(null)).toBe('');
+    expect(vdlLangLabel({ audio: [], multi: false, subs: [], subbed: false })).toBe('');
   });
 });

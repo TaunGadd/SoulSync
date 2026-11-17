@@ -120,6 +120,7 @@ _cover_seq = iter(range(1, 10 ** 9))
 import copy
 import os as _os
 import pytest
+import sys
 import tempfile as _tempfile2
 import threading
 import time
@@ -1108,6 +1109,15 @@ def _quality_profile_refresh_inline(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_cover_art_archive_probe(monkeypatch):
+    """the artwork lookup asks the Cover Art Archive whether a release has a
+    front cover (P2C-2). no test asks the real archive; the ones about that
+    check set their own answer"""
+    from core.library2 import provider_adapters
+    monkeypatch.setattr(provider_adapters, "_caa_has_front", lambda scope, mbid: True)
+
+
+@pytest.fixture(autouse=True)
 def _no_match_credit_fetch(monkeypatch):
     """a manual match fetches the new release's credits on a thread. in tests
     no provider is asked; the tests for that turn it back on."""
@@ -1147,6 +1157,9 @@ def _fresh_fold_index():
     # the mirror outbox's background drainer would outlive the test's database
     from core.library2 import mirror_outbox as _mirror_outbox
     saved_bg_drain, _mirror_outbox.BACKGROUND_DRAIN = _mirror_outbox.BACKGROUND_DRAIN, False
+    # the metasync depot's background network asker: same reason
+    from core import metasync_depot as _metasync_depot
+    saved_bg_ask, _metasync_depot.BACKGROUND_ASK = _metasync_depot.BACKGROUND_ASK, False
     worker_queue._reset_progress_snapshots()
     worker_queue._NEW_CURSOR.clear()
     worker_queue._NEW_IDLE.clear()
@@ -1157,6 +1170,9 @@ def _fresh_fold_index():
     from database.music_database import MusicDatabase
     MusicDatabase._owned_genres_cache.clear()
     saved_genres_ttl, MusicDatabase._OWNED_GENRES_TTL = MusicDatabase._OWNED_GENRES_TTL, 0.0
+    # the quarantine list's artist name maps are kept per database too
+    MusicDatabase._quarantine_name_maps.clear()
+    saved_quarantine_ttl, MusicDatabase._QUARANTINE_NAME_MAPS_TTL = MusicDatabase._QUARANTINE_NAME_MAPS_TTL, 0.0
     # which profiles keep a library of their own is cached per process. a test
     # that set some up left it filled for the next test on the same xdist
     # worker, which then filtered by library and read tables it doesn't have
@@ -1172,11 +1188,67 @@ def _fresh_fold_index():
     yield
     fold_index.CHECK_SECONDS = saved
     worker_queue.PROGRESS_SNAPSHOT_TTL = saved_ttl
+    MusicDatabase._QUARANTINE_NAME_MAPS_TTL = saved_quarantine_ttl
     worker_queue.PENDING_COUNT_TTL = saved_pending_ttl
     _mirror_outbox.BACKGROUND_DRAIN = saved_bg_drain
+    _metasync_depot.BACKGROUND_ASK = saved_bg_ask
     MusicDatabase._OWNED_GENRES_TTL = saved_genres_ttl
     metadata_cache._TOUCH_FLUSH_SECONDS = saved_touch
     _artist_facts.ONLINE_LOOKUP = saved_online
+
+
+def _open_databases():
+    """the process-wide music database (the one get_database() answers with
+    DATABASE_PATH), if this process already opened it. a test's private
+    database can't carry state into the next test, and every temp file the
+    session made stays in the instance map, so only this one is checked.
+    never opens one: a test that didn't touch it leaves nothing to undo."""
+    mod = sys.modules.get("database.music_database")
+    if mod is None:
+        return {}
+    shared = _os.environ.get("DATABASE_PATH", "database/music_library.db")
+    for (_thread, path), db in list(getattr(mod, "_database_instances", {}).items()):
+        if path == shared:
+            return {path: db}
+    return {}
+
+
+def _own_library_profiles(db):
+    try:
+        with db._get_connection() as conn:
+            return {row[0] for row in conn.execute(
+                "SELECT id FROM profiles WHERE library_mode = 'own'")}
+    except Exception:  # noqa: BLE001 - no profiles table in this database
+        return set()
+
+
+@pytest.fixture(autouse=True)
+def _own_libraries_end_with_the_test():
+    """a profile a test switched to its own library goes back to shared after
+    it. the profiles live in the process's test database, so one test's own
+    library made every later test on that xdist worker read through library
+    scopes (ci 42718976935: the reorganize job asked a None db for the
+    library's owners, the findings inbox joined lib2_library_roots). profiles
+    that were own before the test (a module fixture's) are left alone."""
+    before = {path: _own_library_profiles(db) for path, db in _open_databases().items()}
+    yield
+    changed = False
+    for path, db in _open_databases().items():
+        added = _own_library_profiles(db) - before.get(path, set())
+        if not added:
+            continue
+        marks = ",".join("?" * len(added))
+        try:
+            with db._get_connection() as conn:
+                conn.execute(f"UPDATE profiles SET library_mode = 'shared', library_root = NULL "
+                             f"WHERE id IN ({marks})", tuple(added))
+                conn.commit()
+            changed = True
+        except Exception:  # noqa: BLE001, S110 - a closed or read-only test database
+            pass
+    if changed:
+        from core.library_scope import invalidate_library_scope_cache
+        invalidate_library_scope_cache()
 
 
 @pytest.fixture(autouse=True, scope='session')

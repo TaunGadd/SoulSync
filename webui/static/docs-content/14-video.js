@@ -123,6 +123,34 @@ To keep 4K copies apart, like a separate **Movies 4K** library in Plex, switch o
 - Switch a 4K folder off and it's ignored everywhere (routing, scans, health checks). Its path is kept for next time.
 
 In Docker, map each 4K folder in your compose file (the default compose has commented \`/media/movies-4k\` and \`/media/tv-4k\` lines) and add it to a library on your media server. See [Video: Downloads](#video-downloads) for the full pipeline.
+
+## More libraries
+
+Add your own movie and TV libraries, like a **Stand-Up**, **Documentaries** or **Kids** library in Plex, under Settings > Folders > Video > More libraries. Each has a name, its own folder and optional rules. The main and 4K libraries are listed there too (their folders are the ones set above), so an install with no extra library works exactly as before.
+
+A new title files into, first match wins:
+
+1. the library picked for it: the **Library** picker in **Get** / **Manual search** (shown once a kind has two libraries), which sticks to the title
+2. the 4K library, when its quality profile saves to 4K
+3. the first library whose **rules** match: a **genre** (TMDB's, like Documentary or Family) or a **keyword** (found inside one of the title's TMDB keywords, like stand-up comedy, or in its name)
+4. the **default** library for its kind (**Make default** on a library)
+
+- Anime shows keep the anime folder unless a library was picked for them.
+- Titles you already have stay where they are, and their upgrades land beside the copy you have.
+- A library that's switched off or has no folder is skipped everywhere; **Remove** keeps its folder and files, and titles picked for it go back to the rules and the default.
+- A library's folder is a library folder like the main ones: scans, health checks and the download monitor know it. Map it in Docker and add it to a library on your media server.
+
+**Quality profile per library.** Each library can set the quality profile its titles are grabbed and upgraded by (**Quality profile** on its card). A title's own profile still wins; a library left on the default uses the kind's default as before.
+
+**The same movie in two libraries.** In a movie's **Get** window, **Also want a copy in…** adds a second copy in another library: the film in Movies (1080p) and in Movies 4K, neither replacing the other. Each copy is its own wishlist card (named with its library), hunted, grabbed and upgraded by its library's profile, and filed in its library. A copy is owned only by a file in its own library's folder (scans note which library each file sits in; on Docker, the server's folders need to be reached, see Your library's folders), so the 4K file never satisfies the 1080p wish or the other way round. Remove the copy with its **×**, or its wishlist card. Second copies are for movies; TV shows keep one copy.
+
+**Where a library downloads from.** **Download from** on a library's card picks the sources its automatic searches use (the wishlist, Search now, retries), in the order you click them: Usenet first then Torrent, say. None picked follows the global order in Settings > Downloads. RSS sync still runs on the global order's indexer sources, and keeps only releases from the library's own sources. **Torrent category / label** and **Usenet category** give that library's downloads their own category in the client (qBittorrent / SABnzbd / NZBGet category, Deluge / Transmission label); empty uses the client's own. Make the category in the client first: SABnzbd files an unknown one under its default. SoulSync talks to one torrent client and one usenet client (Settings > Downloads), so a library picks between those; two instances of the same client aren't supported.
+
+**Which indexers a library searches.** Open **Indexers** on a library's card to tick the Prowlarr indexers its searches use: private 4K trackers for Movies 4K, say. None ticked searches every indexer (within Settings > Indexers' own allowlist), as before. The wishlist, Search now, retries, manual search in Get, and RSS sync all follow it (an EXT.to release has no indexer and is kept).
+
+**Searching and upgrading per library.** **Search automatically** off: the wishlist drain and RSS sync leave that library's titles alone, and they're only searched when you click Search now (or Search all missing). **Upgrade what you have** off: titles you already have in that library stop being upgraded toward their profile's cutoff; missing ones are still hunted.
+
+**Filtering by library.** Once a kind has two libraries, the Movies / TV list has a **Library** filter (the library its files sit in, as the last scan saw them), the wishlist has one (a copy's library, else the library picked for the title, else where its last search filed it), and so does the video Downloads list (the library a download files into).
 `
         },
         {
@@ -237,6 +265,8 @@ Studios are also a discovery vector: if you love everything A24 puts out, follow
             title: 'Fresh Releases Board',
             lede: 'A live torrent board from EXT.to — cached, matched, and instant to open.',
             body: `
+The **Releases** tab on the Search page searches release names directly: with torrents on, every torrent indexer you have in Prowlarr (private trackers included) plus EXT.to, in every category, and says which indexers answered and with how many. **Show all** lists every result past the first 25.
+
 The **Fresh Releases** tab on the Search page is a live torrent board sourced from **EXT.to** — the Movies and TV torrent sections for Day, Week, and Month, parsed from the EXT.to homepage into rows carrying size, file count, age, seeders, and leechers.
 
 ## How the board stays warm
@@ -343,15 +373,21 @@ registerDocsSection({
         {
             id: 'vlib-browse',
             title: 'Browsing & Filters',
-            lede: 'Your owned movies and shows as a poster wall — filterable, sortable, and scroll-position aware.',
+            lede: 'Your movies and shows as posters, as a table of titles, or as a table of the files themselves, with filters that find what needs a look.',
             body: `
-The **Library** page is your owned movies and shows as a poster wall.
+The **Library** page shows the same library three ways. Pick one with the switch beside the search box:
 
-- **Filter** by status (all / owned / wanted / watched / unwatched), resolution, genre, and more
-- **Sort** by title, added date, release year, or rating
-- The page **remembers your scroll position** when you navigate away and come back
+- **Posters**: the wall, for browsing.
+- **Titles**: a table you sort by any column: year, quality, video and audio format, subtitles, size, drive, added date and more. The column button at the right of the header picks which columns show.
+- **Files**: one row per video file, with its path, size, codecs and languages.
 
-Filters compose — combine "4K + unwatched + sci-fi" to find exactly what you're in the mood for.
+**Needs a look.** The pills above the list are the things worth fixing, each with a count: **Missing**, **Below quality**, **Extra copies**, **Unmatched**, **No subtitles**, **Not read yet**. Click one to see only those. A pill only shows when it holds something.
+
+**Filters** opens the rest: on disk or not, monitored, padlock, quality, video codec, HDR, audio and subtitle language, drive, library, quality profile, genre and year. Each filter you set becomes a chip you can remove.
+
+**Views** saves what is on screen (side, layout, filters, sort and columns) under a name, so "4K without subtitles" or "Kids, unwatched" is one click away. Views are saved on the server, so they follow you to another browser.
+
+For a profile that is not an admin the page stays a plain poster wall.
 `
         },
         {
@@ -373,17 +409,46 @@ Locked fields are respected by every future enrichment pass — your corrections
         {
             id: 'vlib-bulk',
             title: 'Bulk Operations',
-            lede: 'Act on many titles at once — monitor, mark watched, edit ratings and genres, refresh art.',
+            lede: 'Act on a selection, or on everything a filter matches: rename, move, upgrade, fetch subtitles, edit details, delete.',
             body: `
-Select multiple titles to act on them at once:
+Tick titles in any view (or **Select all** to take everything the filters match) and a bar appears at the bottom:
 
-- Bulk **monitor / unmonitor**
-- Bulk **mark watched / unwatched**
-- Bulk **content rating** changes
-- Bulk **genre add / remove**
-- Bulk **artwork refresh**
+- **Monitor** / stop monitoring
+- **Get missing** and **Look for upgrades**: adds to the Wishlist, which does the searching
+- **Rename**: shows every file's old and new name first, then renames to your template
+- **More**: quality profile, fetch missing subtitles, series type, add or remove a genre, content rating, add to a collection, refresh artwork, identify again, **move to another drive or library**, lock or unlock, mark watched, and delete
 
-Large bulk jobs run in the background so the UI stays responsive — kick off a thousand-title job and keep browsing.
+**Move to another drive or library** lists each library with every drive it sits on. It shows what would move and how much crosses to another drive before anything is touched. Files land where your naming template puts them under that library's folder, with their subtitles, and the title is filed there so later downloads land beside them.
+
+**Delete** lists what goes and asks you to type the number of titles. Files go to the recycle folder.
+
+In the **Files** view the bar acts on the files themselves: rename to template, or delete.
+
+Large jobs run in the background with a progress bar.
+
+### Editing one title
+
+The pencil on a row (or on a poster) opens the title beside the list:
+
+- **Details**: title, year, content rating, sort title, genres, studio or network, tagline, overview, quality profile, and series type for a show. A field you change is marked **Yours** and scans leave it alone; click the mark to hand it back. **Change poster** picks from every poster TMDB has.
+- **Files**: every file with its format, languages and path.
+- **Episodes** (shows): tick the files that are filed under the wrong episode, choose the season and the episode the run starts at, and they are filed in order and renamed to match. Specials are season 0. The plan is shown before anything changes.
+- **History**: changes made to its files, each with **Undo**, and what was downloaded for it.
+
+### History and undo
+
+Every rename, move, delete and re-file you make is recorded. **History** at the top of the page lists them all, newest first, and **Undo** puts a file back where it was. After a bulk rename or move a line appears above the list with one **Undo** for the whole run. A deleted file comes back, owned again, as long as the recycle folder still holds it.
+
+### The padlock
+
+**Lock** a title once it is the way you want it. From then on:
+
+- its details are kept (scans and metadata refreshes leave them alone)
+- maintenance jobs do not raise findings for it, and mass rename skips it
+- automatic upgrades never replace the copy it has
+- in a bulk rename, move, delete, re-identify or upgrade it is left alone, and the result says how many were
+
+New episodes of a locked show still arrive: that is what **monitored** controls. Anything you do to a locked title on its own (from its sheet or its page) still works.
 
 > [!WARNING]
 > Library edits, deletes, re-matches, and bulk jobs are **admin-only**. Non-admin profiles can browse everything, but mutating the library requires an admin profile.
@@ -416,39 +481,90 @@ The hero keeps one main action: **Play / Resume** on your server when you own it
 
 The synopsis shows three lines; **More** opens the rest in place. Every score in the ratings row opens its own site (IMDb, Rotten Tomatoes, Metacritic, Trakt, TVmaze, AniList). Below the tabs, cast comes first, then the collection and **More Like This**, videos and photos, then one **About** section with the facts (release, runtime, rating, network, budget, language, the languages subtitles exist in, with the ones you grab listed first), the studios, and keywords. An anime also gets its other names (romaji and Japanese), the studio that animated it, the next episode's countdown while it airs, and a link to each season on AniList, on a search preview too. When TMDB lumps an anime into one long season (Jujutsu Kaisen's 59 episodes), the episode list is split into the seasons TVDB, your server and release names use, from TVDB when you have a key and from AniList's seasons when you don't. If your server numbers the show TMDB's way, SoulSync keeps its numbering. **Where to Watch** shows one tile per service. The side-scrolling rows have arrows when you hover them.
 
-A show's numbers count like you'd read them: **Specials** and episodes that haven't aired yet are never "missing", so a show with every aired episode reads **Complete**. Specials sit after the real seasons.
+A show's numbers count like you'd read them: **Specials** and episodes that haven't aired yet are never "missing", so a show with every aired episode reads **Complete**. Specials sit after the real seasons. **Hide specials** above the episode list takes them out of the season list, and this browser remembers it; they stay in the show and can still be grabbed. When you get a whole show, specials start unticked, so only the real seasons are picked until you tick them.
 
 If a page can't load (the title left your library, YouTube didn't return a channel or playlist, or the server didn't answer), it says which, with **Try again** and, for YouTube, **Open on YouTube**.
 
-On a show, each episode row shows **Missing** or **Upcoming** only when there's a gap. A missing episode gets one **Get** button, and the rest (manual search, wishlist, download again for an upgrade, subtitles) is in the row's **⋯** menu. The season bar works the same way: **Grab season** plus a menu with manual search, wishlist, monitoring and clear failures.
+A movie has **Manual search…** in its **⋯** menu, in your library or not: the same release picker an episode has, for when you want one particular version.
+
+On a show, each episode row shows **Missing** or **Upcoming** only when there's a gap. A missing episode gets one **Get** button, and the rest (manual search, wishlist, download again for an upgrade, subtitles) is in the row's **⋯** menu. The season bar works the same way: **Grab season** plus a menu with manual search, wishlist, monitoring and clear failures. **Grab season** searches and grabs each missing episode on its own with the show's quality profile, so every episode is tracked separately and one that fails or times out doesn't stop the rest. To grab the whole season as one pack instead, use the season's search and pick a pack from the results.
 `
         },
         {
             id: 'vdet-library',
-            title: 'Your Library Tab',
+            title: 'Your Library on a Title',
             lede: 'Every copy you own of a title: where it lives, how good it is, and what you can do with it.',
             body: `
-Every movie and show in your library has two tabs: the page itself (**Overview** for a movie, **Episodes** for a show) and **Your library**. The tab you used last is remembered.
+A title in your library is one page, with no tabs: what you own and what you can do with it are part of the page itself.
 
-**What you have**: how many copies and how big, your best copy's resolution, and whether it meets the quality target of the title's profile. **Find an upgrade** opens a manual search when it doesn't; **Quality and download settings** opens the Manage panel.
+Under the buttons in the hero, one line says what you have. For a **movie**: your best copy's resolution, how many copies and how big, whether it meets the quality target of its profile, when it was added and what it is matched to. For a **show**: how many aired episodes you have, their size, the quality mix, the target and the match. **Quality and download settings**, **Fix match** and **File history** sit at the end of the line, after the **Lock** button.
 
-**Files**: one card per copy, with the quality tag, codecs, audio, size and runtime, the file name and its folder, the subtitle files beside it, and whether its name matches your [naming template](#vlib-manage). The **⋯** menu on each file:
+The line ends with **Up to date** and **Refresh**. The page opens from what SoulSync already knows, then asks whichever source has gone stale, in the background, and redraws in place only if something moved:
+
+| Asked | For | How often |
+|-------|-----|-----------|
+| Your media server | This one title's files and watch state | Every 10 minutes |
+| The metadata provider | A show that ended or came back, new and renamed episodes, moved air dates, a movie's release date or collection | Daily for a show still running or a movie within 90 days of release, otherwise every 14 days |
+| Ratings | The scores | Every 3 days while a title is new or running, otherwise every 30 days |
+
+Point at **Up to date** to see when each was last asked. **Refresh** asks all three now. A refresh only fills blanks and moves the facts that change; it never overwrites a detail you edited. If your media server no longer has the title, the page says so under **Needs attention** and removes nothing: **Sync with server**, in the **More** menu, does that.
+
+**Lock** is the [padlock](#vlib-manage): once a title is the way you want it, lock it and maintenance jobs, mass rename, automatic upgrades and scans leave it and its files alone. What you do on this page still goes through, and new episodes still arrive.
+
+**File history** lists every rename, move and delete made by hand to this title's files, newest first, each with **Undo**. A deleted file comes back while the recycle bin still holds it.
+
+**Needs attention** comes next, only when something is wrong. A movie's **Files** follow; a show's files are in its **Episodes** list.
+
+**Needs attention** lists every problem with the title, each with its fix beside it. The section is not shown at all when there is nothing. A download that is stuck or on its way is a row here too.
+
+| It says | The fix |
+|---------|---------|
+| *Files below your target* | **Look for upgrades** puts the movie, or exactly those episodes, on the wishlist and searches now. A better copy replaces the file when one turns up. |
+| *Aired episodes missing* | **Get missing** wishlists them and searches now. |
+| *Extra copies* | **Keep the best…** shows which copy of each movie or episode stays (the highest resolution, then the largest) and which go. Nothing is removed until you press the button, and removed copies go to the recycle bin. |
+| *Split across folders* | **Bring together…** moves the show into one of its folders. See below. |
+| *Not named by your template* | **Rename** or **Rename all**. |
+| *Not matched* | **Find the right title**. |
+
+**Files**: one card per copy, two side by side so copies can be compared, the best one first and outlined. The card leads with the resolution, the quality tag, size and runtime, then four facts: **Picture** (HDR or Dolby Vision, codec), **Sound** (format, Atmos, languages), **Subtitles** (how many, in the file or beside it, and which) and **Where** (drive and folder). Under those, the file name and whether it matches your [naming template](#vlib-manage), with **Rename** when it doesn't. The foot says when it was downloaded and from which indexer (hover for the release), or that there is no download on record. On a show, each episode's row carries its file as one line (resolution, source, HDR, audio, size, and a chip when it is below your target or has more than one copy); open the episode to see the cards above its guest stars. The **⋯** menu on each file:
 
 | Action | What it does |
 |--------|--------------|
+| **Find an upgrade / Manual search** | The manual search for that movie or that one episode. |
+| **Move to another episode…** | For a file filed under the wrong episode. Pick the right one; where SoulSync can reach the file it is renamed for the new episode so your media server agrees. |
 | **Rename to template** | Renames the file to what your template says, where it sits. Subtitles and sidecars move with it, nothing is overwritten, and the stored path follows. |
 | **Search subtitles** | The manual subtitle search, for that file. |
 | **Copy path** | The path as your media server reports it. |
-| **Delete to recycle bin** | Moves the file to the recycle bin. If it was the last copy the title shows as missing. A file outside your library folders is refused rather than deleted for good. |
+| **Delete to recycle bin** | Shows the file and what is left, then moves it to the recycle bin. If it was the last copy the title shows as missing. For an episode, **Stop hunting this episode** in the same window keeps a monitored season from fetching it again. A file outside your library folders is refused rather than deleted for good. |
+
+Every change on the page leaves a line at the foot of it saying what happened, with **Undo**. It stays for half a minute; after that the same undo is in **File history**.
 
 > [!NOTE]
 > A file on a drive only your media server can see (a different Docker mount or NAS path) still shows everything the server reports, but it can't be renamed or deleted from SoulSync. The page says so instead of guessing.
 
-For a **show**, the tab lists every season with what's owned, missing and upcoming, its size and resolution mix, and a **Monitored** switch. Open a season to see each episode's file, and **Rename all** when several have drifted from your template. **Where it lives** lists the folders the show's files are in; when it says *Split across 2 folders*, part of the show forked off somewhere else, usually an upgrade that couldn't find the original.
+**Delete Show / Delete Movie** (admins, in the page's **More** menu) takes the whole title out of your library and stops it coming back. It unfollows it and clears its wishlist entries for every profile, cancels its downloads in progress, declines pending requests for it (the people who asked are told), closes its repair findings, hides it from Discover, moves its folder into the recycle bin as one entry (so it restores in one step), asks your media server to rescan, and forgets it. Torrents your client is still seeding are left alone; your seeding rules, or you, remove them. The first dialog lists exactly what will happen; the second asks you to type the title. A title with files outside your library folders is refused rather than deleted for good. Restoring the folder brings the files back, not the follow or the wishlist.
+
+For a **show**, the season you are looking at says what's there, its size and its resolution mix on one line, with a **Monitored** switch beside them and **Grab**, **Manual search**, **Wishlist** and **Clear failures** in its menu.
+
+The same menu manages the season's files:
+
+| In the season's menu | What it does |
+|----------------------|--------------|
+| **Rename files…** | Shows each file's name now and the name your template gives it, then renames them. Files already named right, and files only your media server can see, are counted and left alone. |
+| **Renumber episodes…** | For a season filed under the wrong numbers. Tick the files, say which season and which episode the run starts at, and they are filed in order and renamed to match. Specials are season 0. The plan is shown before anything is filed. |
+| **Delete files…** | Lists every file in the season with its size and says how many episodes would be left with no copy, then moves them to the recycle bin. |
+
+Tick episodes (the box under an episode's number, shown when you point at a row), or the box at the start of the season line for every episode that has a file, to act on several at once. A bar appears above the list with **Look for upgrades**, **Rename…**, **Renumber…**, **Stop hunting** (or **Hunt again**) and **Delete…**.
+
+**Hunting one episode.** A monitored season hunts every missing episode in it. To leave one out, open the episode's menu and pick **Stop hunting this episode**; the row then says *Not hunted*. **Hunt this episode** turns it back on. Nothing on disk changes either way.
+
+**Move to another drive or library…** (in the page's **More** menu, beside a movie's files, and over **Where it lives**) moves the title's files, named by your template. A library can sit on many drives: the main library is its own folder plus your additional folders and the server folders you mapped under Settings > Folders > Video. The window lists each library with every drive it has and the free space on each. Pick another drive of the same library to shift the title there, or another library to move it and file it under that library. New episodes of a show follow it to wherever its files are. It shows how many files move, how much has to be copied to another drive and whether there is room, before anything moves. **More** also has **Rename files…** for every file of the title.
+
+**Where it lives** lists the folders the show's files are in, each with its drive, file count and size. When a show is split, part of it forked off somewhere else, usually an upgrade that couldn't find the original. **Bring together…** asks which folder to keep and shows what would move before anything does: how many files, how much has to be copied because it sits on another drive, and the free space there. Files keep their names and land in that folder's season folders, subtitles go along, and nothing is overwritten. A copy to another drive only takes its real name once it is complete, so a move that is interrupted leaves the original where it was. The move runs in the background; you can close the window, come back to its progress, or stop it after the current file.
 
 **Match** shows the TMDB, IMDb and TVDB ids the title is matched to. **Fix match** searches TMDB (a title, a title and year, or a pasted TMDB id) and re-points the title. The ids are locked, so a library scan can't switch them back, and if your server named the title differently, SoulSync takes TMDB's name and year. **Use the server's match again** undoes it.
 
-Subtitle language overrides and the acquisition history for the title live under this tab too.
+Subtitle language overrides and the acquisition history for the title are further down the same page.
 `
         },
         {
@@ -464,7 +580,7 @@ SoulSync ingests per-episode and per-movie **watch state** from your server:
 
 **Whose watch state.** The scan reads watch state through the server's own account, so it is the server owner's. Each profile linked to its own Plex account (Connect with Plex, or a linked Plex Home user) gets its own: after every Plex scan SoulSync reads that account's watched and in-progress titles with its own token, and that profile's rail, Next Up, watched checks and library filters follow it. Its watched toggle marks the title played on its own Plex account. A profile with no linked account has no watch state, and no watched toggle. The admin with no linked account sees the server owner's.
 
-The **acquisition history** on the [Your library tab](#vdet-library) shows grabs, imports, and upgrades over time — useful for answering "when did this land, and from where?"
+The **acquisition history** at the bottom of the title's page ([your library on a title](#vdet-library)) shows grabs, imports, and upgrades over time — useful for answering "when did this land, and from where?"
 `
         },
         {
@@ -477,7 +593,7 @@ Edit any metadata field and **lock** it so enrichment never overwrites your chan
 > [!WARNING]
 > A re-match changes the title's identity and can update its name and art — but it does **not** silently wipe your locked fields. Locked means locked.
 
-A re-point from the **Matches** list (or **Fix match** on the [Your library tab](#vdet-library)) is locked too: the next scan keeps it even if your server still reports the old match.
+A re-point from the **Matches** list (or **Fix match** in the [library line](#vdet-library) of the title's page) is locked too: the next scan keeps it even if your server still reports the old match.
 
 On a TMDB page for something you own but SoulSync didn't recognise, **More → I have this** links it to your copy. An unmatched copy is re-identified as that title on the spot; a copy matched to a different title asks first.
 
@@ -491,7 +607,9 @@ Episodes are treated as facts: a scan that no longer sees an episode **demotes**
             body: `
 Assign a title its own **quality profile** ("this show is always 1080p, that movie is 4K"). Pick it from the title's Manage panel, or right in **Get** / **Manual search** with the **Profile** picker, even for a title that isn't in your library yet: the pick judges that search and grab, sticks to the title's wishlist entries, and the title keeps it when it lands, so its upgrades use it too.
 
-**Filter and sort the results.** Every manual search (movie, show, season or episode) has a bar over its results: type to narrow by name, group or indexer, sort by best match, size, age, quality, format score, seeders, indexer or grabs, and open **Filters** to build conditions (resolution is 1080, codec is HEVC, group contains MeGusta, size less than 1 GB) matched on all or any of them. Name a filter to save it for every later search on your profile. The head says how many results there are, how many meet your profile and how many match your filter. It only changes what you see: Auto and the wishlist still rank releases by your profile.
+**Edit the query.** Manual search opens with its query in a box at the top (\`Primal S02E03\`, \`Dune 2021\`). Leave it and the usual search runs, with the title's ids. Change it (add \`MULTi\`, a group, another spelling) and press **Search**: every source gets exactly what you typed, like Prowlarr's own search, and the results are still judged against the title.
+
+**Filter and sort the results.** Every manual search (movie, show, season or episode) has a bar over its results: type to narrow by name, group or indexer, sort by best match, size, age, quality, format score, seeders, indexer or grabs, and open **Filters** to build conditions (resolution is 1080, codec is HEVC, group contains MeGusta, size less than 1 GB, language contains japanese) matched on all or any of them. **Language** reads the audio language tags in a release's name, by name or code, and **dual** or **multi** finds the dual audio ones; a release with no language tag is usually the original audio only. Name a filter to save it for every later search on your profile. The head says how many results there are, how many meet your profile and how many match your filter. It only changes what you see: Auto and the wishlist still rank releases by your profile.
 
 **When a grab fails and SoulSync takes the next release**, the card you grabbed lists what it tried after (each release and whether it downloaded or failed too), and the result card of the release that replaced it is marked *Grabbed instead* or *Downloaded instead*. The episode row shows the newest attempt.
 
@@ -533,6 +651,22 @@ registerDocsSection({
 The video **Watchlist** is how you tell SoulSync "keep an eye on this." Follow an **actor**, **director**, or **studio** and their upcoming and newly-released titles are automatically added to your [Wishlist](#vwish-wanted) so the download pipeline can go find them.
 
 Follow from anywhere a follow button appears: [detail pages](#vdet-people), [studio pages](#vsearch-studios), or search results.
+
+## The Watchlist page
+
+Four tabs: **Shows**, **People**, **Studios** and **Channels** (YouTube channels and playlists), each with its count. The line under the title says what the tab holds; on Shows it says how many aired episodes are missing across how many shows.
+
+**Shows** holds every show you follow plus every airing show you own. The chips narrow it:
+
+- **Missing episodes**: shows in your library where an episode has aired, is monitored, and has no file.
+- **Up to date**: shows in your library with nothing aired missing.
+- **Not in library**: shows you follow that your library does not have yet.
+
+A poster only speaks up for an exception. A show with a gap gets a bar along the bottom of its poster and a line like **6 missing · 9 of 15** under its name; a show with nothing missing just shows its episode count. **Ended** and **Upcoming** shows carry a small label, airing ones do not, since nearly everything here is airing. Unaired and unmonitored episodes never count as missing.
+
+Sort by **A to Z**, **Recently added**, or **Most missing** (Shows only) to put the shows furthest behind first. The search box filters whichever tab you are on, Channels included.
+
+Hover a card for its controls: the eye unfollows, the download button opens Get, and people and studios have a cog for their back-catalog window. On a touch screen the controls are always shown.
 `
         },
         {
@@ -678,9 +812,22 @@ A **quality profile** is an ordered ladder of allowed qualities — for example,
 For dubbed or MULTI copies, pick one or more **audio languages** on the profile and a mode:
 
 - **Prefer**: releases tagged with one of your languages (FRENCH, VFF, TRUEFRENCH, GERMAN, iTA, LATINO and so on) or with MULTI / Dual Audio rank first, even over a higher resolution.
-- **Require**: anything without one of those tags is skipped.
+- **Require**: a release tagged only with other languages is skipped.
 
-A release with no language tag is the original audio, so Require skips it. Subtitle-only tags like VOSTFR or SUBFRENCH never count as audio.
+The scene only tags audio that isn't English, so a release with no language tag reads as English. With English on your list it counts as a match and is never ranked below one that spells out ENGLISH. With only other languages on your list it's the English original, so Prefer ranks it below a dub and Require skips it. Subtitle-only tags like VOSTFR or SUBFRENCH never count as audio.
+
+## How releases are ranked
+
+Every search ranks releases the same way: the title's search modal, Auto, the wishlist's Search now, the hourly wishlist run, RSS sync, upgrades and the retry after a failed download. Among releases that meet the profile it compares, in order:
+
+1. **Quality**: the tier's place on your ladder (move a tier up and it ranks higher), plus the profile's preferences: codec, HDR, audio, repack and audio language.
+2. **Custom formats**: the summed format score.
+3. **Tie-breaks**: lossless or Atmos audio, then how close the size is to your **preferred size**.
+4. Then free slots or seeders, then the bigger file.
+
+A later step only matters when everything above it ties, so a +100 format beats a release that only differs by an ENGLISH tag, Atmos or size, and never beats a better quality tier. Each result in a search has **Why this rank**, which lists every factor and its points.
+
+**Preferred size** (per movie and per episode, off by default) sits beside the max size: releases closest to it win a tie. It never rejects anything, and it can't be set past the max size.
 
 ## Save to
 
@@ -688,7 +835,7 @@ A release with no language tag is the original audio, so Require skips it. Subti
 
 ## Custom formats
 
-**Custom formats** are scored release matchers layered on top of the profile. They nudge the ranker toward releases you like (a preferred release group, a specific HDR flavor, TrueHD audio) and away from ones you don't (extras, mislabeled scene tags). Positive scores boost a release; negative scores penalize it.
+**Custom formats** are scored release matchers layered on top of the profile. They nudge the ranker toward releases you like (a preferred release group, a specific HDR flavor, TrueHD audio) and away from ones you don't (extras, mislabeled scene tags). Positive scores boost a release; negative scores penalize it. Formats rank right after quality, so a modest score like +100 for a preferred group is enough: it doesn't need inflating to outweigh a language tag or a bigger file.
 
 ## Per-title overrides
 
@@ -776,6 +923,8 @@ After a download completes, a lightweight post-download scan probes your media s
 ## Naming & folders
 
 Set your **naming scheme** (how files and folders are named — title, year, edition tags, season/episode patterns) and your **folder layout** once, and every import follows it. Consistent naming keeps Plex/Jellyfin matching clean. **Colons in titles** picks what a ':' becomes, since file systems don't allow one: deleted (Dexter Resurrection, the default), smart (Dexter - Resurrection, and 12:30 becomes 12-30), space dash space, or a dash. Mass Rename brings files you already have in line.
+
+**Two shows with one name** never share a folder. The first one in the library keeps the plain folder (\`The Office\`); a later show whose title renders to that same folder is filed with its year (\`The Office (2001)\`), or with its TMDB id when the year is the same too. SoulSync knows a folder is another show's from the library, from its own finished downloads, and from the folder's \`tvshow.nfo\`, so this holds before your media server has scanned anything.
 
 ## Mass rename
 
@@ -907,6 +1056,19 @@ registerDocsSection({
             lede: 'The same automation engine as the music side — scheduled tasks and event workflows for video.',
             body: `
 The video side surfaces the same **system automation engine** the music side uses: scheduled tasks and event-driven workflows, minus the music-only kinds (Beatport, user, playlist triggers). SoulSync seeds **28 system automations** for video — all enabled, all editable or deletable.
+
+## The page
+
+Video's Automations page is the same page the music side has, showing video's automations only. Four pills along the top:
+
+- **Overview**: the next 24 hours drawn as a lane of runs, what is up next, what needs attention, and what ran last with what each one did.
+- **All automations**: every video automation in sections (Operations, your own groups, My Automations, Maintenance). The chips above narrow it to Needs attention, Scheduled, Event-driven or Switched off, and the search box and the two filters narrow it further. Click a row to open it: when it runs, what it does, its last runs, and Run now, Edit and Run history. The switch on the row turns that one automation on or off.
+- **Activity**: the last 24 hours by automation with failures first, and the last week by day.
+- **Guides**: one-click pipelines, single recipes, tips and the block reference, all written for video.
+
+**Automations on** at the top right is the video side's master switch. It starts paused on a new install. While it is paused nothing runs on a schedule or an event, each automation keeps its own switch, and Run now still works. It does not touch the music side.
+
+**New automation** opens the builder with video's own triggers and actions. The **Auto-Update Overlays** row also has **Configure overlays**, which opens the same per-scope overlay settings the Overlay Studio uses.
 
 ## Seeded video system automations
 
@@ -1057,6 +1219,7 @@ A channel without a banner uses a blurred version of its most-viewed video as th
 
 Each followed channel (or playlist) has its own settings, under **More → Channel settings** on the channel's page (or the cog on the watchlist):
 
+- **Download new uploads** (channels): on by default. Off keeps the channel followed but downloads nothing on its own; pick videos from the channel page. Turning it off also takes back what the follow and the scan wished that hasn't downloaded yet.
 - **Custom name** — a display-name override
 - **Quality** — a per-channel quality override (blank uses the global default)
 - **Title include / exclude** filters and a **minimum minutes** length (channels only)
@@ -1146,7 +1309,7 @@ Each collection hands a title to the wishlist **once**. Remove it from the wishl
             body: `
 **Library Maintenance** runs eleven repair jobs that scan the video library for problems. Each job produces rich, lazy-loaded **findings** you can fix individually, fix in bulk, resolve, or dismiss — with a full run history and live progress while jobs execute. Run jobs on demand, on their schedule, or from an automation via the **Run Maintenance Job** action (chain it with the *Maintenance Finding Raised* trigger for alerts).
 
-The video **Tools** page is the same page as music's: an **Operations** tab (Simple and Advanced mode, the findings inbox, the jobs and their history) and a **Tools** tab (Library Scan, Server Scan, the Overlay and Collection Studios, Backups and Mass Rename). Findings work the same way on both sides, see [Repair & Maintenance](#dash-repair).
+The video **Tools** page is the same page as music's: **Findings**, **Jobs** and **History** for library maintenance (admins only), and **Tools** (Library Scan, Server Scan, the Overlay and Collection Studios, Backups and Mass Rename). Findings work the same way on both sides, see [Repair & Maintenance](#dash-repair).
 
 On the video side, **Fix all safe** only runs fixes that change SoulSync's own data. Anything that renames or recycles a file (Naming, Watched Cleanup) or starts a download (Missing Episodes, Collections, Quality Upgrades, Broken Files) is left for you to fix by type, and a file-changing fix asks before it runs. Duplicate Copies stays review-only.
 
@@ -1212,19 +1375,41 @@ registerDocsSection({
     icon: '🎬',
     pages: [
         {
+            id: 'vimp-folder',
+            title: 'Import Folder',
+            lede: 'Drop movies and episodes in one folder and SoulSync files them into your libraries.',
+            body: `
+The video side's answer to the music **Import** page. Set an **Import folder** under **Settings → Library → Video folders**, then drop movie or episode files (or whole folders) in it. Open **Import** in the sidebar to see what SoulSync found.
+
+For each file or folder it reads the names with the same release parser the downloads use, then finds the title on TMDB:
+
+- a loose file with \`S02E03\` in its name is that **episode**,
+- a folder whose files carry episode numbers is a **show** (every season in it),
+- anything else is a **movie** (the largest video in a folder, never the sample).
+
+Each entry shows the title it matched and how sure it is: **Sure match** (the title and year agree), **Check the match**, or **No match**. Press **Import** to bring it in as shown, or **Change…** to pick the right title (and the season and episode for a loose file).
+
+Imports go through the same importer a finished download uses: your naming template, the Movies / TV / anime / 4K library the title belongs in, upgrade and replace rules, subtitles beside the file, NFO and artwork, the wishlist and the download history. A file the importer refuses (a sample, not an upgrade) moves to **Needs a hand** below, where you can place it by hand.
+
+> [!TIP]
+> Tick **Import sure matches automatically** and a sure match is imported on its own once it has finished copying in, like the music side's auto-import. Anything SoulSync isn't sure about waits for you.
+
+> [!NOTE]
+> Keep the import folder apart from your download folder. Imported files leave the folder; what's left (an nfo, a sample) stays for you to clear.
+`
+        },
+        {
             id: 'vimp-failed',
-            title: 'Failed Imports',
+            title: 'Needs a Hand',
             lede: 'When a download can\'t be placed automatically, put it where it belongs by hand.',
             body: `
-When a completed download can't be automatically placed into the library — ambiguous match, unexpected folder layout — it lands in **Failed Imports**. From there you can:
+When a completed download (or an import folder file) can't be placed into the library automatically (a sample, a wrong episode, not an upgrade), it lands under **Needs a hand** on the Import page. From there you can:
 
 - **Place** it manually into the correct title, or
 - **Dismiss** it if it doesn't belong in your library.
 
 > [!NOTE]
-> The Import page is hidden from the sidebar nav — you reach it through the **Manual Import** button on failed items in [Downloads](#video-downloads). Manual import placement mutates the library on disk, so it's **admin-only**.
-
-This is the video equivalent of the music side's manual import step.
+> Placing files changes the library on disk, so the Import page is **admin-only**.
 `
         },
     ]
@@ -1274,7 +1459,7 @@ A hearing-impaired track counts for a plain request. A forced track never does, 
 
 **Forced subtitles.** Switch on **Also grab forced subtitles** to fetch a \`<video>.<lang>.forced.srt\` per language as well: just the lines for scenes in another language, for watching without full subtitles. Most titles have none, so these often stay missing. Whisper never makes forced tracks.
 
-**Retries and upgrades.** Misses retry in the background with backoff (1h, 2h, 4h … up to a week) within a per-provider **daily quota**. Downloaded subtitles are re-checked every 24h: if a clearly better one appears (it beats the current score by the upgrade delta) it replaces the old one, and if the subtitle disappeared from disk it's fetched again. Your own picks from **Search subtitles** (the **CC** button on a detail page) are never auto-replaced.
+**Retries and upgrades.** Misses retry in the background with backoff (1h, 2h, 4h … up to a week) within a per-provider **daily quota**. Downloaded subtitles are re-checked every 24h: if a clearly better one appears (it beats the current score by the upgrade delta) it replaces the old one, and if the subtitle disappeared from disk it's fetched again. Your own picks from **Search subtitles** (the **CC** button on a detail page) are never auto-replaced. When the file already has the language, as a sidecar or inside the video, **Search subtitles** says so, and those count as having it, so SoulSync does not keep searching. A track inside the video with no language tag counts by its title (Français, English SDH). Picture subtitles (PGS, VobSub) count too, but can't be saved as a separate file.
 
 **Your existing library.** New imports are covered automatically. For everything you already own (including titles added straight to Plex or Jellyfin), turn on the **Missing Subtitles** job on the **Tools** page. It checks the whole library on a schedule (weekly by default) with the rules above and queues what's missing; titles that already have subtitles are just recorded as had. Turn on its **Dry Run** setting to review first: you get one finding per movie or show, and approving one queues it.
 `

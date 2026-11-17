@@ -59,6 +59,8 @@ def edition_reference(conn, track_id, data, *, rows=None, has_edition=None, look
                 (row['disc_number'], row['release_edition_id']),
             ).fetchone()
             data['track_count'] = counts[2] if row['track_count'] in (counts[0], counts[1]) and row['track_count'] else None
+            # the whole release's count: a multi-disc file may carry this one
+            data['album_track_total'] = row['track_count'] if data['track_count'] else None
         if row['title_override']:
             data['title'] = row['title_override']
         if row['edition_title']:
@@ -131,9 +133,35 @@ def metadata_states(database, paths):
     return result
 
 
+#: where "the file says something else" is as often the file being right as
+#: the catalogue: a genre is taste ("Electro" against "Electronic"), a year is
+#: the pressing against the original release. On one library, replacing these
+#: with the catalogue's would have dropped a genre from 45,702 files and moved
+#: 13,143 to another year. They are compared and shown, but they are only
+#: filed as something to fix when the setting says so.
+OPINION_FIELDS = ('genre', 'year')
+
+
+def quiet_differences(config):
+    """The tags whose difference from the library is not a fault to fix.
+
+    ``repair.jobs.library_retag.settings``: ``flag_genre_differences`` and
+    ``flag_year_differences``, both off unless set. A tag that is BLANK in
+    the file is never quiet: filling it loses nothing.
+    """
+    try:
+        settings = config.get('repair.jobs.library_retag.settings', {}) or {}
+    except Exception:  # noqa: BLE001 - an unreadable setting keeps the quiet default
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    return frozenset(field for field in OPINION_FIELDS
+                     if settings.get(f'flag_{field}_differences') is not True)
+
+
 def validate_tags(conn, file_id, tags, config):
     from core.library2.retag import _track_rows, _db_data_for_row
-    from core.tag_writer import build_tag_diff
+    from core.tag_writer import build_tag_diff, total_is_settled
     from core.library2.status import EXPECTED_TAGS
 
     file = conn.execute('SELECT track_id, owner_profile_id FROM lib2_track_files WHERE id=?', (file_id,)).fetchone()
@@ -156,8 +184,15 @@ def validate_tags(conn, file_id, tags, config):
         actual = tags.get(key)
         # A known total the file lacks is written like any other tag; it needs a
         # number to sit beside, else nothing could ever write it (build_tag_diff).
-        checks[key] = ('unknown' if not expected else 'correct' if actual == expected else 'mismatch' if actual
+        checks[key] = ('unknown' if not expected else 'correct' if actual == expected
+                       # the album's own count, or no disc total on one disc
+                       else ('correct' if actual else 'not_required') if total_is_settled(key, actual, expected, data)
+                       else 'mismatch' if actual
                        else 'missing' if tags.get(number) or data.get(number) else 'unknown')
+    for key in quiet_differences(config):
+        if checks.get(key) == 'mismatch':
+            # seen and kept on the record, not something to fix
+            checks[key] = 'differs'
     checks.update(artwork_checks(rows[0]['album_image_url'], tags, config))
     checks['edition'] = data.get('edition_status', 'not_checked')
     return {'status': 'issues' if any(v in ('missing', 'mismatch') for v in checks.values())
@@ -180,6 +215,13 @@ def _json_file_links(conn):
     while the pending set is the same (count and newest id) and for at most a
     minute. a file id kept as a json string counts too, as it did when this was
     compared against the integer column.
+
+    a finding that closed since the map was built does not throw it away: its
+    id stays in the map and the readers ask for ``status='pending'`` rows by
+    id, so it is simply not found. only a new finding (a newer id) or more
+    pending rows than before (one put back) means the map is missing something.
+    without that, a bulk fix closing one finding per file rebuilt the whole
+    map per file, the same quadratic pass the inserts used to cause.
     """
     db_file = conn.execute("PRAGMA database_list").fetchone()[2]
     count, newest = conn.execute(
@@ -187,7 +229,10 @@ def _json_file_links(conn):
         "(SELECT MAX(id) FROM repair_findings)").fetchone()
     key = (db_file, count, newest)
     now = time.monotonic()
-    if _JSON_LINKS['key'] == key and now - _JSON_LINKS['at'] < _JSON_LINKS_TTL:
+    cached = _JSON_LINKS['key']
+    if (cached is not None and cached[0] == db_file and cached[2] == newest
+            and (count or 0) <= (cached[1] or 0) and now - _JSON_LINKS['at'] < _JSON_LINKS_TTL):
+        _JSON_LINKS['key'] = key
         return _JSON_LINKS['links']
     links = {}
     for finding_id, lv2, val in conn.execute(
@@ -223,7 +268,9 @@ def _note_own_finding(conn, finding_id, file_id):
             "(SELECT MAX(id) FROM repair_findings WHERE id < ?)", (int(finding_id),)).fetchone()
     except Exception:  # noqa: BLE001 - an unreadable connection keeps the old key
         return
-    if (count, newest) != (live_count - 1, before):
+    # fewer pending than the map saw is fine: findings closed since, see
+    # _json_file_links. more, or another id in between, and the map is stale
+    if newest != before or (live_count - 1) > (count or 0):
         return
     _JSON_LINKS['links'].setdefault(str(file_id).strip(), set()).add(int(finding_id))
     _JSON_LINKS['key'] = (db_file, live_count, int(finding_id))
@@ -342,11 +389,47 @@ def linked_findings(conn, file):
     return linked_findings_many(conn, [file]).get(file['id'], []) if file else []
 
 
+def album_is_hand_tagged(conn, track_id) -> bool:
+    """one of this track's album's files is one the user tagged by hand.
+    3.6.1 locked the whole album then: the user typed the release, and the
+    service's studio tracklist must not be written over the rest of it"""
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='manual_metadata_files'").fetchone():
+            return False
+        from database.music_database import MusicDatabase
+        paths = [r[0] for r in conn.execute(
+            """SELECT f.path FROM lib2_track_files f JOIN lib2_tracks t ON t.id=f.track_id
+                WHERE t.album_id=(SELECT album_id FROM lib2_tracks WHERE id=?)
+                  AND COALESCE(f.file_state,'active')<>'deleted'""", (int(track_id),))]
+        keys = sorted({MusicDatabase.manual_path_key(p) for p in paths if p})
+        if not keys:
+            return False
+        return conn.execute(
+            f"SELECT 1 FROM manual_metadata_files WHERE path_key IN ({','.join('?' for _ in keys)}) LIMIT 1",
+            keys).fetchone() is not None
+    except Exception:  # noqa: BLE001 - an unreadable lock never blocks a scan
+        return False
+
+
 def persist_validation(conn, file_id, validation):
     """Called inside the same transaction as file observations; no file writes."""
     file = dict(conn.execute('SELECT * FROM lib2_track_files WHERE id=?', (file_id,)).fetchone())
     findings = linked_findings(conn, file)
     issues = {k: v for k, v in validation['checks'].items() if v in ('missing', 'mismatch')}
+    if issues and file.get('track_id') and album_is_hand_tagged(conn, file['track_id']):
+        # nothing to re-tag on a release the user typed: no finding, and one
+        # filed before goes away rather than wait to be applied
+        issues = {}
+        for finding in findings:
+            if finding.get('finding_type') == 'library_retag' and finding.get('status') == 'pending':
+                conn.execute("UPDATE repair_findings SET status='resolved', user_action='hand_tagged_album', "
+                             "resolved_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                             (finding['id'],))
+        # review 4 R4-B-8: no return here. with no issues left, the file's
+        # other verified findings (cover art, track numbers) still close
+        findings = [f for f in findings if not (
+            f.get('finding_type') == 'library_retag' and f.get('status') == 'pending')]
     current = [f for f in findings if f['details'].get('validation')]
     for finding in current:
         if not issues and finding_verified(conn, finding, [file]):
@@ -375,6 +458,102 @@ def persist_validation(conn, file_id, validation):
             _note_own_finding(conn, cur.lastrowid, validation.get('file_id'))
 
 
+def _cached_reader_tags(snapshot):
+    """a cached tag snapshot in the shape the tag reader hands validate_tags"""
+    tags = {k: v for k, v in snapshot.items() if k != '_validation'}
+    tags['album_artist'] = tags.pop('albumartist', None)
+    if 'cover' in tags:
+        tags['has_cover_art'] = tags.pop('cover')
+    return tags
+
+
+def settle_scan_findings(database, config=None, *, should_stop=None, batch=200):
+    """Re-check the findings the tag scan filed against the tags it cached.
+
+    A rule that stops counting something as an issue (a one-disc release with
+    no disc total, an album-wide track total, artists spelled another way)
+    left its findings open until each file was next read: 183k of them on one
+    library. This re-runs the check from the cached tags, no file is opened.
+    A finding with nothing left is closed, one that still stands gets its
+    current list of issues. Short transactions, one batch each.
+    """
+    from contextlib import closing
+    from core.library2.status import _coerce_tags
+    from core.metadata.common import get_config_manager
+    config = config or get_config_manager()
+    stats = {'checked': 0, 'closed': 0, 'updated': 0}
+    last = 0
+    while not (should_stop and should_stop()):
+        with closing(database._get_connection()) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='repair_findings'").fetchone():
+                return stats
+            rows = conn.execute(
+                "SELECT id, details_json FROM repair_findings WHERE finding_type='library_retag' "
+                "AND status='pending' AND id>? ORDER BY id LIMIT ?", (last, int(batch))).fetchall()
+            if not rows:
+                return stats
+            # read everything first, write at the end: the write lock is held
+            # for the updates only
+            closes, updates, files = [], [], []
+            for row in rows:
+                last = int(row['id'])
+                try:
+                    details = json.loads(row['details_json'] or '{}')
+                except (TypeError, ValueError):
+                    continue
+                old = details.get('validation') or {}
+                if details.get('diff') or not old.get('file_id'):
+                    continue  # a re-tag job's own finding keeps its reviewed diff
+                file = conn.execute("SELECT id, tags_json, missing_tags_json FROM lib2_track_files WHERE id=? "
+                                    "AND COALESCE(file_state,'active')<>'deleted'", (old['file_id'],)).fetchone()
+                snapshot = _coerce_tags(file['tags_json']) if file else {}
+                if not snapshot or not any(k != '_validation' for k in snapshot):
+                    continue  # never read, or unreadable: the next scan decides
+                stats['checked'] += 1
+                new = validate_tags(conn, file['id'], _cached_reader_tags(snapshot), config)
+                if new.get('status') == 'unknown' and not new.get('checks'):
+                    continue
+                new['source'] = old.get('source') or 'scan'
+                if ((old.get('checks') or {}).get('genre') == 'mismatch'
+                        and new['checks'].get('genre') == 'correct' and 'genre_count' not in snapshot
+                        and 'genre' not in quiet_differences(config)):
+                    # several genres in one value is a mismatch the cache
+                    # cannot see (it keeps no value count): the next read decides
+                    new['checks']['genre'] = 'mismatch'
+                    new['status'] = 'issues'
+                issues = {k: v for k, v in new['checks'].items() if v in ('missing', 'mismatch')}
+                if issues == {k: v for k, v in (old.get('checks') or {}).items() if v in ('missing', 'mismatch')}:
+                    continue
+                snapshot['_validation'] = new
+                try:
+                    missing = json.loads(file['missing_tags_json'] or '[]') or []
+                except (TypeError, ValueError):
+                    missing = []
+                # only if the scan has not read the file again meanwhile
+                files.append((json.dumps(snapshot, sort_keys=True),
+                              json.dumps(list(dict.fromkeys([*missing, *issues]))),
+                              file['id'], file['tags_json']))
+                if not issues:
+                    closes.append(last)
+                else:
+                    details.update(validation=new, required_fields=sorted(issues))
+                    updates.append((', '.join(f'{k}: {v}' for k, v in issues.items()), json.dumps(details), last))
+            if files:
+                conn.executemany("UPDATE lib2_track_files SET tags_json=?, metadata_gaps_json=? "
+                                 "WHERE id=? AND tags_json=?", files)
+                conn.executemany(
+                    "UPDATE repair_findings SET status='resolved', user_action='obsolete', "
+                    "resolved_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+                    [(i,) for i in closes])
+                conn.executemany(
+                    "UPDATE repair_findings SET description=?, details_json=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND status='pending' AND title='Metadata issues'", updates)
+                conn.commit()
+                stats['closed'] += len(closes)
+                stats['updated'] += len(updates)
+    return stats
+
+
 def finding_summary(conn, file, findings=None):
     audio_types = {'acoustid_mismatch', 'corrupt_audio', 'fake_lossless', 'short_preview_track', 'dead_file', 'path_mismatch', 'stale_index_path'}
     findings = linked_findings(conn, file) if findings is None else findings
@@ -401,7 +580,8 @@ def finding_verified(conn, finding, files):
                             for d in details.get('diff', []) if d.get('changed')]
             if not required:
                 return None
-            if any(checks.get(k) not in ('correct', 'not_required') for k in required):
+            # 'differs': a difference the settings say to leave alone
+            if any(checks.get(k) not in ('correct', 'not_required', 'differs') for k in required):
                 return False
         elif kind == 'missing_cover_art':
             if any(checks.get(k) not in ('correct', 'not_required') for k in ('artwork_database', 'cover', 'artwork_sidecar')):

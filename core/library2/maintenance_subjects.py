@@ -9,8 +9,9 @@ enumeration.
 
 from __future__ import annotations
 
+import json
 from contextlib import closing
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from core.library2.provider_ids import source_ids_from_values
 from core.library2.metadata_context import (
@@ -82,15 +83,25 @@ def active_file_subjects(
     *,
     include_missing: bool = False,
     purpose: str = "provider_lookup",
+    file_ids: Optional[Iterable[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Native file facts with explicit lookup, display and protected write values.
 
     Existing detection jobs use provider identity by default. Callers request
     display or Retag write values explicitly; those subjects also retain their
     lookup context. Read-only scans need not build an unused write projection.
+
+    ``file_ids``: only these file rows. Keep Best on one duplicate group read
+    every file in the library (twice per click) to keep two or three of them
+    (review 5 R5-E-1).
     """
 
     validate_metadata_purpose(purpose)
+    wanted_ids: Optional[List[int]] = None
+    if file_ids is not None:
+        wanted_ids = sorted({int(value) for value in file_ids})
+        if not wanted_ids:
+            return []
 
     with closing(database._get_connection()) as conn:
         if not _table_exists(conn, "lib2_track_files"):
@@ -105,6 +116,10 @@ def active_file_subjects(
         # scope and walks all of them. Empty when nothing separates libraries.
         from core.library2.sql_util import owner_clause
         state_clause += owner_clause(column="f.owner_profile_id")
+        params: List[Any] = []
+        if wanted_ids is not None:
+            state_clause += " AND f.id IN (SELECT value FROM json_each(?))"
+            params.append(json.dumps(wanted_ids))
         rows = conn.execute(
             f"""SELECT f.id AS file_id, f.track_id, f.path, f.original_path,
                        f.is_primary, f.primary_manual, f.file_role,
@@ -161,7 +176,8 @@ def active_file_subjects(
              LEFT JOIN lib2_artists ar ON ar.id=al.primary_artist_id
                  WHERE f.path IS NOT NULL AND f.path<>'' AND {state_clause}
               ORDER BY al.id, COALESCE(t.disc_number,1),
-                       COALESCE(t.track_number,2147483647), f.id"""
+                       COALESCE(t.track_number,2147483647), f.id""",
+            params,
         ).fetchall()
         ids = {int(row["track_id"]) for row in rows}
         contexts = {key: track_metadata_contexts(conn, ids, purpose=key)
@@ -205,7 +221,10 @@ def active_file_subjects(
                 _display_subject_fields(subject, selected, album_subject=False)
             _compat_provider_fields(subject)
             subjects.append(subject)
-        return subjects
+        # #2046: a job that changes tags, art, files or the match never sees
+        # the files of an album locked against that
+        from core.library2.locks import drop_locked_subjects
+        return drop_locked_subjects(conn, subjects)
 
 
 def active_album_subjects(
@@ -302,7 +321,8 @@ def active_album_subjects(
                 _display_subject_fields(subject, selected, album_subject=True)
             _compat_provider_fields(subject)
             subjects.append(subject)
-        return subjects
+        from core.library2.locks import drop_locked_subjects
+        return drop_locked_subjects(conn, subjects)
 
 
 def subject_details(subject: Mapping[str, Any]) -> Dict[str, Any]:

@@ -18,7 +18,11 @@ from core.metadata.common import (
     get_image_dimensions,
     get_mutagen_symbols,
 )
+from utils.http_identity import APP_USER_AGENT
 from utils.logging_config import get_logger as _create_logger
+
+# image hosts refuse the bare library client name (#2079)
+_IMAGE_FETCH_HEADERS = {"Accept": "image/*", "User-Agent": APP_USER_AGENT}
 
 __all__ = [
     "embed_album_art_metadata",
@@ -543,6 +547,33 @@ def _cached_fetch_art_bytes(art_url: str, album_key: tuple):
     return data, mime
 
 
+def _library_artwork_bytes(art_url: str):
+    """(bytes, mime) for one of SoulSync's own library artwork links, or None"""
+    import re as _re
+    match = _re.match(r"^/api/library/v2/artwork/(album|artist)/(\d+)", art_url or "")
+    if not match:
+        return None
+    kind, entity_id = match.group(1), int(match.group(2))
+    try:
+        from database.music_database import get_database
+        database = get_database()
+        table = "lib2_albums" if kind == "album" else "lib2_artists"
+        with database._get_connection() as conn:
+            row = conn.execute(f"SELECT image_url FROM {table} WHERE id=?", (entity_id,)).fetchone()
+        remote = usable_remote_image_url(row[0]) if row else None
+        if remote:
+            data, mime = _fetch_art_bytes(remote)
+            if data:
+                return data, mime
+        from core.library2.artwork import artwork_file, is_cached_jpeg
+        cached = artwork_file(database, kind, entity_id)
+        if cached.is_file() and is_cached_jpeg(cached):
+            return cached.read_bytes(), "image/jpeg"
+    except Exception as exc:  # noqa: BLE001 - no art is a soft miss
+        logger.debug("library artwork %s not resolved: %s", art_url, exc)
+    return None
+
+
 def _fetch_art_bytes(art_url: str):
     """Fetch artwork bytes at the highest resolution the source serves.
 
@@ -556,11 +587,15 @@ def _fetch_art_bytes(art_url: str):
     global _caa_original_down_until
     if not art_url:
         return None, None
-    # Only absolute http(s) URLs are fetchable here. A relative path (e.g. one
-    # of SoulSync's own `/api/library/v2/artwork/...` URLs, which now travel in
-    # `album.images` for Library-v2 rows that have no provider CDN cover) would
-    # otherwise reach urlopen and raise `unknown url type` on every attempt.
+    # SoulSync's own `/api/library/v2/artwork/<kind>/<id>` link leads the
+    # images of every library-started download. urlopen can't fetch it, and
+    # taking it as "no art" left those downloads without cover.jpg (3.6.1's
+    # payload led with the provider's CDN link). resolve it here instead: the
+    # release's own CDN cover, else the artwork SoulSync already cached.
     if not str(art_url).startswith(('http://', 'https://')):
+        local = _library_artwork_bytes(str(art_url))
+        if local is not None:
+            return local
         return None, None
     upgraded = _upgrade_art_url(art_url)
     is_caa_original = "coverartarchive.org" in upgraded and upgraded.endswith("/front")
@@ -579,7 +614,9 @@ def _fetch_art_bytes(art_url: str):
     last_err = None
     for i, candidate in enumerate(attempts):
         try:
-            with urllib.request.urlopen(candidate, timeout=10) as response:
+            # a named client: Discogs' image host refuses "Python-urllib" (#2079)
+            req = urllib.request.Request(candidate, headers=_IMAGE_FETCH_HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as response:
                 return response.read(), (response.info().get_content_type() or "image/jpeg")
         except Exception as fetch_err:
             last_err = fetch_err
@@ -679,7 +716,7 @@ def embed_album_art_metadata(audio_file, metadata: dict):
             try:
                 # 1200px CDN thumbnail, not the flaky bare /front original.
                 caa_url = f"https://coverartarchive.org/release/{release_mbid}/front-1200"
-                req = urllib.request.Request(caa_url, headers={"Accept": "image/*"})
+                req = urllib.request.Request(caa_url, headers=_IMAGE_FETCH_HEADERS)
                 with urllib.request.urlopen(req, timeout=10) as response:
                     image_data = response.read()
                     mime_type = response.info().get_content_type() or "image/jpeg"
@@ -853,7 +890,7 @@ def download_cover_art(album_info: dict, target_dir: str, context: dict = None, 
             try:
                 # 1200px CDN thumbnail, not the flaky bare /front original.
                 caa_url = f"https://coverartarchive.org/release/{release_mbid}/front-1200"
-                req = urllib.request.Request(caa_url, headers={"Accept": "image/*"})
+                req = urllib.request.Request(caa_url, headers=_IMAGE_FETCH_HEADERS)
                 with urllib.request.urlopen(req, timeout=10) as response:
                     image_data = response.read()
                 if not image_data or len(image_data) <= 1000:

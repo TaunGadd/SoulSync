@@ -36,6 +36,7 @@ from the schema-ensure step and repairs installs that predate the columns.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from core.quality.lossless import LOSSLESS_FORMATS as _CANONICAL_LOSSLESS
@@ -299,7 +300,54 @@ def set_file_state(conn, file_id: int, state: str) -> bool:
     return True
 
 
-def track_id_for_path(conn, file_path: Any) -> Optional[int]:
+# One file, one path -- however it was written.
+#
+# A Windows path names the same file with either slash. The catalogue holds
+# both: the upgrade and the import wrote "H:/Music/a.flac", the media-server
+# scan resolves the server's path through os.path.abspath and gets
+# "H:\\Music\\a.flac". Every lookup compared the text, so the scan did not
+# find the file it was looking at and adopted it a second time: a second file
+# row on the track ("2 copies"), or a second track row, and the song listed
+# twice in Songs (Nov 13 2026: 286 files on one library, 89 of them as twin
+# tracks). Lookups ask for every spelling, and writers keep the one stored.
+_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
+
+
+def path_spellings(path: Any) -> Tuple[str, ...]:
+    """Every way this file's path may be stored, the given one first.
+
+    Only a Windows path (a drive letter or a UNC share) has more than one: on
+    Linux a backslash is a character in a file name, not a separator."""
+    text = str(path or "")
+    if not text:
+        return ()
+    if not _WINDOWS_PATH.match(text):
+        return (text,)
+    return tuple(dict.fromkeys((text, text.replace("\\", "/"), text.replace("/", "\\"))))
+
+
+def path_identity(path: Any) -> str:
+    """One key for all of a path's spellings (grouping, not storing)."""
+    text = str(path or "")
+    return text.replace("\\", "/") if _WINDOWS_PATH.match(text) else text
+
+
+def stored_spelling(conn, path: Any) -> str:
+    """``path`` as the catalogue already writes this file, else as given.
+
+    A live row wins over a deleted one, the oldest row over a newer copy.
+    One read through the path index."""
+    forms = path_spellings(path)
+    if len(forms) < 2:
+        return forms[0] if forms else ""
+    row = conn.execute(
+        f"SELECT path FROM lib2_track_files WHERE path IN ({','.join('?' * len(forms))})"
+        " ORDER BY (COALESCE(file_state,'active')='deleted'), id LIMIT 1", forms).fetchone()
+    return str(row[0]) if row else forms[0]
+
+
+def track_id_for_path(conn, file_path: Any, *, scoped: bool = False,
+                      basename: bool = True) -> Optional[int]:
     """The catalogue track that owns a file path, or ``None``.
 
     Exact path first, then the basename — a media server and SoulSync often
@@ -310,17 +358,31 @@ def track_id_for_path(conn, file_path: Any) -> Optional[int]:
 
     Live files win over deleted ones: a deleted row is history (ADR-03) and
     must not out-vote the file that actually sits at that path today.
+
+    ``scoped`` keeps it to the asking profile's library, the way 3.6.1's
+    lookup was: a basename guess must never land in someone else's files.
+
+    ``basename=False`` stops after the exact path. the basename step is a
+    leading-wildcard LIKE, a walk of every file row (2-3 s at 300k), so a
+    caller that links the file itself afterwards skips it (review 5 R5-G-1).
     """
     file_path = str(file_path or "")
     if not file_path:
         return None
+    owner = ""
+    if scoped:
+        from core.library2.sql_util import owner_clause
+        owner = owner_clause(column="owner_profile_id")
+    forms = path_spellings(file_path)
     row = conn.execute(
         f"SELECT track_id FROM lib2_track_files"
-        f" WHERE path = ? AND track_id IS NOT NULL"
-        f" AND COALESCE(file_state,'active') <> 'deleted'"
-        f" ORDER BY {primary_order()} LIMIT 1", (file_path,)).fetchone()
+        f" WHERE path IN ({','.join('?' * len(forms))}) AND track_id IS NOT NULL"
+        f" AND COALESCE(file_state,'active') <> 'deleted'{owner}"
+        f" ORDER BY {primary_order()} LIMIT 1", forms).fetchone()
     if row:
         return int(row[0])
+    if not basename:
+        return None
     name = os.path.basename(file_path.replace('\\', '/'))
     if not name:
         return None
@@ -330,8 +392,35 @@ def track_id_for_path(conn, file_path: Any) -> Optional[int]:
         " WHERE track_id IS NOT NULL"
         "   AND COALESCE(file_state,'active') <> 'deleted'"
         "   AND (path LIKE ? ESCAPE '^' OR path LIKE ? ESCAPE '^')"
-        " LIMIT 2", (f"%/{escaped}", f"%\\{escaped}")).fetchall()
+        f"{owner} LIMIT 2", (f"%/{escaped}", f"%\\{escaped}")).fetchall()
     return int(rows[0][0]) if len(rows) == 1 else None
+
+
+def link_unlinked_downloads(cursor) -> int:
+    """Give provenance rows written with track_id NULL the track their file has now.
+
+    every import recorded provenance before its file had a catalogue row, so
+    those rows never linked and the upgrade carry skips them (review 5
+    R5-G-1). exact path only, through idx_track_downloads_file_path and the
+    path index. reads first, writes only the rows that match. Does not commit.
+    """
+    if not cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                          " AND name='track_downloads'").fetchone():
+        return 0
+    rows = cursor.execute(f"""
+        SELECT d.id, (SELECT f.track_id FROM lib2_track_files f
+                       WHERE f.path = d.file_path AND f.track_id IS NOT NULL
+                         AND COALESCE(f.file_state,'active') <> 'deleted'
+                       ORDER BY {primary_order('f')} LIMIT 1)
+          FROM track_downloads d
+         WHERE d.track_id IS NULL AND d.file_path IS NOT NULL AND d.file_path <> ''
+    """).fetchall()
+    pairs = [(str(int(r[1])), int(r[0])) for r in rows if r[1] is not None]
+    if pairs:
+        cursor.executemany(
+            "UPDATE track_downloads SET track_id=?, track_id_kind='lib2'"
+            " WHERE id=? AND track_id IS NULL", pairs)
+    return len(pairs)
 
 
 def repoint_file_path(conn, old_path: str, new_path: str,
@@ -466,7 +555,7 @@ def retire_replaced_files(
         if set_file_state(conn, file_id, "deleted"):
             retired += 1
             logger.info(
-                "Library v2: retired replaced file row %s (%s) for track %s",
+                "Library: retired replaced file row %s (%s) for track %s",
                 file_id, stored, track_id,
             )
     return retired
@@ -556,28 +645,42 @@ def backfill_primary_flags(cursor) -> int:
 
 
 def backfill_file_roles(cursor) -> int:
-    """Classify companions created before role/provenance columns existed."""
-    changed = 0
-    cursor.execute("""
-        UPDATE lib2_track_files SET file_role='derivative'
-         WHERE source='companion' AND COALESCE(file_role,'master')<>'derivative'
-    """)
-    changed += cursor.rowcount
-    cursor.execute("""
-        UPDATE lib2_track_files AS child
-           SET derived_from_file_id=(
-               SELECT parent.id FROM lib2_track_files parent
-                WHERE parent.track_id=child.track_id
-                  AND parent.id<>child.id AND parent.is_primary=1
-                LIMIT 1)
+    """Classify companions created before role/provenance columns existed.
+
+    runs every start: read first, write only the rows found. the set-based
+    UPDATEs held the write lock for a 2-3 s scan of every file row while
+    changing nothing (review 5 R5-X2-1)."""
+    # partial indexes hold just the rows this pass would change (none,
+    # normally), so each read is a walk of those, not of every file row.
+    # INDEXED BY: derived_from_file_id IS NULL also matches the plain
+    # derived_from index, which is nearly every row
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lib2_track_files_companion_role "
+        "ON lib2_track_files(id) WHERE source='companion' "
+        "AND COALESCE(file_role,'master')<>'derivative'")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lib2_track_files_derivative_unlinked "
+        "ON lib2_track_files(id) WHERE file_role='derivative' "
+        "AND derived_from_file_id IS NULL")
+    changed = _update_files(
+        cursor, "file_role='derivative'",
+        "SELECT id FROM lib2_track_files"
+        " INDEXED BY idx_lib2_track_files_companion_role"
+        " WHERE source='companion' AND COALESCE(file_role,'master')<>'derivative'")
+    changed += _update_files(cursor, """
+        derived_from_file_id=(
+            SELECT parent.id FROM lib2_track_files parent
+             WHERE parent.track_id=lib2_track_files.track_id
+               AND parent.id<>lib2_track_files.id AND parent.is_primary=1
+             LIMIT 1)""", """
+        SELECT child.id FROM lib2_track_files child
+               INDEXED BY idx_lib2_track_files_derivative_unlinked
          WHERE child.file_role='derivative'
            AND child.derived_from_file_id IS NULL
            AND EXISTS (
                SELECT 1 FROM lib2_track_files parent
                 WHERE parent.track_id=child.track_id
-                  AND parent.id<>child.id AND parent.is_primary=1)
-    """)
-    changed += cursor.rowcount
+                  AND parent.id<>child.id AND parent.is_primary=1)""")
     return changed
 
 

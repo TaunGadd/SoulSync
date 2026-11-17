@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import uuid
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from contextlib import AbstractContextManager
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from core.downloads.history import ALBUM_PREFIXES
+from core.downloads.origin import HAND_PICKED_ID_PREFIXES
 from core.wishlist.payloads import build_failed_track_wishlist_context
 from core.wishlist.selection import filter_wishlist_tracks_by_category, sanitize_and_dedupe_wishlist_tracks
 from core.wishlist.service import get_wishlist_service
@@ -352,9 +355,14 @@ def _run_wishlist_cycle(
                     source_playlist_id = None
                     for _tr in batch_tracks:
                         _si = _tr.get('source_info') or {}
-                        if isinstance(_si, dict) and _si.get('playlist_id'):
-                            source_playlist_id = _si['playlist_id']
-                            break
+                        # skip the 'wishlist' sentinel, or an early track's
+                        # would hide a later track's real ref
+                        if isinstance(_si, dict):
+                            _cleaned_ref = _clean_requeue_playlist_ref(
+                                _si.get('playlist_id'))
+                            if _cleaned_ref is not None:
+                                source_playlist_id = _cleaned_ref
+                                break
                     mirrored_playlist_id = None
                     try:
                         _music_db = getattr(runtime, 'get_music_database', None)
@@ -447,7 +455,7 @@ def start_direct_track_download_batch(
         with runtime.tasks_lock:
             runtime.download_batches[batch_id] = make_wishlist_batch_row(
                 playlist_id="library_v2_search",
-                playlist_name="Library v2 Automatic Search",
+                playlist_name="Library Automatic Search",
                 track_count=0,
                 max_concurrent=runtime.get_batch_max_concurrent(),
                 profile_id=runtime.profile_id,
@@ -480,7 +488,7 @@ def _prepare_and_run_direct_track_batch(
         direct_tracks, duplicates = sanitize_and_dedupe_wishlist_tracks(tracks)
         if duplicates:
             runtime.logger.info(
-                f"[Library-v2 Search] Removed {duplicates} duplicate transient payload(s)"
+                f"[Library Search] Removed {duplicates} duplicate transient payload(s)"
             )
         for index, track in enumerate(direct_tracks):
             track['_original_index'] = index
@@ -707,9 +715,9 @@ def build_wishlist_source_context(batch: Dict[str, Any], current_time: datetime 
         context['mirrored_playlist_id'] = batch.get('mirrored_playlist_id')
     if batch.get('organize_by_playlist'):
         context['organize_by_playlist'] = True
-    # Preserve album-batch provenance so wishlist requeue has a real signal
-    # for album-vs-single routing instead of relying on per-track album dicts
-    # that may have been mangled by reconstruction fallbacks.
+    # tracks that keep the batch pair are album downloads, and
+    # derive_download_origin reads is_album_download when they finish. a
+    # track whose own playlist wins drops these again (the resolver below)
     if batch.get('is_album_download'):
         context['is_album_download'] = True
         album_ctx = batch.get('album_context')
@@ -719,6 +727,206 @@ def build_wishlist_source_context(batch: Dict[str, Any], current_time: datetime 
         if isinstance(artist_ctx, dict):
             context['artist_context'] = artist_ctx
     return context
+
+
+# refs the wishlist stamps on its own batches. never a real playlist
+_WISHLIST_SENTINEL_REFS = frozenset({'wishlist', 'wishlist_manual'})
+# names that aren't a playlist: the bare label and the builder's default.
+# the generated batch labels all start 'Wishlist (' and are checked below
+_WISHLIST_PLACEHOLDER_NAMES = frozenset({'wishlist', 'unknown playlist'})
+
+
+def _clean_requeue_playlist_ref(value: Any) -> Optional[Any]:
+    """a stored playlist ref, or None when it's nothing real. a positive int
+    stays an int: registration reads an int as a mirrored playlist id and a
+    digit string as an upstream one"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if value <= 0:
+            return None
+        return value
+    if not isinstance(value, str):
+        return None
+    ref = value.strip()
+    if not ref or ref.casefold() in _WISHLIST_SENTINEL_REFS:
+        return None
+    return ref
+
+
+# batch playlist_ids that name no playlist: made-up ids for hand-picked
+# songs and albums (the lists come from origin.py and history.py so they
+# can't drift), plus the redownload, label, resync, itunes link and wing it
+# ids, and the fixed ones below
+_SYNTHETIC_BATCH_PLAYLIST_ID_PREFIXES = HAND_PICKED_ID_PREFIXES + ALBUM_PREFIXES + (
+    'redownload_', 'lbl_album_', 'resync_', 'ituneslink_', 'wing_it_',
+)
+_SYNTHETIC_BATCH_PLAYLIST_IDS = frozenset({'playback_queue', 'legacy_modal', 'library_v2_search'})
+
+
+def _clean_direct_playlist_batch_ref(value: Any) -> Optional[Any]:
+    """a direct playlist download's batch playlist_id, or None. that batch
+    only stamps its real id there, so it counts, the made-up ids don't"""
+    ref = _clean_requeue_playlist_ref(value)
+    if ref is None:
+        return None
+    text = str(ref)
+    if text in _SYNTHETIC_BATCH_PLAYLIST_IDS or text.startswith(
+            _SYNTHETIC_BATCH_PLAYLIST_ID_PREFIXES):
+        return None
+    return ref
+
+
+def _is_generated_batch_label(name: Any) -> bool:
+    """a placeholder or a label the wishlist made up ('Wishlist (Album: X)',
+    'Wishlist (Auto - ...)', 'Wishlist (Residual)'). a real playlist that
+    just starts 'Wishlist (' isn't one"""
+    if not isinstance(name, str):
+        return True
+    folded = name.strip().casefold()
+    if not folded or folded in _WISHLIST_PLACEHOLDER_NAMES:
+        return True
+    return folded == 'wishlist (residual)' \
+        or folded.startswith('wishlist (auto - ') \
+        or folded.startswith('wishlist (album: ')
+
+
+def _batch_own_playlist_name(batch: Dict[str, Any]) -> Optional[str]:
+    """a residual playlist batch's own name, or None. dispatch grouped the
+    batch by it, so it's the tracks' real playlist even when it reads like a
+    label ('Wishlist (2024)'). bare placeholders and the generated labels
+    still don't count"""
+    if not batch.get('is_playlist_batch'):
+        return None
+    name = batch.get('source_playlist_name')
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name or _is_generated_batch_label(name):
+        return None
+    return name
+
+
+def _clean_requeue_playlist_name(value: Any) -> Optional[str]:
+    """a track's stored playlist name, or None when it's a placeholder or a
+    wishlist label. a playlist really named 'Wishlist ...' loses its name
+    here but keeps its ref, and registration goes by the ref"""
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    folded = name.casefold()
+    if not folded or folded in _WISHLIST_PLACEHOLDER_NAMES:
+        return None
+    if folded.startswith('wishlist ('):
+        return None
+    return name
+
+
+def resolve_failed_track_requeue_provenance(
+    batch: Dict[str, Any],
+    track_data: Any,
+    current_time: datetime | None = None,
+    *,
+    batch_context: Optional[Dict[str, Any]] = None,
+) -> tuple[str, Dict[str, Any]]:
+    """the (source_type, source_context) one failed track goes back on the
+    wishlist with.
+
+    the batch pair describes the batch, not the track. a playlist song that
+    failed inside a wishlist album batch went back as 'Wishlist (Album: X)'
+    with playlist_id 'wishlist', the re-add overwrote its row, and when it
+    finally downloaded nothing knew which playlist to re-sync (#1981). so a
+    track that carries its own playlist keeps it, and drops the batch's
+    album flags (derive_download_origin would read it as hand-picked).
+
+    a batch that already resolved a playlist of its own (a real ref, or a
+    name with a mirrored id) wins over the track's older one. either way a
+    key with nothing real in it is removed, never left holding the sentinel,
+    because grouping and registration read the pair together.
+
+    batch_context: the batch pair built once for every track of a batch.
+    """
+    source_type = resolve_wishlist_source_type_for_batch(batch)
+    if batch_context is not None:
+        context = dict(batch_context)
+    else:
+        context = build_wishlist_source_context(batch, current_time=current_time)
+    # names are stored stripped, the next cycle groups by the exact text
+    if isinstance(context.get('playlist_name'), str):
+        context['playlist_name'] = context['playlist_name'].strip()
+
+    # does the batch have a playlist of its own? a real ref on either source
+    # field, or a direct download's real playlist_id. an album batch's
+    # playlist_id never counts, album flows stamp ids no list can cover
+    batch_ref = (
+        _clean_requeue_playlist_ref(batch.get('source_playlist_id'))
+        or _clean_requeue_playlist_ref(batch.get('source_playlist_ref'))
+        or (None if batch.get('is_album_download')
+            else _clean_direct_playlist_batch_ref(batch.get('playlist_id')))
+    )
+    if batch_ref is not None:
+        # the builder doesn't read source_playlist_id, so its ref can be the
+        # sentinel. use the batch's real one then
+        if batch.get('is_album_download') or \
+                _clean_direct_playlist_batch_ref(context.get('playlist_id')) is None:
+            context['playlist_id'] = batch_ref
+        # a real ref beside a generated label is the other bad pairing. a
+        # real name stands, it came with the ref
+        context_name = context.get('playlist_name')
+        if context_name is None or (
+                _clean_requeue_playlist_name(context_name) is None
+                and _is_generated_batch_label(context_name)):
+            context.pop('playlist_name', None)
+        return source_type, context
+    if batch.get('is_playlist_batch') and (
+        _clean_requeue_playlist_name(batch.get('source_playlist_name')) is not None
+        or _clean_requeue_playlist_name(batch.get('playlist_name')) is not None
+        or _batch_own_playlist_name(batch) is not None
+    ) and batch.get('mirrored_playlist_id') is not None:
+        # resolved by name at dispatch, with a mirrored id behind it. drop a
+        # dead ref, keep a real name
+        if _clean_direct_playlist_batch_ref(context.get('playlist_id')) is None:
+            context.pop('playlist_id', None)
+        if _clean_requeue_playlist_name(context.get('playlist_name')) is None:
+            own_name = _batch_own_playlist_name(batch)
+            if own_name is not None:
+                context['playlist_name'] = own_name
+            else:
+                context.pop('playlist_name', None)
+        return source_type, context
+
+    if not isinstance(track_data, dict) or track_data.get('source_type') != 'playlist':
+        return source_type, context
+
+    source_info = track_data.get('source_info')
+    if isinstance(source_info, str):
+        try:
+            source_info = json.loads(source_info)
+        except (ValueError, TypeError, RecursionError):
+            source_info = {}
+    if not isinstance(source_info, dict):
+        return source_type, context
+
+    playlist_id = _clean_requeue_playlist_ref(source_info.get('playlist_id'))
+    playlist_name = _clean_requeue_playlist_name(source_info.get('playlist_name'))
+    if playlist_id is None and playlist_name is None:
+        return source_type, context
+
+    if playlist_name is not None:
+        context['playlist_name'] = playlist_name
+    else:
+        context.pop('playlist_name', None)
+    if playlist_id is not None:
+        context['playlist_id'] = playlist_id
+    else:
+        context.pop('playlist_id', None)
+    # the batch's mirrored id and album flags belong to the batch, not this
+    # track. registration finds the track's playlist by its ref or name
+    context.pop('mirrored_playlist_id', None)
+    context.pop('is_album_download', None)
+    context.pop('album_context', None)
+    context.pop('artist_context', None)
+    return 'playlist', context
 
 
 def _wishlist_run_has_siblings_still_active(
@@ -870,9 +1078,16 @@ def remove_tracks_already_in_library(
 
     from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
 
+    # #2060: a wish for a BETTER copy is about a track that has its file.
+    # Owning it is the premise, not a reason to drop the wish: this sweep took
+    # every upgrade out again before it was tried, so none ever happened.
+    upgrade_wishes = _live_upgrade_wishes(music_database, cleanup_tracks, logger)
+
     cleanup_removed = 0
     for profile_id, track in cleanup_tracks:
         if skip_track_fn and skip_track_fn(track):
+            continue
+        if id(track) in upgrade_wishes:
             continue
         # this runs as a background job, so "already in the library" has to be
         # asked through the wishlist owner's library, not the job's (#1199): an
@@ -887,6 +1102,43 @@ def remove_tracks_already_in_library(
             reset_library_scope(_scope_token)
         cleanup_removed += removed_here
     return cleanup_removed
+
+
+def _live_upgrade_wishes(music_database, cleanup_tracks, logger) -> set:
+    """``id()`` of the rows that ask for a better copy of a track whose file is
+    still below its quality profile. A row whose track has since been upgraded
+    (or whose profile no longer asks for more) is an ordinary owned track
+    again and is swept like any other. Empty on any error: the sweep then
+    behaves as it always did."""
+    try:
+        from core.library2.upgrade_attempts import is_upgrade_wish
+        from core.library2.wishlist_mirror import upgrade_candidate_track_ids
+        from core.library_scope import (
+            library_scope_for_profile, reset_library_scope, set_library_scope,
+        )
+        by_profile: dict = {}
+        for profile_id, track in cleanup_tracks:
+            track_id = is_upgrade_wish(track.get('source_info'))
+            if track_id:
+                by_profile.setdefault(profile_id, []).append((track_id, track))
+        live: set = set()
+        for profile_id, wishes in by_profile.items():
+            token = set_library_scope(library_scope_for_profile(profile_id))
+            try:
+                conn = music_database._get_connection()
+                try:
+                    still = set(upgrade_candidate_track_ids(
+                        conn, profile_id=profile_id,
+                        track_ids=sorted({track_id for track_id, _track in wishes})))
+                finally:
+                    conn.close()
+            finally:
+                reset_library_scope(token)
+            live.update(id(track) for track_id, track in wishes if track_id in still)
+        return live
+    except Exception as exc:  # noqa: BLE001 - the sweep must still run
+        logger.debug("upgrade-wish check skipped: %s", exc)
+        return set()
 
 
 def _cleanup_one(wishlist_service, music_database, _mlm, profile_id, track, active_server, *, logger, log_prefix) -> int:
@@ -1030,7 +1282,7 @@ def _prepare_and_run_manual_wishlist_batch(
         db = runtime.get_music_database()
         manual_profile_id = runtime.profile_id
 
-        logger.warning("[Manual-Wishlist] Cleaning duplicate tracks before download...")
+        logger.info("[Manual-Wishlist] Cleaning duplicate tracks before download...")
         duplicates_removed = db.remove_wishlist_duplicates(profile_id=manual_profile_id)
         if duplicates_removed > 0:
             logger.warning(f"[Manual-Wishlist] Removed {duplicates_removed} duplicate tracks")
@@ -1055,18 +1307,29 @@ def _prepare_and_run_manual_wishlist_batch(
         # approved; the rest waits on the Requests page, which is where the
         # requester hears about it -- same rule as the scheduled run
         from core.library2.mirror_outbox import profile_asks_first
+        waiting = 0
         if profile_asks_first(db, manual_profile_id):
             raw_wishlist_tracks = wishlist_service.get_wishlist_tracks_for_download(
                 profile_id=manual_profile_id, approved_only=True)
-            logger.info("[Manual-Wishlist] Profile %s asks first: approved requests only", manual_profile_id)
+            try:
+                waiting = max(0, int(wishlist_service.get_wishlist_count(profile_id=manual_profile_id) or 0)
+                              - len(raw_wishlist_tracks or []))
+            except Exception:  # noqa: BLE001 - the count only words the message
+                waiting = 0
+            logger.info("[Manual-Wishlist] Profile %s asks first: approved requests only (%s waiting)",
+                        manual_profile_id, waiting)
         else:
             raw_wishlist_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=manual_profile_id)
         if not raw_wishlist_tracks:
             logger.warning("[Manual-Wishlist] No tracks in wishlist after cleanup — marking batch complete")
+            # an asks-first profile's wishlist is requests: say why nothing
+            # started instead of claiming the wishlist is empty
+            error = (f"{waiting} request{'s' if waiting != 1 else ''} waiting for approval "
+                     "on the Requests page" if waiting else 'No tracks in wishlist')
             with runtime.tasks_lock:
                 if batch_id in runtime.download_batches:
                     runtime.download_batches[batch_id]['phase'] = 'complete'
-                    runtime.download_batches[batch_id]['error'] = 'No tracks in wishlist'
+                    runtime.download_batches[batch_id]['error'] = error
             return
 
         wishlist_tracks, duplicates_found = sanitize_and_dedupe_wishlist_tracks(raw_wishlist_tracks)
@@ -1357,7 +1620,7 @@ def process_wishlist_automatically(
                 runtime.update_automation_progress(automation_id, progress=10, phase='Checking wishlist',
                                                    log_line=f'{count} tracks across {len(all_profiles)} profiles', log_type='info')
                 if count == 0:
-                    logger.warning("ℹ️ [Auto-Wishlist] No tracks in wishlist for auto-processing.")
+                    logger.info("ℹ️ [Auto-Wishlist] No tracks in wishlist for auto-processing.")
                     return
 
                 logger.info(f"[Auto-Wishlist] Found {count} tracks in wishlist, starting automatic processing...")
@@ -1382,7 +1645,7 @@ def process_wishlist_automatically(
                 music_database = runtime.get_music_database()
 
                 if not scoped:
-                    logger.warning("[Auto-Wishlist] Cleaning duplicate tracks before processing...")
+                    logger.info("[Auto-Wishlist] Cleaning duplicate tracks before processing...")
                     for profile in all_profiles:
                         duplicates_removed = music_database.remove_wishlist_duplicates(profile_id=profile['id'])
                         if duplicates_removed > 0:
@@ -1416,11 +1679,16 @@ def process_wishlist_automatically(
                                                    log_line='Ran library sweep — owned tracks removed before batch',
                                                    log_type='info')
 
-                # Get wishlist tracks for processing - combine all profiles
-                if not scoped:
-                    raw_wishlist_tracks = []
-                    for profile in all_profiles:
-                        raw_wishlist_tracks.extend(_tracks(profile))
+                # Get wishlist tracks for processing - combine all profiles.
+                # a scoped run read its rows before the sweep: read them again,
+                # or the tracks it just removed as owned are still sent, and the
+                # force_download_all batch downloads them again (review 5 R5-J-1)
+                raw_wishlist_tracks = []
+                for profile in all_profiles:
+                    tracks = _tracks(profile)
+                    if scoped:
+                        tracks = _tracks_in_scope(tracks, requested_track_ids)
+                    raw_wishlist_tracks.extend(tracks)
                 if not raw_wishlist_tracks:
                     logger.warning("No tracks returned from wishlist service.")
                     return
@@ -1516,7 +1784,7 @@ def process_wishlist_automatically(
                         current_cycle = next_cycle
                         filtered_tracks = _other
                     else:
-                        logger.warning(f"ℹ️ [Auto-Wishlist] No {current_cycle} tracks in wishlist, toggling cycle and scheduling next run")
+                        logger.info(f"ℹ️ [Auto-Wishlist] No {current_cycle} tracks in wishlist, toggling cycle and scheduling next run")
                         set_wishlist_cycle(lambda: music_database, next_cycle)
                         logger.info(f"[Auto-Wishlist] Cycle toggled: {current_cycle} → {next_cycle}")
                         runtime.update_automation_progress(
@@ -1743,6 +2011,7 @@ __all__ = [
     "add_cancelled_tracks_to_failed_tracks",
     "recover_uncaptured_failed_tracks",
     "build_wishlist_source_context",
+    "resolve_failed_track_requeue_provenance",
     "finalize_auto_wishlist_completion",
     "automatic_wishlist_cleanup_after_db_update",
     "WishlistAutoProcessingRuntime",

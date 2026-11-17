@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from contextlib import closing
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.library2.sql_util import pick
@@ -41,6 +42,10 @@ def retag_options(options=None) -> Dict[str, Any]:
         'lyrics': raw.get('lyrics', 'skip'),
         'source': raw.get('source', 'auto') or 'auto',
         'auto_apply': raw.get('auto_apply', raw.get('dry_run') is False) is True,
+        # which differences the tag scan files as something to fix
+        # (validation.quiet_differences)
+        'flag_genre_differences': raw.get('flag_genre_differences') is True,
+        'flag_year_differences': raw.get('flag_year_differences') is True,
     }
     if raw.get('dry_run') is True:
         result['auto_apply'] = False
@@ -65,6 +70,68 @@ _POLICY_DATA_KEYS = {
     'bpm': 'bpm', 'style': 'style', 'mood': 'mood', 'copyright': 'copyright',
     'isrc': 'isrc', 'lyrics': 'lyrics',
 }
+
+
+#: a scan check -> the tag field (or cover) a fix for it writes
+_CHECK_FIELDS = {
+    'title': 'title', 'artist': 'artist', 'album': 'album', 'albumartist': 'album_artist',
+    'year': 'year', 'genre': 'genre', 'track_number': 'track_number', 'disc_number': 'disc_number',
+    'total_tracks': 'total_tracks', 'total_discs': 'total_discs',
+    'cover': 'cover_art', 'artwork_sidecar': 'cover_art', 'artwork_database': 'cover_art',
+}
+
+
+def scan_finding_parts(details: Dict[str, Any]) -> Dict[str, list]:
+    """A scan-made finding's fields, split by what a fix would do to the file.
+
+    ``fill``: blank in the file, so writing it loses nothing. ``replace``:
+    the file holds a value and the library holds another, so writing it
+    throws the file's away. Both as tag field names (``album_artist``,
+    ``cover_art``).
+    """
+    checks = (details.get('validation') or {}).get('checks') or {}
+    parts = {'fill': set(), 'replace': set()}
+    for key, state in checks.items():
+        field = _CHECK_FIELDS.get(key)
+        if field and state == 'missing':
+            parts['fill'].add(field)
+        elif field and state == 'mismatch':
+            parts['replace'].add(field)
+    parts['replace'] -= parts['fill']
+    return {name: sorted(fields) for name, fields in parts.items()}
+
+
+def scan_finding_options(details: Dict[str, Any], *, fill_only: bool = False) -> Optional[Dict[str, Any]]:
+    """The write a scan-made finding is allowed: the fields it flagged.
+
+    ``fill_only`` is what a bulk run gets: only the tags that are blank in
+    the file, and never over a value that is there (``mode: fill_missing``
+    holds that even if the file changed since the scan).
+
+    A finding the tag scan files has no options of its own, and applying it
+    took the Write Tags path: every core tag rewritten from the library and
+    the embedded cover replaced, for a finding that said "total_discs:
+    missing". On one library that was 182k files, 57k genres and 13k artist
+    credits nobody had been shown. It writes what it reported and fills a
+    cover only where there is none. None when the finding flagged nothing.
+    """
+    validation = details.get('validation') or {}
+    if fill_only:
+        if not validation:
+            return None
+        return retag_options({'fields': scan_finding_parts(details)['fill'], 'mode': 'fill_missing',
+                              'cover_art': 'fill_missing', 'lyrics': 'skip'})
+    flagged = set(details.get('required_fields') or ())
+    flagged.update(k for k, v in (validation.get('checks') or {}).items() if v in ('missing', 'mismatch'))
+    # a difference the settings say to leave alone is not written, however it
+    # got onto the list of what this finding once needed
+    flagged -= {k for k, v in (validation.get('checks') or {}).items() if v == 'differs'}
+    if not validation and not flagged:
+        return None
+    # nothing flagged any more: an empty list writes nothing, where None
+    # would mean "every field"
+    fields = sorted({_CHECK_FIELDS[k] for k in flagged if k in _CHECK_FIELDS})
+    return retag_options({'fields': fields, 'cover_art': 'fill_missing', 'lyrics': 'skip'})
 
 
 def _policy_diff(file_tags, db_data, options):
@@ -108,13 +175,27 @@ def _lyrics_for_row(row):
     return (getattr(lyrics, 'synced_lyrics', None) or getattr(lyrics, 'plain_lyrics', None)) if lyrics else data.get('lyrics')
 
 
-def repair_field_protection(database, file_path, fields, *, track_id=None, file_id=None):
-    """Revalidate file ownership and manual fields immediately before a repair."""
+def repair_field_protection(database, file_path, fields, *, track_id=None, file_id=None,
+                            follows_file_tags=False):
+    """Revalidate file ownership and manual fields immediately before a repair.
+
+    ``follows_file_tags``: the caller writes the file and then has the Library
+    take the file's tags again (tags_to_library.apply). A value the Library
+    took from a file tag is then not something to protect: it follows the file
+    it came from (#2084). An edit typed in by hand still is.
+    """
     from core.repair_jobs.base import hand_tagged_path_keys, is_hand_tagged_path
     from core.library2.paths import resolve_lib2_path
     keys = hand_tagged_path_keys(database)
     if is_hand_tagged_path(file_path, keys) or is_hand_tagged_path(resolve_lib2_path(file_path), keys):
         return {}
+    if track_id is not None:
+        # another file of the album is hand-tagged: the album is the user's
+        # (3.6.1's album lock), so a finding filed earlier writes nothing
+        from core.library2.validation import album_is_hand_tagged
+        with closing(database._get_connection()) as conn:
+            if album_is_hand_tagged(conn, int(track_id)):
+                return {}
     if track_id is None:
         return dict(fields)
     from core.library2.track_files import writable_file_rows
@@ -139,6 +220,10 @@ def repair_field_protection(database, file_path, fields, *, track_id=None, file_
         ):
             if entity_id:
                 overrides = get_field_overrides(conn, entity_type=entity, entity_id=int(entity_id))
+                if follows_file_tags:
+                    from core.library2.tags_to_library import FILE_TAGS_REASON
+                    overrides = {k: v for k, v in overrides.items()
+                                 if (getattr(v, 'reason', None) or '') != FILE_TAGS_REASON}
                 protected.update(mapping[k] for k in overrides if k in mapping)
         # Number/identity repairs cannot replace a pinned edition's reference.
         album = conn.execute('SELECT canonical_locked FROM lib2_albums WHERE id=?', (row['album_id'],)).fetchone()
@@ -172,6 +257,7 @@ def _track_rows(conn, track_ids: List[int]) -> List[Any]:
     return conn.execute(
         f"""SELECT t.id, t.title, t.duration, t.track_number, t.disc_number,
                    t.spotify_id, t.musicbrainz_id, t.album_id, t.bpm, t.isrc, t.style, t.mood, t.copyright, t.genius_lyrics, t.external_ids,
+                   t.track_artist AS own_artist,
                    al.title AS album_title, al.album_type, al.year, al.release_date, al.genres,
                    al.expected_track_count, al.track_count,
                    al.image_url AS album_image_url,
@@ -314,6 +400,48 @@ def _apply_overrides(conn, row: Any, data: Dict[str, Any]) -> Dict[str, str]:
     return manual
 
 
+def _performers(artists: List[str], album_artist: Any, own_artist: Any) -> List[str]:
+    """the credits that belong in the ARTIST tag.
+
+    the upgrade import credits every track to its album artist as well as to
+    whoever the track's own artist names. on an album filed under someone
+    else (a soundtrack folder, a compilation, a guest's song on a mixtape)
+    that put the album artist in front of the performer: "Official
+    Soundtrack; Michael Giacchino" over a file that said "Michael Giacchino".
+    the track's own artist says who performs it, so an album artist it does
+    not name stays out of the tag."""
+    if len(artists) < 2 or not album_artist or not own_artist:
+        return artists
+    try:
+        from core.tag_writer import _artist_name_set
+        album_names = _artist_name_set(album_artist)
+        if not album_names or album_names & _artist_name_set(own_artist):
+            return artists
+        kept = [a for a in artists if not (_artist_name_set(a) & album_names)]
+        return kept or artists
+    except Exception:  # noqa: BLE001 - the full credit list is the fallback
+        return artists
+
+
+def _artist_joiner() -> str:
+    """the user's artist separator, as the download path writes it. the tag
+    was always joined with "; ", whatever the setting said."""
+    try:
+        from core.metadata.common import get_config_manager
+        joiner = get_config_manager().get("metadata_enhancement.tags.artist_separator", ", ")
+        return joiner if isinstance(joiner, str) and joiner.strip() else ", "
+    except Exception:  # noqa: BLE001
+        return ", "
+
+
+def _date_only(value: Any) -> Any:
+    """a release date without a time of day. itunes dates come as
+    2019-02-22T08:00:00Z and were written into the tag like that."""
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})[T ]", text)
+    return match.group(1) if match else value
+
+
 def _db_data_for_row(conn, row: Any) -> Dict[str, Any]:
     """Shape a lib2 track row into the ``db_data`` dict core/tag_writer reads."""
     artists = _credited_artists(conn, row["id"])
@@ -322,14 +450,16 @@ def _db_data_for_row(conn, row: Any) -> Dict[str, Any]:
 
     album_artist_name = effective_artist_name(
         conn, row["album_artist_id"], row["album_artist_name"])
-    track_artist = "; ".join(artists) if artists else (album_artist_name or "")
+    own_artist = row["own_artist"] if "own_artist" in row.keys() else None
+    artists = _performers(artists, album_artist_name, own_artist)
+    track_artist = _artist_joiner().join(artists) if artists else (album_artist_name or "")
     data: Dict[str, Any] = {
         "title": row["title"],
         "artist_name": album_artist_name or (artists[0] if artists else None),
         "track_artist": track_artist or None,
         "album_title": row["album_title"],
         "year": row["year"],
-        "release_date": row["release_date"],
+        "release_date": _date_only(row["release_date"]),
         "genres": _genres_list(row["genres"]),
         "track_number": row["track_number"],
         "disc_number": row["disc_number"],
@@ -352,11 +482,31 @@ def _db_data_for_row(conn, row: Any) -> Dict[str, Any]:
             if field in overrides and overrides[field].value != data.get(key):
                 manual[key] = data.get(key)
                 data[key] = overrides[field].value
-    manual.update(_apply_overrides(conn, row, data))
+    overridden = _apply_overrides(conn, row, data)
+    manual.update(overridden)
+    if "year" in overridden and data.get("release_date"):
+        # a hand-set year beats the provider's date: the diff and the writer
+        # read release_date first, so it wrote '1999-05-01' over the user's
+        # 2001. the date stays when its year agrees, as reorganize does
+        # (review 5 R5-F-3)
+        from core.library2.release_dates import album_release_date
+        adjusted = album_release_date(data["release_date"], data["year"]) or None
+        if adjusted != data["release_date"]:
+            # releasing the year hands the provider's date back with it
+            data["_release_date_before_year"] = data["release_date"]
+            data["release_date"] = adjusted
     if not data["genres"] and _genres_list(row["album_artist_genres"]):
         # The import's order (artist genres, then album, core/metadata/source.py):
         # an album with none fills an EMPTY tag from its artist (build_tag_diff).
         data.update(genres=_genres_list(row["album_artist_genres"])[:2], genres_from_artist=True)
+    if data.get("genres") and "genres" not in manual:
+        # #1057: the strict whitelist applies at the tag write too, so Write
+        # Tags cleans genres stored before it was on (media-server genres, the
+        # artist fallback). 3.6.1 filtered here; v2 wrote them unfiltered.
+        # strict off is a no-op; a genre the user set by hand is theirs
+        from core.genre_filter import filter_genres
+        from core.metadata.common import get_config_manager
+        data["genres"] = filter_genres(list(data["genres"]), get_config_manager())
     data["_manual_fields"] = manual
     # ``build_tag_diff`` renders its Cover Art row from ``thumb_url``. Without
     # it the preview claimed "Cover Art: None → None, unchanged" for every lib2
@@ -690,21 +840,85 @@ def _release_manual_fields(db_data: Dict[str, Any], track_id: Any,
         }
     for key in keys:
         db_data[key] = manual[key]
+    if "year" in keys and "_release_date_before_year" in db_data:
+        db_data["release_date"] = db_data.pop("_release_date_before_year")
+
+
+# the tags a library write may add beyond 3.6.1's core set, and the settings
+# that let the download path write each one
+_EXTRA_TAG_SETTINGS = {
+    "style": ("audiodb.tags.style",),
+    "mood": ("audiodb.tags.mood",),
+    "isrc": ("musicbrainz.tags.isrc", "deezer.tags.isrc", "tidal.tags.isrc",
+             "hifi.tags.isrc", "qobuz.tags.isrc"),
+    "copyright": ("tidal.tags.copyright", "qobuz.tags.copyright", "hifi.tags.copyright"),
+}
+
+
+def _gate_extra_tags(data: Dict[str, Any], policy: Dict[str, Any], legacy: bool) -> Dict[str, Any]:
+    """What a library write may put in a file beyond the core tags.
+
+    Write Tags (and the retag a new album cover starts) wrote the catalogue's
+    Genius plain-text lyrics over a file's synced lyrics, plus style, mood,
+    copyright and ISRC with their tag settings off. 3.6.1's Write Tags wrote
+    none of those. The plain write keeps to that; the Retag modal writes them
+    only where their setting allows, and lyrics only when it fetched them.
+    """
+    data = dict(data)
+    if legacy:
+        for key in ("style", "mood", "copyright", "isrc", "lyrics"):
+            data.pop(key, None)
+        return data
+    if policy.get('lyrics') != 'fetch':
+        data.pop('lyrics', None)
+    from core.metadata.common import get_config_manager
+    cfg = get_config_manager()
+    for key, settings in _EXTRA_TAG_SETTINGS.items():
+        if not any(cfg.get(setting, True) is not False for setting in settings):
+            data.pop(key, None)
+    return data
+
+
+def _change_record(file, diff, written, before, after, cover):
+    """What one write changed in one file, kept so it can be shown and undone.
+
+    ``before`` is the value read just ahead of the write; ``after`` is read
+    back from the file, so it is what the file holds and not what was asked.
+    """
+    rows = []
+    for item in diff:
+        key = item.get('file_key')
+        if key not in written or key == 'cover_art':
+            continue
+        new = after.get(key)
+        if new in (None, ''):  # ids and extras the snapshot does not carry
+            new = written[key]
+        if isinstance(new, (list, tuple)):
+            new = ', '.join(str(v) for v in new)
+        rows.append({'key': key, 'label': item.get('field') or key,
+                     'before': item.get('file_value') or '', 'after': str(new)})
+    return {'file_id': file['id'], 'path': file['path'], 'fields': rows,
+            'cover': ('replaced' if before.get('has_cover_art') else 'added') if cover else None}
 
 
 def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
                        protect_hand_tagged=False, overwrite_manual=None,
-                       progress=None, lyrics_value=None, legacy=False):
+                       progress=None, lyrics_value=None, legacy=False, record_changes=False):
     """Policy adapter around effective metadata, diff and the partial writer."""
     from core.library2.paths import resolve_lib2_path
     from core.library2.tag_cache import read_tag_snapshot
     from core.tag_writer import write_tag_fields, write_tags_to_file, build_tag_diff, _multi_artist_write_enabled
     from core.repair_jobs.base import hand_tagged_path_keys, is_hand_tagged_path
     stats = {'written': 0, 'skipped': 0, 'failed': 0, 'errors': []}
+    # only a caller that keeps them asks: an artist-wide write would carry
+    # every old lyric sheet back in its reply
+    changes = stats.setdefault('changes', []) if record_changes else None
     selected = set(file_ids) if file_ids is not None else None
     covers = {}
+    from core.library2 import locks
     with closing(database._get_connection()) as conn:
         rows = track_contexts(conn, track_ids, lyrics=policy['lyrics'] == 'fetch')
+        held = locks.lock_map(conn)
     for i, row in enumerate(rows):
         if progress:
             progress('retag', i, len(rows))
@@ -712,6 +926,12 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
         files = [f for f in files if f['id'] and (selected is None or f['id'] in selected)]
         if not files:
             stats['skipped'] += 1
+            continue
+        # #2046: a reviewed and locked album is not retagged by a job. counted
+        # apart so a run can say why it left these alone
+        if held and locks.blocks('album', row['album_id'], 'tags', 'Tag write', known=held):
+            stats['skipped'] += 1
+            stats['locked'] = stats.get('locked', 0) + 1
             continue
         try:
             # Reproject overrides for this track rather than trust an old finding.
@@ -723,6 +943,7 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
                         raise ValueError('Track no longer exists')
                     data = _db_data_for_row(conn, fresh[0])
             _release_manual_fields(data, row['id'], overwrite_manual)
+            data = _gate_extra_tags(data, policy, legacy)
             if policy['lyrics'] == 'fetch' and ('fields' not in policy or 'lyrics' in policy['fields']):
                 data['lyrics'] = lyrics_value if lyrics_value is not None else _lyrics_for_row({**row, 'db_data': data})
             for index, file in enumerate(files):
@@ -741,7 +962,11 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
                     legacy_diff = build_tag_diff(tags, data) if legacy else []
                     legacy_changed = bool(tags.get('error')) or any(item.get('changed') for item in legacy_diff)
                     cover = None
-                    if (policy['cover_art'] != 'skip' and
+                    # #2046: tags open, artwork locked: the tags are written,
+                    # the cover in the file stays the one that was reviewed
+                    art_open = not (held and locks.blocks(
+                        'album', row['album_id'], 'artwork', 'Cover embed', known=held))
+                    if (art_open and policy['cover_art'] != 'skip' and
                             ('fields' not in policy or 'cover_art' in policy['fields']) and
                             (policy['cover_art'] == 'replace' or not tags.get('has_cover_art')
                              or (legacy and (legacy_changed or index > 0)))):
@@ -761,7 +986,13 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
                         result = write_tags_to_file(path, data, embed_cover=bool(cover), cover_data=cover)
                         if result.get('success'):
                             stats['written'] += 1
-                            _persist_file_tags(database, file['id'], read_tag_snapshot(path))
+                            after = read_tag_snapshot(path)
+                            if changes is not None:
+                                changes.append(_change_record(
+                                    file, legacy_diff,
+                                    {i['file_key']: i.get('db_value') for i in legacy_diff if i.get('changed')},
+                                    tags, after, cover))
+                            _persist_file_tags(database, file['id'], after)
                         else:
                             stats['failed'] += 1
                             stats['errors'].append({'track_id': row['id'], 'file_id': file['id'], 'error': result.get('error') or 'Tag write failed'})
@@ -793,7 +1024,10 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
                         stats['errors'].append({'track_id': row['id'], 'file_id': file['id'], 'error': result.get('error')})
                         continue
                     stats['written'] += 1
-                    _persist_file_tags(database, file['id'], read_tag_snapshot(path))
+                    after = read_tag_snapshot(path)
+                    if changes is not None:
+                        changes.append(_change_record(file, diff, fields, tags, after, cover))
+                    _persist_file_tags(database, file['id'], after)
                 except Exception as exc:
                     stats['failed'] += 1
                     stats['errors'].append({'track_id': row['id'], 'file_id': file['id'], 'error': str(exc)})
@@ -810,7 +1044,7 @@ def _write_policy_tags(database, track_ids, policy, *, file_ids=None,
 def write_tags(database, track_ids: List[int], *, embed_cover: bool = True,
                force_cover: bool = False, overwrite_manual: Any = None,
                progress=None, file_ids=None, protect_hand_tagged: bool = True,
-               options=None, lyrics_value=None) -> Dict[str, Any]:
+               options=None, lyrics_value=None, record_changes: bool = False) -> Dict[str, Any]:
     """Write lib2 DB metadata into the files' tags.
 
     ``overwrite_manual`` releases fields a person set by hand back to the
@@ -839,7 +1073,8 @@ def write_tags(database, track_ids: List[int], *, embed_cover: bool = True,
     return _write_policy_tags(database, track_ids, policy, file_ids=file_ids,
                               protect_hand_tagged=protect_hand_tagged,
                               overwrite_manual=overwrite_manual, progress=progress,
-                              lyrics_value=lyrics_value, legacy=options is None)
+                              lyrics_value=lyrics_value, legacy=options is None,
+                              record_changes=record_changes)
 
 
 __all__ = [

@@ -27,6 +27,10 @@ def auto_run_repair_job(config: Dict[str, Any], deps: AutomationDeps) -> Dict[st
     automation_id = (config or {}).get('_automation_id')
     want = str((config or {}).get('job_id') or 'all').strip()
     want = JOB_ID_MIGRATIONS.get(want, want)  # automations saved before a rename
+    # 3.6.1's flag-only Quality Check lives on as Quality Profile Audit (the
+    # same review of library tracks against their profile). a saved
+    # automation that ran it runs the audit instead of being skipped.
+    want = {'quality_upgrade_scanner': 'quality_profile_audit'}.get(want, want)
     jobs = get_all_jobs()
 
     if want == 'all':
@@ -34,7 +38,7 @@ def auto_run_repair_job(config: Dict[str, Any], deps: AutomationDeps) -> Dict[st
     elif want in jobs:
         targets = [want]
     elif want in RETIRED_JOB_IDS:
-        reason = f"'{want}' was retired; Library v2 now does its work continuously"
+        reason = f"'{want}' was retired; the Library now does its work continuously"
         deps.update_progress(automation_id, status='finished', progress=100, phase='Skipped',
                              log_line=f'Nothing queued: {reason}', log_type='info')
         return {'status': 'skipped', 'queued': 0, 'jobs': '', 'reason': reason,

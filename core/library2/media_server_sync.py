@@ -78,6 +78,15 @@ def _genres_json(obj: Any) -> Optional[str]:
     return json.dumps(genres) if genres else None
 
 
+def _held(cursor, entity_type: str, entity_id: int) -> bool:
+    """#2046: a reviewed and locked row keeps its name, year, art and genres
+    when an import lands on it. It is still mapped to the server, like any
+    row a scan stamps."""
+    from core.library2 import locks
+    return locks.blocks(entity_type, entity_id, "metadata", "Import",
+                        conn=getattr(cursor, "connection", None))
+
+
 def upsert_artist(cursor, *, server_source: str, server_id: str, name: str,
                   image_url: Optional[str] = None,
                   genres_json: Optional[str] = None,
@@ -122,7 +131,7 @@ def upsert_artist(cursor, *, server_source: str, server_id: str, name: str,
             upsert_mapping(cursor, "artist", artist_id, server_source, server_id)
         return artist_id
     artist_id = int(row[0])
-    if not allow_create:
+    if not allow_create or _held(cursor, "artist", artist_id):
         upsert_mapping(cursor, "artist", artist_id, server_source, server_id)
         return artist_id
     image_set = (
@@ -260,7 +269,7 @@ def upsert_album(cursor, *, server_source: str, server_id: str, artist_id: int,
         ).lastrowid)
     else:
         album_id = int(row[0])
-        if not allow_create:
+        if not allow_create or _held(cursor, "album", album_id):
             cursor.execute(
                 "UPDATE lib2_albums SET track_count=COALESCE(?,track_count),"
                 "duration=COALESCE(?,duration),"
@@ -448,10 +457,15 @@ def adopt_scanned_file(cursor, path: Optional[str], server_path: Optional[str],
     download or an upgrade. ``server_path`` covers rows stored in the server's
     form of the path (#1573).
     """
-    if not path or cursor.execute(
-            "SELECT 1 FROM lib2_track_files WHERE path IN (?, ?)"
-            " AND COALESCE(file_state,'active')<>'deleted' LIMIT 1",
-            (path, server_path or path)).fetchone():
+    if not path:
+        return False
+    # every spelling of both paths: a file stored as H:/Music/a.flac was not
+    # found as H:\Music\a.flac and was adopted a second time
+    from core.library2.track_files import path_spellings
+    known = tuple(dict.fromkeys(path_spellings(path) + path_spellings(server_path or path)))
+    if cursor.execute(
+            f"SELECT 1 FROM lib2_track_files WHERE path IN ({','.join('?' * len(known))})"
+            " AND COALESCE(file_state,'active')<>'deleted' LIMIT 1", known).fetchone():
         return False
     from core.library2.library_roots import load_roots
     from core.library2.autolink import link_download_into_library_v2
@@ -465,6 +479,12 @@ def adopt_scanned_file(cursor, path: Optional[str], server_path: Optional[str],
         track_info = {"name": tags.get("title"), "artist": artist, "album": tags.get("album"),
                       "track_number": tags.get("track_number"),
                       "disc_number": tags.get("disc_number")} if artist and tags.get("title") else {}
+        if track_info:
+            # the release the tags name, so same-named albums stay apart
+            # (#1299 by release id, #2110 by year and folder)
+            from core.library.release_identity import read_release_identity
+            track_info["year"] = tags.get("year")
+            track_info["release_mbid"] = read_release_identity(path)[0] or None
     elif (server_info and server_info.get("name") and server_info.get("artist")
           and not _library_folders_visible(roots, path)):
         # the media server is on another machine: SoulSync can't open its

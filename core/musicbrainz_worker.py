@@ -250,6 +250,36 @@ class MusicBrainzWorker:
             return {'type': 'wishlist', 'id': row[0], 'name': query['album'], **query}
         return None
 
+    def _group_types_item(self, conn) -> Optional[Dict[str, Any]]:
+        """An album that has its release group but not what kind of release
+        that is (#2055). Walked once by id: one MusicBrainz has no answer for
+        is passed over until the next start, not asked again every loop."""
+        row = conn.execute(
+            "SELECT al.id, al.title, al.musicbrainz_release_group_id FROM lib2_albums al"
+            " WHERE al.id > ? AND COALESCE(al.musicbrainz_release_group_id, '') <> ''"
+            " AND al.release_group_types IS NULL ORDER BY al.id LIMIT 1",
+            (getattr(self, '_group_types_after', 0),)).fetchone()
+        if not row:
+            return None
+        self._group_types_after = int(row[0])
+        return {'type': 'album_types', 'id': row[0], 'name': row[1], 'group_id': row[2]}
+
+    def _album_track_titles(self, album_id) -> list:
+        """The album's own track titles, for checking a same-titled release
+        against when none was found under its artist (#2071)."""
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            return [row[0] for row in conn.execute(
+                "SELECT title FROM lib2_tracks WHERE album_id = ? AND COALESCE(title, '') <> ''",
+                (album_id,))]
+        except Exception as exc:
+            logger.debug("Track titles for album %s unavailable: %s", album_id, exc)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
     def _get_next_item(self) -> Optional[Dict[str, Any]]:
         """Get next item to process from priority queue"""
         conn = None
@@ -284,8 +314,11 @@ class MusicBrainzWorker:
                     "FROM lib2_tracks t WHERE t.id = ?", (item['id'],)).fetchone()
                 if row:
                     item['duration'], item['track_artist'], item['isrc'] = row[0], row[1], row[2]
-            return item or self._release_group_item(
-                conn, retry_before=datetime.now() - timedelta(days=self.retry_days))
+            return (item
+                    or self._release_group_item(
+                        conn, retry_before=datetime.now() - timedelta(days=self.retry_days))
+                    # last of all: nothing waits on it but how a page is drawn
+                    or self._group_types_item(conn))
 
         except Exception as e:
             logger.error(f"Error getting next item: {e}")
@@ -441,7 +474,8 @@ class MusicBrainzWorker:
 
             elif item_type == 'album':
                 artist_name = item.get('artist')
-                result = self.mb_service.match_release(item_name, artist_name)
+                result = self.mb_service.match_release(
+                    item_name, artist_name, track_titles=self._album_track_titles(item_id))
                 if result and result.get('mbid'):
                     self.mb_service.update_album_mbid(
                         item_id, result['mbid'], 'matched',
@@ -453,9 +487,21 @@ class MusicBrainzWorker:
                     self.stats['not_found'] += 1
                     logger.debug(f"No match for album '{item_name}'")
 
+            elif item_type == 'album_types':
+                # #2055: what kind of release the group is, for albums whose
+                # group was found before that was kept
+                types = self.mb_service.lookup_release_group_types(item['group_id'])
+                if types is not None:
+                    self.mb_service.update_album_release_group_types(item_id, item['group_id'], types)
+                    self.stats['matched'] += 1
+                else:
+                    self.stats['not_found'] += 1
+
             elif item_type == 'album_group':
-                group = self.mb_service.lookup_release_group(item['release_id'])
+                group, types = self.mb_service.lookup_release_group_and_types(item['release_id'])
                 self.mb_service.update_album_release_group(item_id, group)
+                if group and types is not None:
+                    self.mb_service.update_album_release_group_types(item_id, group, types)
                 if group:
                     self.stats['matched'] += 1
                     logger.debug(f"Album '{item_name}' → release group {group}")
@@ -525,6 +571,8 @@ class MusicBrainzWorker:
                     self.mb_service.update_artist_mbid(item['id'], None, 'error')
                 elif item['type'] == 'album':
                     self.mb_service.update_album_mbid(item['id'], None, 'error')
+                elif item['type'] == 'album_types':
+                    pass  # passed over until the next start (_group_types_item)
                 elif item['type'] == 'album_group':
                     self.mb_service.update_album_release_group(item['id'], None)
                 elif item['type'] == 'wishlist':
@@ -550,8 +598,14 @@ class MusicBrainzWorker:
                 + owned_sql('album', 'al', scope=ANY_OWNER) + ")"
                 " + (SELECT COUNT(*) FROM wishlist_tracks WHERE musicbrainz_match_status IS NULL)"
             ).fetchone()[0]
+            # and the albums still to be asked what kind of release they are
+            kinds = conn.execute(
+                "SELECT COUNT(*) FROM lib2_albums al WHERE al.id > ?"
+                " AND COALESCE(al.musicbrainz_release_group_id, '') <> ''"
+                " AND al.release_group_types IS NULL",
+                (getattr(self, '_group_types_after', 0),)).fetchone()[0]
             return pending_count(conn, 'musicbrainz',
-                                 retry_after_days=self.retry_days) + int(groups or 0)
+                                 retry_after_days=self.retry_days) + int(groups or 0) + int(kinds or 0)
         except Exception as e:
             logger.error(f"Error counting pending items: {e}")
             return 0

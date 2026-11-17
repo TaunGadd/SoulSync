@@ -924,7 +924,9 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
         if task is None:
             continue
         tasks_snapshot[tid] = dict(task)
-        if task.get('status') == 'completed':
+        # already_owned: another batch fetched this exact recording (the
+        # cross-batch dedup); it is in the playlist all the same
+        if task.get('status') in ('completed', 'already_owned'):
             ti = task.get('track_info', {})
             artists = ti.get('artists', [])
             artist_str = artists[0] if isinstance(artists, list) and artists else ''
@@ -1141,7 +1143,13 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                     # a failed download keeps the task's own reason (tidal said no,
                     # the transfer stalled, ...). a bare 'Download failed' left the
                     # wishlist saying "keeps failing" with nothing to go on.
-                    'failure_reason': 'Download cancelled' if task_status == 'cancelled' else ('No matching track found' if task_status == 'not_found' else (task.get('error_message') or 'Download failed')),
+                    # a not found used to store a bare 'No matching track found',
+                    # so the wishlist couldn't say which searches ran or what they
+                    # turned up (#1981). the task's own words follow it now. the
+                    # prefix stays, the wishlist files rows by it
+                    'failure_reason': 'Download cancelled' if task_status == 'cancelled' else (
+                        ('No matching track found' + (f". {task['error_message']}" if task.get('error_message') else ''))
+                        if task_status == 'not_found' else (task.get('error_message') or 'Download failed')),
                     'candidates': task.get('cached_candidates', []),  # Include search results if available
                 }
 
@@ -1219,7 +1227,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
             download_batches[batch_id]['active_count'] -= 1
             new_active = download_batches[batch_id]['active_count']
 
-            logger.error(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
+            (logger.info if success else logger.warning)(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
 
         # ENHANCED: Always check batch completion after any task completes (including duplicate calls)
         # This ensures completion is detected even when mixing normal downloads with cancelled tasks
@@ -1277,7 +1285,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
         has_retrying_tasks = retrying_count > 0
 
         if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
-            logger.error(f"[Batch Manager] Batch {batch_id} truly complete - all {finished_count}/{len(queue)} tasks finished - processing failed tracks to wishlist")
+            logger.info(f"[Batch Manager] Batch {batch_id} truly complete - all {finished_count}/{len(queue)} tasks finished - processing failed tracks to wishlist")
         elif all_tasks_started and no_active_workers and has_retrying_tasks:
             logger.warning(f"[Batch Manager] Batch {batch_id}: all workers free but {retrying_count} tasks retrying - continuing monitoring")
         elif all_tasks_started and no_active_workers:

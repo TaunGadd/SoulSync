@@ -53,9 +53,15 @@ def _track_ids_from_mirror_row(track: Dict[str, Any]) -> set[str]:
         if track_id:
             identities.append((track_id, str(album_id or '').strip()))
 
+    # review 5 R5-C-1: a mirrored_playlist_tracks row's ``id`` is the row's
+    # own key, never a provider id; sync wishlists it under source_track_id.
+    # only an inline tracks_json dict (no source_track_id column) carries the
+    # provider id in ``id``
+    own_id = (track.get('source_track_id') if 'source_track_id' in track
+              else track.get('id'))
     _remember(
         track if isinstance(track.get('id'), dict) else None,
-        fallback_id=track.get('id') or track.get('source_track_id'),
+        fallback_id=own_id,
         fallback_album=track.get('source_album_id') or track.get('album_id'),
     )
     extra = track.get('extra_data') or {}
@@ -338,6 +344,30 @@ def apply_sync_errors(
     messages = list(sync_summary.get('error_messages') or []) or [f'{errors} playlist(s)']
     result['error'] = 'Sync failed: ' + '; '.join(messages)
     log_line += f' — {errors} playlist sync{"s" if errors != 1 else ""} failed'
+    return log_line, 'warning'
+
+
+def apply_refresh_errors(
+    errors: int,
+    messages: List[str],
+    result: Dict[str, Any],
+    log_line: str,
+    log_type: str,
+) -> tuple:
+    """Same as ``apply_sync_errors`` for the REFRESH phase. A playlist whose
+    source returned nothing was counted, then dropped, so the run read as a
+    clean "completed, 0 refreshed" (#2147).
+
+    Sets ``result['refresh_errors']`` always, and adds to ``result['error']``
+    when something failed. Returns the possibly downgraded
+    ``(log_line, log_type)``."""
+    errors = int(errors or 0)
+    result['refresh_errors'] = str(errors)
+    if errors <= 0:
+        return log_line, log_type
+    message = 'Refresh failed: ' + '; '.join(list(messages or []) or [f'{errors} playlist(s)'])
+    result['error'] = f"{message}. {result['error']}" if result.get('error') else message
+    log_line += f', {errors} playlist refresh{"es" if errors != 1 else ""} failed'
     return log_line, 'warning'
 
 

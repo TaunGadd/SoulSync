@@ -345,14 +345,177 @@ def get_genres(database, time_range: str, profile_id: Optional[int] = None) -> A
     return database.get_genre_breakdown(time_range, profile_id=profile_id)
 
 
+# The three whole-library reports read every live file, every owned track or
+# (db storage) every page of the database file: 3 s, 9 s and 11 s on a 300k
+# library (review 5 perf). A request must not wait on that, so each answers
+# from its last result and a background thread works out a new one when that
+# result is older than its max age, or the library's files changed since
+# (lib2_song_search_state.files_version, which the file triggers bump). An
+# answer that is being refreshed says ``refreshing: true`` so the page asks
+# again; a fresh one is exactly the old payload. Nothing here writes.
+REPORT_MAX_AGE = {
+    "library_health": 300.0,
+    "library_disk_usage": 300.0,
+    # table sizes move slowly, and this one reads the whole database file
+    "db_storage": 1800.0,
+}
+# a first request waits this long for the first result (a small library has it
+# at once), then answers refreshing and lets the page ask again
+REPORT_FIRST_WAIT = 0.5
+# a files_version change starts a new pass at most this often. an import bumps
+# the counter on every file, so without a gap every 3 s poll found the result
+# stale and ran the whole-library pass again, back to back, for as long as the
+# import ran (review 5 W3-TU-2). inside the gap the last result is the answer.
+REPORT_VERSION_GAP = 60.0
+# after a failed pass, wait this long before trying again. a pass that raised
+# every time started a new thread on every poll and the page said "measuring"
+# forever (review 5 W3-TU-2)
+REPORT_RETRY_AFTER = 60.0
+_report_lock = threading.Lock()
+_reports: dict = {}       # key -> (computed_at, files_version, value)
+_report_jobs: dict = {}   # key -> threading.Event, set when the job ends
+_report_failed: dict = {}  # key -> monotonic time of the last failed pass
+
+
+def _files_version(database) -> Optional[int]:
+    try:
+        from core.library2.song_search import song_count_version
+        conn = database._get_connection()
+        try:
+            return song_count_version(conn)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - no counter: the max age alone decides
+        return None
+
+
+def _report(name: str, database, compute: Callable[[], Any], *, scoped: bool,
+            versioned: bool, seed: Optional[Callable[[], Any]] = None) -> tuple[Any, bool, bool]:
+    """(value, refreshing, failed). value is None only while the first result for this
+    database is still being worked out and ``seed`` has nothing either.
+
+    ``refreshing`` is true only while a pass is running, so a page polling on
+    it stops once the pass ends, whether it stored a result or failed.
+    ``failed`` says the last pass raised and no newer one is running."""
+    path = getattr(database, "database_path", None)
+    max_age = REPORT_MAX_AGE.get(name, 0.0)
+    if path is None or max_age <= 0:
+        return compute(), False, False
+    scope = "any"
+    if scoped:
+        from core.library2.sql_util import ANY_OWNER, ambient_scope
+        resolved = ambient_scope()
+        scope = "any" if resolved is ANY_OWNER else repr(resolved)
+    key = (name, str(path), scope)
+    version = _files_version(database) if versioned else None
+    now = time.monotonic()
+    start = False
+    with _report_lock:
+        hit = _reports.get(key)
+        job = _report_jobs.get(key)
+        if hit is not None and job is None:
+            age = now - hit[0]
+            # a moved counter only counts once the last pass is a gap old
+            if age < max_age and (hit[1] == version or age < REPORT_VERSION_GAP):
+                return hit[2], False, False
+        failed_at = _report_failed.get(key)
+        if job is None and failed_at is not None and now - failed_at < REPORT_RETRY_AFTER:
+            # the last pass failed just now: answer what there is and let the
+            # page stop asking, instead of failing again on every poll
+            if hit is not None:
+                return hit[2], False, True
+            return _report_seed(seed, scope), False, True
+        if job is None:
+            job = threading.Event()
+            _report_jobs[key] = job
+            start = True
+    if start:
+        from core.library_scope import carrying_scope
+
+        def _refresh():
+            try:
+                # the counter BEFORE the read: a write landing mid-read leaves
+                # an older number behind, and the next request refreshes again
+                at = _files_version(database) if versioned else None
+                value = compute()
+                with _report_lock:
+                    _reports[key] = (time.monotonic(), at, value)
+                    _report_failed.pop(key, None)
+            except Exception as exc:  # noqa: BLE001 - the old result stays
+                logger.warning("stats report %s failed: %s", name, exc)
+                with _report_lock:
+                    _report_failed[key] = time.monotonic()
+            finally:
+                with _report_lock:
+                    _report_jobs.pop(key, None)
+                job.set()
+
+        threading.Thread(target=carrying_scope(_refresh), name=f"stats-report-{name}",
+                         daemon=True).start()
+    if hit is not None:
+        return hit[2], True, False
+    job.wait(REPORT_FIRST_WAIT)
+    with _report_lock:
+        hit = _reports.get(key)
+    if job.is_set():
+        if hit is not None:
+            return hit[2], False, False
+        # the first pass already failed: nothing is on the way
+        return _report_seed(seed, scope), False, True
+    return _report_seed(seed, scope), True, False
+
+
+def _report_seed(seed: Optional[Callable[[], Any]], scope: str) -> Any:
+    if seed is None or scope != "any":
+        return None
+    try:
+        return seed()
+    except Exception:  # noqa: BLE001 - no seed, the page asks again
+        return None
+
+
+def _as_payload(value: Any, refreshing: bool, pending: dict, failed: bool = False) -> dict:
+    payload = dict(value) if isinstance(value, dict) else dict(pending)
+    if refreshing:
+        payload["refreshing"] = True
+    if failed:
+        # the page says it could not measure, not "no tracks" (review 5 W3-TU-2)
+        payload["report_failed"] = True
+    return payload
+
+
+def _worker_health(database) -> Optional[dict]:
+    """the health the listening-stats worker last stored, to show while the
+    first live result is worked out."""
+    conn = database._get_connection()
+    try:
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'stats_cache_health'").fetchone()
+    finally:
+        conn.close()
+    value = json.loads(row[0]) if row and row[0] else None
+    return value if isinstance(value, dict) and value else None
+
+
 def get_library_health(database) -> dict:
     """Library health metrics."""
-    return database.get_library_health()
+    value, refreshing, failed = _report("library_health", database, database.get_library_health,
+                                scoped=True, versioned=True,
+                                seed=lambda: _worker_health(database))
+    return _as_payload(value, refreshing, {}, failed)
 
 
 def get_db_storage(database) -> dict:
     """Database storage breakdown by table."""
-    return database.get_db_storage_stats()
+    value, refreshing, failed = _report("db_storage", database, database.get_db_storage_stats,
+                                scoped=False, versioned=False)
+    pending = {"tables": [], "total_file_size": 0, "method": "dbstat"}
+    if value is None:
+        try:
+            import os
+            pending["total_file_size"] = os.path.getsize(str(database.database_path))
+        except Exception:  # noqa: BLE001, S110 - the size comes with the first result
+            pass
+    return _as_payload(value, refreshing, pending, failed)
 
 
 def get_library_disk_usage(database) -> dict:
@@ -363,7 +526,11 @@ def get_library_disk_usage(database) -> dict:
     MediaSources[].Size, Navidrome <song size="...">,
     SoulSync standalone os.path.getsize).
     """
-    return database.get_library_disk_usage()
+    value, refreshing, failed = _report("library_disk_usage", database, database.get_library_disk_usage,
+                                scoped=True, versioned=True)
+    pending = {"total_bytes": 0, "tracks_with_size": 0, "tracks_without_size": 0,
+               "by_format": {}, "has_data": False}
+    return _as_payload(value, refreshing, pending, failed)
 
 
 def get_recent_tracks(database, limit: int, image_url_fixer: Optional[ImageUrlFixer] = None,
@@ -672,6 +839,35 @@ def _listening_streak(cursor, scope: str, today: date) -> int:
         window *= 4
 
 
+def _library_artist_picture(cursor, name) -> Optional[str]:
+    """SoulSync's own artwork route for the library artist of that name, or
+    None. The route serves the cached picture, so nothing here is fetched."""
+    if not name:
+        return None
+    try:
+        cursor.execute(
+            "SELECT id FROM lib2_artists WHERE name = ? COLLATE NOCASE "
+            "AND COALESCE(image_url, '') <> '' LIMIT 1", (str(name),))
+        row = cursor.fetchone()
+    except Exception:  # noqa: BLE001 - no catalogue yet
+        return None
+    return f"/api/library/v2/artwork/artist/{int(row[0])}" if row else None
+
+
+def _library_album_cover(cursor, title) -> Optional[str]:
+    """SoulSync's own artwork route for a library album of that title, or None."""
+    if not title:
+        return None
+    try:
+        cursor.execute(
+            "SELECT id FROM lib2_albums WHERE title = ? COLLATE NOCASE "
+            "AND COALESCE(image_url, '') <> '' ORDER BY id LIMIT 1", (str(title),))
+        row = cursor.fetchone()
+    except Exception:  # noqa: BLE001 - no catalogue yet
+        return None
+    return f"/api/library/v2/artwork/album/{int(row[0])}" if row else None
+
+
 def get_weekly_digest(database, profile_id: Optional[int] = None) -> dict:
     """This-week listening digest for the dashboard banner.
 
@@ -736,15 +932,55 @@ def get_weekly_digest(database, profile_id: Optional[int] = None) -> dict:
         discoveries = cursor.fetchone()[0] or 0
 
         cursor.execute(
-            f"""SELECT date(lh.played_at, 'localtime') AS d, COALESCE(SUM({play_duration_sql('lh')}), 0)
+            f"""SELECT date(lh.played_at, 'localtime') AS d, COALESCE(SUM({play_duration_sql('lh')}), 0),
+                       COUNT(*)
                 FROM listening_history lh
                 WHERE {window} AND {scope}
                 GROUP BY d"""
         )
-        day_ms = {row[0]: row[1] for row in cursor.fetchall()}
+        day_rows = cursor.fetchall()
+        day_ms = {row[0]: row[1] for row in day_rows}
+        day_plays = {row[0]: row[2] for row in day_rows}
+
+        # the week before this one, for "more than last week". the same
+        # played_at index, the next seven days back
+        cursor.execute(
+            f"""SELECT COALESCE(SUM({play_duration_sql('lh')}), 0)
+                FROM listening_history lh
+                WHERE lh.played_at >= datetime('now', '-14 days')
+                  AND lh.played_at < datetime('now', '-7 days') AND {scope}"""
+        )
+        previous_ms = cursor.fetchone()[0] or 0
+
+        # the album each day was mostly made of, and the week's three
+        album_present = "+lh.album IS NOT NULL AND TRIM(lh.album) <> ''"
+        cursor.execute(
+            f"""SELECT date(lh.played_at, 'localtime') AS d, lh.album, COUNT(*) AS c
+                FROM listening_history lh
+                WHERE {window} AND {scope} AND {album_present}
+                GROUP BY d, LOWER(lh.album) ORDER BY d ASC, c DESC, lh.album ASC"""
+        )
+        day_album: dict = {}
+        for day_key, album_name, _count in cursor.fetchall():
+            day_album.setdefault(day_key, album_name)
+        cursor.execute(
+            f"""SELECT lh.album, lh.artist, COUNT(*) AS c
+                FROM listening_history lh
+                WHERE {window} AND {scope} AND {album_present}
+                GROUP BY LOWER(lh.album), LOWER(COALESCE(lh.artist, ''))
+                ORDER BY c DESC, lh.album ASC LIMIT 3"""
+        )
+        repeat_rows = cursor.fetchall()
+        covers: dict = {}
+        for title in {*day_album.values(), *(row[0] for row in repeat_rows)}:
+            covers[title] = _library_album_cover(cursor, title)
+        on_repeat = [{'name': row[0], 'artist': row[1], 'play_count': row[2],
+                      'image_url': covers.get(row[0])} for row in repeat_rows]
 
         today = date.today()
         streak = _listening_streak(cursor, scope, today)
+        # while the connection is open: asked after the close it found nothing
+        top_artist_image = _library_artist_picture(cursor, top_row[0] if top_row else None)
     finally:
         conn.close()
 
@@ -756,15 +992,23 @@ def get_weekly_digest(database, profile_id: Optional[int] = None) -> dict:
             'date': key,
             'day': 'mtwtfss'[day.weekday()],
             'hours': round((day_ms.get(key) or 0) / 3_600_000, 1),
+            'tracks': day_plays.get(key) or 0,
+            # the album played most that day, and its cover when the library has one
+            'album': day_album.get(key),
+            'cover': covers.get(day_album.get(key)) if day_album.get(key) else None,
         })
 
     return {
         'tracks_played': total_row[0] or 0,
         'time_ms': total_row[1] or 0,
         'top_artist': top_row[0] if top_row else None,
+        # the library's own picture of that artist, when it holds one
+        'top_artist_image': top_artist_image,
         'discoveries': discoveries,
         'streak_days': streak,
         'start_date': (today - timedelta(days=6)).isoformat(),
         'end_date': today.isoformat(),
         'daily': daily,
+        'previous_time_ms': previous_ms,
+        'on_repeat': on_repeat,
     }

@@ -83,6 +83,8 @@ declare global {
      * hands the shell over for the edit instead — see -automations.builder.ts.
      */
     showAutomationBuilder?: (automationId?: number) => void;
+    /** the same builder on the video side's blocks, saving `owned_by: 'video'` */
+    showVideoAutomationBuilder?: (automationId?: number) => void;
     /**
      * Closes the shared builder. Wrapped by the React automations page so it
      * can reclaim the shell — every exit path (Back, Cancel, Save) calls it.
@@ -556,6 +558,11 @@ declare global {
     getWeatherPreview?: () => { preset: string; date: string | null } | null;
     setWeatherPreview?: (preview: { preset: string; date: string | null } | null) => void;
     weatherPreviewPresets?: () => Array<{ key: string; label: string }>;
+    /** ...and wiring its controls once the React System tab renders them */
+    initWeatherPreviewSettings?: () => void;
+    /** src/shell/oidc-signin.ts / oidc-only.ts: the OIDC boxes in Security & Access */
+    initOidcAdminStatus?: () => void;
+    refreshOidcOnlySettingsStatus?: () => Promise<void>;
     /** shared-helpers.js html escaper (also re-declared by downloads.js) */
     escapeHtml?: (text: unknown) => string;
     /** init.js - the active profile, or null before profiles load */
@@ -645,7 +652,7 @@ declare global {
     /** video-poster-modal.js: the poster manager (search, then pick art). */
     VideoPoster?: { openSearch?: () => void };
     /** video-overlay-editor.js / video-collection-editor.js: the two studios. */
-    VideoOverlayEditor?: { open?: () => void };
+    VideoOverlayEditor?: { open?: () => void; openSettings?: () => void };
     VideoCollectionEditor?: { open?: () => void };
     /** video-worker-orbs.js: re-anchor to the video dashboard's orb stage. */
     videoWorkerOrbs?: { refresh: () => void; onStatus: (id: string, data: unknown) => void };
@@ -653,6 +660,8 @@ declare global {
     videoEnrichmentPrime?: () => void;
     /** video-side.js: the calendar on a day, optionally with an episode open. */
     videoOpenCalendar?: (opts?: { date?: string; ep?: number | string }) => void;
+    /** #2128: the video Library's recycle bin button (video-side.js) */
+    videoOpenRecycleBin?: () => void;
     /** video-side.js: flip the shell chrome music <-> video (does NOT navigate). */
     _switchAppSide?: (side: 'music' | 'video', opts?: { force?: boolean }) => void;
     /** unified downloads page: true while any video download is active.

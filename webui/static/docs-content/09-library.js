@@ -25,18 +25,42 @@ The Library page shows every artist in your collection as cards with images, alb
 - **Alphabet navigation** (A–Z, #) — jump through large collections
 - **Watchlist filter** — All, Watched, or Unwatched artists
 - **Metadata source filter** — find artists unmatched to a specific service (e.g. "No Discogs") or matched to one (e.g. "Has Spotify")
+- **Reviewed filter** — All, Not reviewed, or Reviewed. An artist is reviewed when every album of theirs with files is locked
+- **Collection**: each artist card and table row shows owned / expected tracks with a bar, green when complete, amber when tracks are missing. For a Watchlist artist, expected follows their collection settings, so a release they leave out never counts as missing. For anyone else it's the albums you have: every track of each release you hold something of, plus anything you asked for, so one track of a 14 track album reads 1 / 14. An artist whose release sizes were never looked up says **Not checked** instead of complete. Click **N missing** to see those tracks: in Wanted for a Watchlist artist, on the artist's page for anyone else
+- **Leftover rows**: when a retag or re-identify moves a file onto another row of its album, the old row is left with no file at the same position. A library scan and an artist's **Refresh & Scan** fold it into the row that has the file (its plays come along), so the album counts right again. A locked album keeps them until you act, and you can remove one yourself from its **⋯** menu with **Remove This Row**. A row alone at its position is a missing track and stays
+- **Collection filters** live in the Filters menu: complete or incomplete, missing count and completion ranges, and artists only credited on other people's tracks. Sort by completion, missing tracks, could be better or incomplete albums, and turn any sort around with the arrow
+- **Overview** opens a summary above the list: artists, tracks owned, complete and incomplete collections, tracks missing, could be better, and Watchlist artists
+- **Card size** slider in the toolbar, separate for artist and album cards (and posters on the video library), with a reset. The list also remembers its view, sort, filters and scroll when you come back from an artist
+- **Select artists** with the checkbox on a card or row (shift-click for a range, or select the page or everything that matches). The bar can add or remove them from the Watchlist, run Automatic Search, refresh discographies, lock or unlock, and change the quality profile. It runs in the background, shows done, skipped and failed, and asks first before undoing anything
 
-Click any artist card to open their detail page: albums, EPs, and singles as cards with completion percentages. Filter by category, content type (live, compilations, featured), or status (owned, missing). **View on** buttons at the top link the artist on each matched external service.
+#### Reviewed and locked
+
+The **padlock** on an album or an artist is for when you have gone through it and it is right. Locking it does two things: it counts as reviewed, and nothing automated changes it after that.
+
+- **What is left alone** is a set of switches, all on by default: tags in the files, artwork, library details, file names and folders, the release match, and quality upgrades. Switch one off to keep that part handled for you
+- **What a lock does not stop**: missing tracks still download, and a missing or damaged file is still reported on the Tools page (marked **Locked**). **Fix all** passes a locked finding over; the button on the finding itself still works
+- **Your own hands are never blocked** — editing, retagging or reorganizing a locked album from its page works as before
+- **Kept away** lists the jobs the lock turned back, so you can see it working
+- **Changed since your review** shows when a file of a locked album was replaced, renamed, added or removed outside SoulSync. **Mark reviewed again** clears it
+- **Lock and next** (on the album page) locks the album and opens the artist's next album that is not reviewed. On the artist page the padlock on an album row locks it and you stay on the page, so you can go down the list. The artist's toolbar shows the count, e.g. "14 of 20 reviewed"
+- **An artist's lock** covers the artist (photo, details, folder, match). Albums are locked one by one, so a new release still gets tagged; locking an artist offers **And all current albums**
+- Locking needs the admin profile. Everyone sees the padlock on what is locked
+
+Click any artist card to open their detail page: albums, EPs, and singles as cards with completion percentages. Live records, compilations, soundtracks, remixes, demos and spoken word each get a section of their own under Albums, EPs and Singles, so the studio albums are not buried: the **Show** pills are those sections, each with its count, and a kind the artist has nothing of is not listed. A release is placed by its MusicBrainz release type when that is known (SoulSync looks it up in the background for every album it has matched), and by its title until then. Filter by section, featured releases, or status (owned, missing). **View on** buttons at the top link the artist on each matched external service.
 `
         },
         {
             id: 'lib-enhanced',
             title: 'Library Management',
-            lede: 'Manage catalogue metadata and physical file versions in Library v2.',
+            lede: 'Manage catalogue metadata and physical file versions in the Library.',
             body: `
-The Library route opens **Library v2** directly. Management actions are part of that page; there is no separate Enhanced toggle.
+Management actions are part of the Library page; there is no separate Enhanced toggle.
 
 Catalogue tracks and their physical files are managed separately. **File versions** shows the copies held for a track, and **Recording duplicates** reviews linked single/album recordings. Removal actions preview the selected catalogue entries and file paths before applying changes. Available actions depend on your profile permissions and selected library.
+
+**Preview Rename / Organize** shows where each file would go under your naming template before anything moves. You don't have to open it to find out: on the artist page an album row shows **N to rename** when some of its files are not where the template puts them, the artist's toolbar shows the total, and the album's track table marks those files in the **File path** column. Click the count to open the preview. The check runs after the page loads and only while file organization is on and the template is valid.
+
+On an album's track list, a small **flame** next to a title marks the album's most played tracks on Last.fm: up to three that clearly stand out from the rest. It needs the Last.fm worker to have enriched the album's tracks, and an album where the plays are close together, or where Last.fm knows too few of the tracks, shows none.
 `
         },
         {
@@ -44,11 +68,12 @@ Catalogue tracks and their physical files are managed separately. **File version
             title: 'Service Matching',
             lede: 'Link your artists, albums, and tracks to external services for richer metadata.',
             body: `
-Library v2 exposes provider links and matching actions on catalogue entities. The available services depend on the entity and its stored provider IDs.
+The Library exposes provider links and matching actions on catalogue entities. The available services depend on the entity and its stored provider IDs.
 
 - Click any chip to **manually search and link** the correct external ID when automatic matching gets it wrong
 - **Paste a link or an ID** instead of a name when several artists share one (eleven called "1905"): open the right one on that service, copy its address, and paste it. Works for Spotify, MusicBrainz, Deezer, iTunes/Apple Music, Discogs, Tidal, Qobuz, Amazon, AudioDB, JioSaavn, Last.fm and Bandcamp links, and Genius IDs. A paste that doesn't resolve falls back to a normal search
 - Fixing an artist's match also fixes it on **your watchlist**, so new releases are scanned for the right artist. Only your own watchlist changes, and never onto an ID another watched artist already uses
+- **Other versions…** in an album's **⋯** menu is the edition picker (like Picard's): it lists the album's releases from its MusicBrainz release group and the same-titled releases on your primary source, each with its track count, date, country, format and label, the current one marked. A search box finds one that is not listed, kept to that artist. Pick one to see what changes (track count, how your files line up) and confirm: the album then follows that release, the same as a manual match on its chip. Your files stay as they are, so run **Preview Retag** afterwards to write it into their tags
 - Run per-service **enrichment** from the Enrich dropdown to pull in metadata from a specific source
 - Matched services show as clickable badges linking to the entity on that service's website
 
@@ -101,7 +126,7 @@ From any album card showing missing tracks, click **Download Missing** to open a
             title: 'Remove Entries and Files',
             lede: 'Remove tracks from the database only, or from disk as well — with a deliberate choice each time.',
             body: `
-Library v2 previews the affected entries and file paths before removal:
+The Library previews the affected entries and file paths before removal:
 
 - **Remove from library database only** — removes the selected library records and keeps the physical files on disk.
 - **Permanently delete files** — removes the corresponding records and disk files after explicit confirmation. Paths outside configured Music Library Paths, or on unavailable storage, are blocked.

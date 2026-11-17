@@ -66,7 +66,8 @@ afterEach(() => {
 });
 
 /** The page is on screen once its title has painted. */
-const settled = () => screen.findByText('Downloads');
+// the page name: the first view's pill is called Downloads too
+const settled = () => screen.findByRole('heading', { level: 1, name: 'Downloads' });
 
 describe('the active-downloads route', () => {
   it('renders without the shell’s .page class', async () => {
@@ -214,6 +215,27 @@ describe('the active-downloads route', () => {
       expect(container.querySelector('[data-quarantine-id="q1"]')).not.toBeNull(),
     );
     expect(container.querySelector('.dlc-tag-bad')?.textContent).toBe('Failed integrity check');
+  });
+
+  it('?open=recycle lands on the music recycle bin, then drops the param (#2128)', async () => {
+    server.use(
+      http.get('/api/deleted-files', () =>
+        HttpResponse.json({ success: true, entries: [], total: 0, retention_days: 30 }),
+      ),
+    );
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({
+      initialEntries: ['/active-downloads?media=music&open=recycle'],
+    });
+    const router = createAppRouter({ history, queryClient });
+    const { container } = render(<AppRouterProvider router={router} queryClient={queryClient} />);
+    await settled();
+    await waitFor(() => expect(container.querySelector('#verif-subview-banner')).not.toBeNull());
+    await waitFor(() => {
+      const on = container.querySelector('#verif-subview-banner [aria-selected="true"]');
+      expect(on?.textContent).toContain('Deleted');
+    });
+    await waitFor(() => expect(router.state.location.search).toEqual({ media: 'music' }));
   });
 
   it('collapses to quarantine-only when require_verified is on', async () => {

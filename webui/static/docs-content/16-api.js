@@ -1824,7 +1824,8 @@ body are touched** (\`api/watchlist.py:update_watchlist_filters\`).
 | include_albums | boolean | no | unchanged | Watch full albums. |
 | include_eps | boolean | no | unchanged | Watch EPs. |
 | include_singles | boolean | no | unchanged | Watch singles. |
-| include_live | boolean | no | unchanged | Watch live releases. |
+| include_live | boolean | no | unchanged | Watch live albums. |
+| include_live_tracks | boolean | no | unchanged | Watch live versions on other releases. Follows include_live until set once. |
 | include_remixes | boolean | no | unchanged | Watch remixes. |
 | include_acoustic | boolean | no | unchanged | Watch acoustic releases. |
 | include_compilations | boolean | no | unchanged | Watch compilations. |
@@ -4363,22 +4364,90 @@ curl -H "Authorization: Bearer $API_KEY" \\
   http://localhost:8008/api/v1/video/scan/status
 \`\`\`
 
-### \`GET /api/v1/video/downloads\`
+### \`GET /api/v1/video/stats\`
 
-The active video download queue (also nudges the download monitor to make
-sure it is running).
+Everything a dashboard widget needs in one call: what is in the library, the
+database, where the download queue stands, and the wishlist.
 
-**Response**
+**Response** — \`data\`:
 
-\`data\` is \`{"downloads": [...]}\` — one object per active download row
-(progress, status, source, media ids, and annotated upgrade-watch/pack
-info where applicable).
+| Field | Type | Description |
+|-------|------|-------------|
+| \`server\` | string/null | The video server the library counts are scoped to (\`plex\` \| \`jellyfin\`). |
+| \`library.movies\` | integer | Movies in the library. |
+| \`library.shows\` | integer | Shows in the library. |
+| \`library.episodes\` | integer | Episodes with a file on disk. |
+| \`library.episodes_missing\` | integer | Monitored episodes that have aired but have no file. |
+| \`library.size_bytes\` | integer | Total size of the library's files. |
+| \`database.size_mb\` | number/null | Video database file size. |
+| \`database.last_update\` | string/null | Last change to a library row, ISO UTC. |
+| \`database.last_scan\` | string/null | Start of the last full library scan, ISO UTC. |
+| \`downloads.active\` | integer | Rows queued, searching, downloading or importing. |
+| \`downloads.failed\` | integer | Rows that failed to download or import. |
+| \`downloads.completed\` | integer | Completed rows still on the downloads list. |
+| \`downloads.cancelled\` | integer | Cancelled rows. |
+| \`downloads.by_status\` | object | Count per raw status. |
+| \`downloads.speed_bps\` | integer | Combined speed of everything downloading right now. |
+| \`downloads.completed_all_time\` | integer | Completed grabs in the permanent history (survives clearing the list). |
+| \`wishlist.movies\` / \`episodes\` / \`videos\` / \`total\` | integer | Wishlist counts (\`videos\` is YouTube). |
+
+\`\`\`json
+{
+  "success": true,
+  "data": {
+    "server": "plex",
+    "library": {"movies": 1250, "shows": 85, "episodes": 6520,
+                "episodes_missing": 41, "size_bytes": 18734029840384},
+    "database": {"size_mb": 96.4, "last_update": "2026-10-16T17:49:14+00:00",
+                 "last_scan": "2026-10-16T17:48:54+00:00"},
+    "downloads": {"active": 3, "failed": 1, "completed": 17, "cancelled": 0,
+                  "by_status": {"queued": 1, "searching": 0, "downloading": 2, "importing": 0,
+                                "failed": 1, "import_failed": 0, "completed": 17, "cancelled": 0},
+                  "speed_bps": 12500000, "completed_all_time": 412},
+    "wishlist": {"movies": 12, "episodes": 40, "videos": 1, "total": 53}
+  },
+  "error": null,
+  "pagination": null
+}
+\`\`\`
 
 **Example**
 
 \`\`\`bash
 curl -H "Authorization: Bearer $API_KEY" \\
-  http://localhost:8008/api/v1/video/downloads
+  http://localhost:8008/api/v1/video/stats
+\`\`\`
+
+**Errors:** \`503 NOT_AVAILABLE\` when the video side is off, \`500 VIDEO_ERROR\`.
+
+### \`GET /api/v1/video/downloads\`
+
+The video downloads list, active rows first then newest (the latest 100).
+Also nudges the download monitor to make sure it is running.
+
+**Query parameters**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| status | string | no | — | One status or a comma list: \`queued\`, \`searching\`, \`downloading\`, \`importing\`, \`failed\`, \`import_failed\`, \`completed\`, \`cancelled\`. \`active\` and \`failed\` also work as shorthand for their groups. |
+
+**Response**
+
+\`data\` is \`{"downloads": [...]}\` — one object per download row
+(progress, status, source, media ids, and annotated upgrade-watch/pack
+info where applicable). With \`status\` it also carries \`count\`.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | \`BAD_REQUEST\` | \`status\` has a word that is not a known status. |
+
+**Example**
+
+\`\`\`bash
+curl -H "Authorization: Bearer $API_KEY" \\
+  "http://localhost:8008/api/v1/video/downloads?status=downloading"
 \`\`\`
 
 ### \`GET /api/v1/video/downloads/status\`
@@ -4671,6 +4740,7 @@ curl -X POST -H "Authorization: Bearer $API_KEY" \\
 | POST | \`/api/automations/{automation_id}/toggle\` | Enable/disable one automation | session |
 | POST | \`/api/automations/{automation_id}/run\` | Run an automation right now | session (profile-scoped) |
 | GET | \`/api/automations/progress\` | Live progress of running automations | session |
+| GET | \`/api/automations/activity\` | The last 24 hours by automation and the last 7 days by local day. \`?side=video\` for the video side. Returns \`{recent, days, totals}\` | session |
 | GET | \`/api/automations/{automation_id}/history\` | Run history — \`?limit=50&offset=0\` | session |
 | GET | \`/api/scripts\` | Scripts available to the run-script action | session |
 | GET | \`/api/automations/blocks\` | Trigger/action/notification block catalog | session |
@@ -4795,6 +4865,43 @@ In the request app, set the Lidarr URL to \`http://<host>:8008/lidarr\` and past
 ## Supported routes
 
 All under \`/lidarr/api/v1\`: \`system/status\`, \`qualityprofile\`, \`metadataprofile\`, \`rootfolder\`, \`tag\`, \`artist\` (list, lookup, add, edit, editor, delete), \`album\` (list, lookup, add, edit, monitor, delete), \`track\`, \`trackfile\`, \`command\` (\`AlbumSearch\`, \`ArtistSearch\`, \`RefreshArtist\`; other commands are accepted and do nothing), \`queue\`, \`history\` and \`wanted/missing\`.
+`
+        },
+        {
+            id: 'api-seerr',
+            title: 'Seerr Compatible API',
+            lede: 'Let Seerr apps like Litefin browse and request movies and shows through SoulSync.',
+            body: `
+# Seerr compatible API
+
+Apps built for Seerr (Jellyseerr, Overseerr) can use SoulSync's video side instead. They browse and search through SoulSync's TMDB data, see what's already in your library, and their movie and show requests land on SoulSync's video wishlist. Built for **Litefin** and its Jellyfin plugin.
+
+## Turn it on
+
+Go to **Settings > System > SoulSync API > Seerr Compatible API**:
+
+1. Tick **Answer as Seerr at /seerr**. While it's off, every \`/seerr\` route answers \`404\`.
+2. Pick **Jellyfin users with no profile request as**.
+
+## Connect the app
+
+In the app, set the Seerr URL to \`http://<host>:8008/seerr\` and paste a SoulSync **admin** API key as the Seerr API key. For Litefin that's the **Seerr Integration** on the Litefin plugin's page in your Jellyfin dashboard. A read key gets \`403\`. The app talks to \`/seerr/api/v1\` like it would to a real Seerr.
+
+## Who asks
+
+Each Jellyfin user requests as the SoulSync profile that picked that Jellyfin user under **Settings > Connections**, else the profile with the same name, else the profile picked above. A profile without the video side can't request, and a kids profile can't request a title over its rating cap.
+
+## What happens
+
+- A profile that can download gets it straight away: a movie goes on its video wishlist, and for a show every aired episode of the seasons asked for that isn't in the library yet. Asking for the newest season also follows the show, so its next episodes come too.
+- A profile that can't download files a video request that waits on the **Requests** page. SoulSync requests pick a whole-show policy, so when the seasons asked for aren't all, the first or the newest, the request asks for every season and the note says which ones were picked. The admin can change it when approving.
+- Request limits apply like they do in SoulSync.
+- Cards show **Available** when it's in your library, **Partially available** for a show with episodes missing, **Processing** when it's on a wishlist or followed, and **Pending** while a request waits.
+- Downloads use your normal quality profiles. There are no Radarr or Sonarr servers to pick and no separate 4K request.
+
+## Supported routes
+
+All under \`/seerr/api/v1\`: \`status\`, \`auth/me\`, \`user\`, \`discover/trending\`, \`discover/movies\` (plus \`upcoming\`, \`studio\`, \`genre\`), \`discover/tv\` (plus \`upcoming\`, \`network\`, \`genre\`), \`discover/genreslider\`, \`search\`, \`movie\` and \`tv\` (details, \`similar\`, \`recommendations\`), \`person\` (with \`combined_credits\`), \`collection\`, \`request\` (list, create, cancel) and \`media\`. Seerr's watch-later list, outside ratings and Radarr/Sonarr service lists answer empty, since SoulSync doesn't keep them.
 `
         },
         {

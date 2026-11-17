@@ -324,11 +324,16 @@ def _resolve_enhance_original_path(recorded_path: str) -> str:
     return resolved or recorded_path
 
 
-def _retire_lib2_path_after_redownload(old_path: str, new_path: str) -> None:
+def _retire_lib2_path_after_redownload(old_path: str, new_path: str, *,
+                                       track_id=None, stored_path=None) -> None:
     """Point the lib2 row of a redownloaded track at its new file (dd28-08).
 
     The redownload hook fires outside the autolink callback for tracks that
     were already in the catalog, so the retirement has to happen here too.
+    ``track_id`` (the redownload knows it) wins over a lookup by path: on a
+    path-mapped install the row stores the media server's path, not the
+    local one SoulSync read, and the lookup found nothing (the moved-away
+    file stayed active and primary). 3.6.1 keyed this by the track id too.
     """
     try:
         # No feature gate: `library_v2_enabled()` returns True unconditionally
@@ -340,14 +345,18 @@ def _retire_lib2_path_after_redownload(old_path: str, new_path: str) -> None:
 
         conn = get_database()._get_connection()
         try:
-            row = conn.execute(
-                "SELECT track_id FROM lib2_track_files WHERE path=? LIMIT 1",
-                (old_path,),
-            ).fetchone()
-            if row is None or row[0] is None:
-                return
+            owner = int(track_id) if str(track_id or "").isdigit() else None
+            if owner is None:
+                row = conn.execute(
+                    "SELECT track_id FROM lib2_track_files WHERE path IN (?, ?) LIMIT 1",
+                    (old_path, stored_path or old_path),
+                ).fetchone()
+                if row is None or row[0] is None:
+                    return
+                owner = row[0]
             retire_replaced_files(
-                conn, row[0], keep_path=new_path, removed_paths=[old_path],
+                conn, owner, keep_path=new_path,
+                removed_paths=[p for p in (old_path, stored_path) if p],
                 config_manager=_cm,
             )
             conn.commit()
@@ -669,6 +678,16 @@ def _is_staging_task(task_id) -> bool:
     """the task's file came from the staging folder, not a download."""
     with tasks_lock:
         return bool(download_tasks.get(task_id, {}).get('staging_match'))
+
+
+def _remember_quarantine(task_id, reason) -> None:
+    """if the retry this precedes finds nothing, the task says the file was
+    quarantined and why, not "no match found" (#2001)"""
+    if not task_id or not reason:
+        return
+    with tasks_lock:
+        if task_id in download_tasks:
+            download_tasks[task_id]['last_quarantine_reason'] = str(reason)
 
 
 def _requeue_quarantined_task_for_retry(task_id, batch_id, trigger) -> bool:
@@ -1029,7 +1048,7 @@ def _recover_moved_file_bookkeeping(context, artist_context=None, album_info=Non
         linked_lib2_file_id = link_download_into_library_v2(
             context, raise_on_error=True)
         if linked_lib2_file_id is None:
-            raise RuntimeError("Library v2 did not create a file row")
+            raise RuntimeError("The Library did not create a file row")
         from core.settings import config_manager
         from database.music_database import get_database
         from core.library2.track_reconcile_trigger import (
@@ -1041,7 +1060,7 @@ def _recover_moved_file_bookkeeping(context, artist_context=None, album_info=Non
             config_manager,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Post-move Library-v2 reconciliation failed: %s", exc)
+        logger.warning("Post-move Library reconciliation failed: %s", exc)
         return False
     try:
         from core.acquisition.pipeline_callback import notify_pipeline_import_success
@@ -1072,7 +1091,7 @@ def _confirm_existing_file_bookkeeping(context, artist_context=None, album_info=
         return True
     context.setdefault(
         '_context_failure_msg',
-        'the file is at its destination, but Library v2 could not register it',
+        'the file is at its destination, but the Library could not register it',
     )
     return False
 
@@ -1100,7 +1119,8 @@ def _record_completed_import_side_effects(
     record_library_history_download(context)
     return True
 def _maybe_write_artist_nfo(context: dict, final_path: str, config_manager) -> None:
-    """#1449: optional artist.nfo (Jellyfin/Kodi/Emby) in the artist folder.
+    """#1449: optional artist.nfo (Jellyfin/Kodi/Emby) in the artist folder,
+    plus poster.jpg / background.jpg when missing (#2138).
 
     Idempotent (skips when the nfo exists) and never raises — a sidecar
     must not break the import. Called on every path where a file actually
@@ -1108,9 +1128,11 @@ def _maybe_write_artist_nfo(context: dict, final_path: str, config_manager) -> N
     stream-processor-variant paths).
     """
     try:
-        from core.library.artist_nfo import ensure_artist_nfo_for_track
+        from core.library.artist_nfo import ensure_artist_nfo_for_track, schedule_artist_artwork
+        # #2138: poster.jpg / background.jpg ride the same switch
         _nfo_ok, _nfo_detail = ensure_artist_nfo_for_track(
-            context.get('_final_processed_path', final_path), config_manager)
+            context.get('_final_processed_path', final_path), config_manager,
+            artwork=schedule_artist_artwork)
         if _nfo_ok:
             logger.info(f"artist.nfo written: {_nfo_detail}")
     except Exception as _nfo_err:  # noqa: BLE001 — best effort sidecar
@@ -1408,6 +1430,9 @@ def _post_process_matched_download(context_key, context, file_path, runtime, met
             logger.error(f"[Integrity] Rejected {_basename}: {integrity.reason}")
             context['_integrity_failure_msg'] = integrity.reason
             context['_integrity_checks'] = integrity.checks
+            # the review shows "expected 4:26, got 13:04" from these (#2001)
+            context['_expected_length_s'] = (round(_expected_duration_ms / 1000.0, 1)
+                                             if _expected_duration_ms else None)
             _journal_checks_not_run(
                 context,
                 checks=('quality', 'acoustic_id'),
@@ -2575,14 +2600,14 @@ def _post_process_matched_download(context_key, context, file_path, runtime, met
         if _verified_upgrade:
             if not _upgrade_snapshot_still_current(_upgrade_snapshot):
                 raise RuntimeError(
-                    "Library-v2 upgrade conflict: primary file or profile changed; "
+                    "Library upgrade conflict: primary file or profile changed; "
                     "previous file kept and incoming artifact left recoverable"
                 )
             if (_upgrade_old_local and os.path.exists(_upgrade_old_local)
                     and not _replacement_length_is_safe(
                         _upgrade_old_local, file_path)):
                 raise RuntimeError(
-                    "Library-v2 upgrade rejected: retained artifact is materially "
+                    "Library upgrade rejected: retained artifact is materially "
                     "shorter than the current primary"
                 )
 
@@ -2787,7 +2812,7 @@ def _post_process_matched_download(context_key, context, file_path, runtime, met
             else:
                 context.setdefault(
                     '_context_failure_msg',
-                    'the file was moved, but Library v2 could not register it',
+                    'the file was moved, but the Library could not register it',
                 )
                 logger.warning(f"Source file gone, not retrying: {context_key}")
     finally:
@@ -2949,6 +2974,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             # Requeue-first, fail-second — the same order the direct path uses.
             # A successful requeue means the task is live again on its next-best
             # candidate, so it must not be marked failed.
+            _remember_quarantine(task_id, reason)
             if _requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
                 logger.info(
                     f"Task {task_id} quarantined by the {trigger} guard — "
@@ -3015,6 +3041,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             # source flagged used) picks the runner-up match instead.
             with matched_context_lock:
                 matched_downloads_context.pop(context_key, None)
+            _remember_quarantine(task_id, f"verification failed: {failure_msg}")
             if _requeue_quarantined_task_for_retry(task_id, batch_id, 'acoustid'):
                 logger.info(
                     f"AcoustID mismatch for task {task_id} — retrying next-best candidate: {failure_msg}"
@@ -3080,6 +3107,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             # file and retry the next-best candidate before failing.
             with matched_context_lock:
                 matched_downloads_context.pop(context_key, None)
+            _remember_quarantine(task_id, f"integrity check failed: {failure_msg}")
             if _requeue_quarantined_task_for_retry(task_id, batch_id, 'integrity'):
                 logger.info(
                     f"Integrity check failed for task {task_id} — retrying next-best candidate: {failure_msg}"
@@ -3142,7 +3170,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             # explicit failure rather than an unverifiable success.
             failure_msg = str(context.get(
                 '_context_failure_msg',
-                'post-processing did not complete Library v2 registration',
+                'post-processing did not complete Library registration',
             ))
             logger.error(
                 "Post-processing did not import (task=%s): %s", task_id, failure_msg,
@@ -3206,7 +3234,9 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                             # the LEGACY tracks.file_path, leaving the lib2 row
                             # pointing at the file it had just deleted.
                             _record_replaced_file_path(context, old_path)
-                            _retire_lib2_path_after_redownload(old_path, expected_final_path)
+                            _retire_lib2_path_after_redownload(
+                                old_path, expected_final_path, track_id=lib_track_id,
+                                stored_path=redownload_ctx.get('old_stored_path'))
                             logger.info(f"[Redownload] Moved old file to the deleted folder: {old_path}")
                     # Guarded on `old_path`, because that is what the repoint
                     # matches on — the row is keyed by the path we stored, not
