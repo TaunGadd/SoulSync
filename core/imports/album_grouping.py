@@ -23,6 +23,7 @@ Pure SQL-over-a-cursor; no app singletons, so it tests against an in-memory DB.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from utils.logging_config import get_logger
@@ -52,6 +53,8 @@ def find_existing_soulsync_album_id(
     album_source_id: Optional[str] = None,
     source: Optional[str] = None,
     release_id: Optional[str] = None,
+    release_year: Any = None,
+    file_folder: Optional[str] = None,
 ) -> Optional[int]:
     """Resolve the catalogue album row a track should join, or None.
 
@@ -72,14 +75,55 @@ def find_existing_soulsync_album_id(
     releases can share a title and an artist and differ only by MusicBrainz's
     disambiguation (#1299); matching them by name merged both into one album
     with every shared song twice. A row with no release id yet still matches.
+
+    ``release_year`` / ``file_folder``: for an import that carries no release
+    or provider id at all, the year and folder of the file. A same-named row
+    whose files all sit in other folders under another year is another
+    release (#2110), the rule the scan and refresh writers follow.
     """
     release = (release_id or "").strip().casefold()
+    provider = (source or '').strip().lower()
+    own_id = str(album_source_id or "").strip()
+
+    def _other_provider_release(album_id) -> bool:
+        # weezer's three self-titled albums share the name hash; the
+        # provider's own album id and the year tell them apart (#2110). the
+        # id alone does not: a provider lists one album under several ids
+        # (clean and explicit, one per region), and those are one album here
+        if not own_id or not provider or provider == 'musicbrainz':
+            return False
+        held = cursor.execute(
+            "SELECT spotify_id, external_ids, release_date, year FROM lib2_albums WHERE id = ?",
+            (album_id,)).fetchone()
+        if not held:
+            return False
+        from core.library2.release_split import tag_year
+        wanted_year, held_year = tag_year(release_year), tag_year(held[2]) or tag_year(held[3])
+        if not wanted_year or not held_year or wanted_year == held_year:
+            return False
+        if provider == 'spotify':
+            stored = held[0]
+        else:
+            try:
+                stored = (json.loads(held[1] or "{}") or {}).get(provider)
+            except (TypeError, ValueError, AttributeError):
+                stored = None
+        stored = str(stored or "").strip()
+        return bool(stored) and stored != own_id
 
     def _usable(row) -> bool:
         if not row:
             return False
         stored = str(row[1] or "").strip().casefold()
-        return not (release and stored and stored != release)
+        if release and stored and stored != release:
+            return False
+        if _other_provider_release(row[0]):
+            return False
+        if not release and not own_id and release_year and file_folder:
+            from core.library2.release_split import is_other_release_by_year
+            if is_other_release_by_year(cursor, row[0], release_year, file_folder):
+                return False
+        return True
 
     if release:
         row = cursor.execute(
@@ -97,7 +141,6 @@ def find_existing_soulsync_album_id(
     if _usable(row):
         return int(row[0])
 
-    provider = (source or '').strip().lower()
     where, params = None, (album_source_id,)
     if album_source_id and provider:
         if provider in ('spotify', 'musicbrainz'):

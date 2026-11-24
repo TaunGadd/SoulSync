@@ -1277,10 +1277,67 @@ function downloadModalQualityProfileSelectId(playlistId) {
 }
 
 function downloadModalQualityProfileSelectHtml(playlistId) {
-    return acquisitionQualityProfileSelectHtml(downloadModalQualityProfileSelectId(playlistId));
+    return acquisitionQualityProfileSelectHtml(downloadModalQualityProfileSelectId(playlistId))
+        + downloadModalLidarrWholeAlbumHtml(playlistId);
+}
+
+/**
+ * "Whole album via Lidarr". On, the download goes to Lidarr, which grabs
+ * whole albums; off, to the next source of the hybrid chain (e.g. Soulseek).
+ * Rendered hidden and shown by hydration only when the server says the
+ * choice exists (hybrid mode with Lidarr and another source).
+ */
+function downloadModalLidarrWholeAlbumId(playlistId) {
+    return `lidarr-whole-album-${playlistId}`;
+}
+
+function downloadModalLidarrWholeAlbumHtml(playlistId) {
+    return `
+        <label class="force-download-toggle" data-lidarr-whole-album hidden
+            title="On: Lidarr downloads the whole album. Off: the next download source (e.g. Soulseek) gets the tracks.">
+            <input type="checkbox" id="${downloadModalLidarrWholeAlbumId(playlistId)}" checked>
+            <span>Whole album via Lidarr</span>
+        </label>`;
+}
+
+let _lidarrWholeAlbumOptionPromise = null;
+
+function lidarrWholeAlbumOption() {
+    if (!_lidarrWholeAlbumOptionPromise) {
+        _lidarrWholeAlbumOptionPromise = fetch('/api/downloads/lidarr-whole-album')
+            .then(r => (r.ok ? r.json() : { available: false }))
+            .catch(() => ({ available: false }));
+        // settings can change; ask again for the next dialog
+        _lidarrWholeAlbumOptionPromise.finally(() => {
+            setTimeout(() => { _lidarrWholeAlbumOptionPromise = null; }, 30000);
+        });
+    }
+    return _lidarrWholeAlbumOptionPromise;
+}
+
+async function hydrateDownloadModalLidarrWholeAlbum(playlistId) {
+    const option = await lidarrWholeAlbumOption();
+    const checkbox = document.getElementById(downloadModalLidarrWholeAlbumId(playlistId));
+    if (!checkbox) return;
+    const label = checkbox.closest('[data-lidarr-whole-album]');
+    if (!option || !option.available) {
+        if (label) label.hidden = true;
+        return;
+    }
+    checkbox.checked = option.default !== false;
+    if (label) label.hidden = false;
+}
+
+/** The dialog's choice, or undefined when the toggle is not shown (server default). */
+function getDownloadModalLidarrWholeAlbum(playlistId) {
+    const checkbox = document.getElementById(downloadModalLidarrWholeAlbumId(playlistId));
+    const label = checkbox ? checkbox.closest('[data-lidarr-whole-album]') : null;
+    if (!checkbox || (label && label.hidden)) return undefined;
+    return checkbox.checked;
 }
 
 function hydrateDownloadModalQualityProfileSelect(playlistId, options = {}) {
+    hydrateDownloadModalLidarrWholeAlbum(playlistId);
     return hydrateAcquisitionQualityProfileSelect(
         downloadModalQualityProfileSelectId(playlistId),
         { playlistRef: playlistId, ...options },
@@ -1314,7 +1371,7 @@ function playlistOrganizeToggleHtml(playlistRef, source = 'spotify') {
     const safeRef = String(playlistRef).replace(/'/g, "\\'");
     const safeSource = String(source).replace(/'/g, "\\'");
     return `
-        <label class="playlist-modal-organize-toggle" title="Download into a playlist-named folder (Artist - Track) under your transfer path">
+        <label class="playlist-modal-organize-toggle" title="Download into a playlist-named folder (Artist - Track) in your music library folder">
             <input type="checkbox" id="${playlistDetailsOrganizeCheckboxId(playlistRef)}"
                 onchange="onPlaylistOrganizePreferenceChange('${safeRef}', this.checked, '${safeSource}')">
             <span>Organize by playlist</span>
@@ -1876,7 +1933,7 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
 
     // Use the exact same modal HTML structure as the existing modals
     modal.innerHTML = `
-        <div class="download-missing-modal-content" data-context="${contextType}">
+        <div class="download-missing-modal-content" data-context="${contextType}" data-tour="download.window">
             <div class="download-missing-modal-header">
                 ${generateDownloadModalHeroSection(heroContext)}
             </div>
@@ -1902,16 +1959,18 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                         ` : ''}
                         ${downloadModalQualityProfileSelectHtml(virtualPlaylistId)}
                     </div>
-                    <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
+                    <p class="music-get-off-note" role="note">Getting music isn't part of your profile. You can still see what's here and what you already have. Ask your admin if you'd like it.</p>
+                    <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" data-tour="download.start" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
                     ${_isBeatportPlaylistId(virtualPlaylistId) ? `
                     <button class="download-control-btn sync-to-server-btn" id="sync-server-btn-${virtualPlaylistId}" onclick="syncPlaylistToServer('${virtualPlaylistId}')" ${_isSoulsyncStandalone ? 'style="display:none"' : ''}>
                         Sync to Server
                     </button>` : ''}
-                    <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
+                    <button class="download-control-btn" data-request-action id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
+                    <span class="music-asks-left" data-asks-left aria-live="polite"></span>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
                         Cancel All
                     </button>
@@ -1951,6 +2010,8 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
     } else {
         void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
     }
+    // a profile that asks first sees what's left of its limit (#2166)
+    if (typeof window.fillMusicAsksLeft === 'function') window.fillMusicAsksLeft(modal);
     modal.style.display = 'flex';
     hideLoadingOverlay();
 
@@ -4014,15 +4075,8 @@ async function fetchAndUpdateServiceStatus() {
         // duplicate frames.
         window.dispatchEvent(new CustomEvent('ss:service-status', { detail: data }));
 
-        if (typeof syncSpotifySettingsAuthState === 'function') {
-            syncSpotifySettingsAuthState(data?.spotify || null);
-        }
-        if (typeof syncPrimaryMetadataSourceAvailability === 'function') {
-            syncPrimaryMetadataSourceAvailability(data?.spotify || null);
-        }
-        if (typeof sanitizeMetadataSourceSelection === 'function') {
-            sanitizeMetadataSourceSelection({ quiet: true });
-        }
+        // the Settings metadata source picker and Spotify card follow the
+        // dispatch above (connections-metadata.tsx)
 
         // The dashboard service cards are React-rendered from the dispatch
         // above since the flip (service-cards.tsx) — only the sidebar half
@@ -4066,33 +4120,8 @@ async function fetchAndUpdateServiceStatus() {
     }
 }
 
-function syncPrimaryMetadataSourceAvailability(statusData) {
-    const select = document.getElementById('metadata-fallback-source');
-    if (!select) return;
-    if (!statusData) return;
-
-    const spotifyOption = select.querySelector('option[value="spotify"]');
-    const discogsOption = select.querySelector('option[value="discogs"]');
-
-    const spotifyAvailable = statusData?.authenticated === true;
-    if (spotifyOption) {
-        spotifyOption.dataset.unavailable = spotifyAvailable ? 'false' : 'true';
-        spotifyOption.textContent = spotifyAvailable ? 'Spotify' : '🔒 Spotify';
-        spotifyOption.title = spotifyAvailable
-            ? 'Spotify'
-            : 'Spotify authentication is required before this source can be selected.';
-    }
-
-    if (discogsOption) {
-        const discogsToken = document.getElementById('discogs-token');
-        const discogsAvailable = !!discogsToken?.value?.trim();
-        discogsOption.dataset.unavailable = discogsAvailable ? 'false' : 'true';
-        discogsOption.textContent = discogsAvailable ? 'Discogs' : '🔒 Discogs';
-        discogsOption.title = discogsAvailable
-            ? 'Discogs'
-            : 'Discogs personal access token is required before this source can be selected.';
-    }
-}
+// syncPrimaryMetadataSourceAvailability: the Settings metadata source picker
+// locks Spotify and Discogs itself (connections.ts sourceOptions)
 
 function getMetadataSourceLabel(source) {
     if (source === 'deezer') return 'Deezer';

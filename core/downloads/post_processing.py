@@ -109,7 +109,7 @@ def _copy_release_audio_to_transfer(source_path: str, transfer_dir: str) -> Opti
         shutil.copy2(src, dest)
         return str(dest)
     except Exception as exc:
-        logger.warning("[Post-Processing] Could not copy release audio to transfer: %s", exc)
+        logger.warning("[Post-Processing] Could not copy release audio to the music library folder: %s", exc)
         return None
 
 
@@ -284,7 +284,9 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
         # A routed artist's files belong in the audiobook folder, not the music library.
         from core.audiobook_routing import routed_root_for_context
-        transfer_dir = routed_root_for_context(context) or transfer_dir
+        from core.imports.paths import lidarr_root_for_context
+        transfer_dir = (routed_root_for_context(context) or lidarr_root_for_context(context)
+                        or transfer_dir)
 
         expected_final_path = (context or {}).get('_final_processed_path')
 
@@ -496,7 +498,7 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
         # Handle file found in transfer folder - already completed by stream processor
         if file_location == 'transfer':
-            logger.info(f"[Post-Processing] File found in transfer folder - already completed by stream processor: {found_file}")
+            logger.info(f"[Post-Processing] File found in music library folder - already completed by stream processor: {found_file}")
 
             # Check if metadata enhancement was completed
             metadata_enhanced = False
@@ -505,7 +507,7 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                     metadata_enhanced = download_tasks[task_id].get('metadata_enhanced', False)
 
             if not metadata_enhanced:
-                logger.warning("[Post-Processing] File in transfer folder missing metadata enhancement - completing now")
+                logger.warning("[Post-Processing] File in music library folder missing metadata enhancement - completing now")
                 # Attempt to complete metadata enhancement using context
                 if context and expected_final_path:
                     try:
@@ -623,7 +625,8 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                 try:
                     from database.music_database import get_database
                     from core.library2.validation import refresh_imported_metadata
-                    metadata_status = refresh_imported_metadata(get_database(), [found_file])
+                    metadata_status = refresh_imported_metadata(get_database(), [found_file],
+                                                                fill_blanks=True)
                 except Exception as exc:
                     logger.warning('Final metadata read failed for %s: %s', found_file, exc)
             with tasks_lock:

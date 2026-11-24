@@ -1,0 +1,215 @@
+/**
+ * Connections, step 10b (SETTINGS_PORT.md): the Scrobbling and Extras cards
+ * and the rest of the music API Configuration group. Its markup is checked
+ * with the whole group in connections-metadata.test.tsx.
+ */
+
+import { act, fireEvent, render, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { createSettingsStore, type SettingsPayload, type SettingsStore } from '../settings-store';
+import { SCROBBLER_PRESETS, scrobblerPresetUrl } from './connections-extras';
+import { serviceActions } from './connections-services';
+import { ConnectionsTab } from './connections-tab';
+
+type Shell = Window & Record<string, unknown>;
+const shell = window as unknown as Shell;
+
+let store: SettingsStore;
+let posted: SettingsPayload[];
+let calls: Array<{ url: string; method: string }>;
+let answers: Record<string, unknown>;
+
+beforeEach(() => {
+  const sink: SettingsPayload[] = [];
+  posted = sink;
+  store = createSettingsStore({
+    post: (body) => {
+      sink.push(structuredClone(body));
+      return Promise.resolve({ success: true });
+    },
+    delay: 0,
+  });
+  calls = [];
+  answers = {};
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method || 'GET' });
+      const data = answers[url] ?? { success: true };
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(data) } as Response);
+    }),
+  );
+  for (const k of ['showToast', 'showLoadingOverlay', 'hideLoadingOverlay']) shell[k] = vi.fn();
+  shell.testConnection = vi.fn(() => Promise.resolve());
+  shell.saveSettings = vi.fn(() => Promise.resolve());
+  shell.showConfirmDialog = vi.fn(() => Promise.resolve(true));
+});
+
+afterEach(async () => {
+  await act(() => store.flush());
+  vi.unstubAllGlobals();
+  for (const k of [
+    'showToast',
+    'showLoadingOverlay',
+    'hideLoadingOverlay',
+    'testConnection',
+    'saveSettings',
+    'showConfirmDialog',
+  ])
+    delete shell[k];
+});
+
+function group() {
+  const slot = document.createElement('div');
+  document.body.append(slot);
+  return render(<ConnectionsTab store={store} part="api-music" opened={0} active={false} />, {
+    container: slot,
+  });
+}
+const el = (id: string) => document.getElementById(id) as HTMLInputElement;
+function saved(): SettingsPayload {
+  const merged: SettingsPayload = {};
+  for (const body of posted)
+    for (const [k, v] of Object.entries(body)) merged[k] = { ...merged[k], ...v };
+  return merged;
+}
+
+describe('the Scrobbling and Extras cards', () => {
+  it('show what is saved, Last.fm says whether it is authorized', () => {
+    group();
+    expect(el('lastfm-scrobble-status').textContent).toBe('');
+    act(() =>
+      store.hydrate({
+        lastfm: { username: 'me', scrobble_enabled: true, session_key: 'abc' },
+        listenbrainz: { base_url: 'http://lb', scrobble_enabled: false },
+        acoustid: { enabled: true, api_key: '__redacted_unchanged__' },
+        concerts: { country: 'GB' },
+        fanart: { api_key: 'f' },
+      }),
+    );
+    expect(el('lastfm-username').value).toBe('me');
+    expect(el('lastfm-scrobble-enabled').checked).toBe(true);
+    expect(el('lastfm-scrobble-status').textContent).toBe('Authorized');
+    expect(el('listenbrainz-base-url').value).toBe('http://lb');
+    expect(el('acoustid-enabled').checked).toBe(true);
+    expect(el('acoustid-api-key').value).toBe('__redacted_unchanged__');
+    expect(el('concerts-country').value).toBe('GB');
+    expect(el('artist-fanart-api-key').value).toBe('f');
+    act(() => store.hydrate({ lastfm: {} }));
+    expect(el('lastfm-scrobble-status').textContent).toBe('Not authorized');
+  });
+
+  it('each field saves its key; the ones the page trimmed are trimmed', async () => {
+    group();
+    act(() => store.hydrate({ lastfm: {} }));
+    fireEvent.change(el('lastfm-username'), { target: { value: ' me ' } });
+    // shown as typed
+    expect(el('lastfm-username').value).toBe(' me ');
+    fireEvent.change(el('lastfm-api-key'), { target: { value: ' k ' } });
+    fireEvent.click(el('lastfm-scrobble-enabled'));
+    fireEvent.change(el('concerts-country'), { target: { value: 'gb ' } });
+    fireEvent.change(el('concerts-ticketmaster-api-key'), { target: { value: ' tm' } });
+    fireEvent.change(el('pollinations-api-key'), { target: { value: ' p ' } });
+    fireEvent.change(el('artist-fanart-api-key'), { target: { value: 'f ' } });
+    fireEvent.change(el('genius-access-token'), { target: { value: ' g ' } });
+    fireEvent.click(el('acoustid-enabled'));
+    fireEvent.change(el('listenbrainz-username'), { target: { value: ' u ' } });
+    fireEvent.change(el('listenbrainz-token'), { target: { value: 't' } });
+    fireEvent.click(el('listenbrainz-scrobble-enabled'));
+    await waitFor(() => expect(store.hasPending()).toBe(false));
+    expect(saved()).toEqual({
+      lastfm: { username: 'me', api_key: ' k ', scrobble_enabled: true },
+      concerts: { country: 'GB', ticketmaster_api_key: 'tm' },
+      pollinations: { api_key: 'p' },
+      fanart: { api_key: 'f' },
+      genius: { access_token: ' g ' },
+      acoustid: { enabled: true },
+      listenbrainz: { username: 'u', token: 't', scrobble_enabled: true },
+    });
+  });
+
+  it('the Maloja and Koito buttons fill in the scrobbler address in one click', async () => {
+    group();
+    act(() => store.hydrate({ listenbrainz: { base_url: '' } }));
+    fireEvent.click(el('listenbrainz-preset-koito'));
+    expect(el('listenbrainz-base-url').value).toBe('http://localhost:4110/apis/listenbrainz');
+    fireEvent.change(el('listenbrainz-base-url'), {
+      target: { value: 'https://music.example/koito/apis/listenbrainz/1/' },
+    });
+    fireEvent.click(el('listenbrainz-preset-maloja'));
+    expect(el('listenbrainz-base-url').value).toBe('https://music.example/koito/apis/listenbrainz');
+    await waitFor(() => expect(store.hasPending()).toBe(false));
+    expect(saved().listenbrainz).toEqual({
+      base_url: 'https://music.example/koito/apis/listenbrainz',
+    });
+  });
+
+  it('a preset keeps the server typed, else localhost on its own port', () => {
+    const koito = SCROBBLER_PRESETS.find((p) => p.id === 'koito')!;
+    expect(scrobblerPresetUrl('', koito)).toBe('http://localhost:4110/apis/listenbrainz');
+    expect(scrobblerPresetUrl('koito.lan:4110', koito)).toBe(
+      'http://koito.lan:4110/apis/listenbrainz',
+    );
+    expect(scrobblerPresetUrl('https://api.listenbrainz.org', koito)).toBe(
+      'http://localhost:4110/apis/listenbrainz',
+    );
+  });
+
+  it('Authorize Scrobbling saves first, then opens Last.fm', async () => {
+    const opened = vi.spyOn(window, 'open').mockImplementation(() => null);
+    answers['/api/lastfm/auth-url'] = { success: true, url: 'https://last.fm/auth' };
+    group();
+    fireEvent.click(document.querySelector('#lastfm-scrobble-actions button')!);
+    await waitFor(() =>
+      expect(opened).toHaveBeenCalledWith('https://last.fm/auth', '_blank', 'width=600,height=500'),
+    );
+    expect(shell.saveSettings).toHaveBeenCalledWith();
+    opened.mockRestore();
+  });
+
+  it('Clear quarantine is not in the AcoustID sheet any more: it moved to System > Maintenance', () => {
+    group();
+    const card = document.querySelector('[data-service="acoustid"]')!;
+    expect(card.textContent).not.toContain('Clear quarantine');
+    expect(card.textContent).not.toContain('Clear Quarantine');
+  });
+
+  it('Last.fm says plainly when the key was refused (Pro only from 1 December 2026)', async () => {
+    const pro =
+      'Last.fm now requires a Pro subscription for API keys (from 1 December 2026). Your key was not accepted.';
+    answers['/api/lastfm/configured'] = { configured: true, key_rejected: true, message: pro };
+    group();
+    await waitFor(() => expect(el('lastfm-key-rejected')?.textContent).toBe(pro));
+    // ListenBrainz is the recommended scrobbler, on both cards
+    expect(document.getElementById('listenbrainz-recommended')?.textContent).toMatch(/Recommended/);
+    expect(document.getElementById('lastfm-pro-note')?.textContent).toMatch(/Pro subscription/);
+  });
+
+  it('a working key shows no refusal, and Test asks again', async () => {
+    answers['/api/lastfm/configured'] = { configured: true, key_rejected: false, message: '' };
+    group();
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url === '/api/lastfm/configured')).toHaveLength(1),
+    );
+    expect(document.getElementById('lastfm-key-rejected')).toBeNull();
+    // the sheet's Test calls the card's own, which asks again afterwards
+    await act(async () => {
+      await serviceActions.get('music:lastfm')!.test!();
+    });
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url === '/api/lastfm/configured')).toHaveLength(2),
+    );
+  });
+
+  it('each card tests its service; the hidden row of six Test buttons and Expand All went', async () => {
+    group();
+    expect(document.querySelector('.api-test-buttons, .stg-accordion-toggle')).toBeNull();
+    await act(async () => {
+      await serviceActions.get('music:listenbrainz')!.test!();
+      await serviceActions.get('music:concerts')!.test!();
+    });
+    expect(shell.testConnection).toHaveBeenNthCalledWith(1, 'listenbrainz');
+    expect(shell.testConnection).toHaveBeenNthCalledWith(2, 'concerts');
+  });
+});

@@ -308,6 +308,78 @@ describe('library v2 album track table', () => {
     expect(await screen.findByText('Downloading 55%')).toBeInTheDocument();
   });
 
+  it('flames only the tracks the server marked popular (#2144)', async () => {
+    server.use(
+      http.get('/api/library/v2/albums/42', () =>
+        HttpResponse.json({
+          success: true,
+          album: album([
+            track({ id: 7, title: 'Back In Black', track_number: 6, popular: true }),
+            track({ id: 8, title: 'Shake a Leg', track_number: 9, popular: false }),
+            track({ id: 9, title: 'Have a Drink on Me', track_number: 8 }),
+          ]),
+        }),
+      ),
+      http.get('/api/library/v2/albums/42/match-status', () =>
+        HttpResponse.json({ success: true, album: [], tracks: {} }),
+      ),
+      http.get('/api/library/v2/quality-profiles', () =>
+        HttpResponse.json({ success: true, profiles: [] }),
+      ),
+      http.get('/api/library/v2/albums/42/queue-status', () =>
+        HttpResponse.json({ tracks: {}, albums: {} }),
+      ),
+    );
+
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AlbumTrackTable albumId={42} onAction={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    const marks = await screen.findAllByRole('img', { name: /most played tracks on this album/ });
+    expect(marks).toHaveLength(1);
+    expect(marks[0]).toHaveAttribute('title', expect.stringContaining('Last.fm'));
+    expect(marks[0].closest('tr')).toContainElement(screen.getByText('Back In Black'));
+  });
+
+  it('a flame ranked on ListenBrainz says so', async () => {
+    server.use(
+      http.get('/api/library/v2/albums/42', () =>
+        HttpResponse.json({
+          success: true,
+          album: album([
+            track({
+              id: 7,
+              title: 'Back In Black',
+              track_number: 6,
+              popular: true,
+              popular_source: 'listenbrainz',
+            }),
+          ]),
+        }),
+      ),
+      http.get('/api/library/v2/albums/42/match-status', () =>
+        HttpResponse.json({ success: true, album: [], tracks: {} }),
+      ),
+      http.get('/api/library/v2/quality-profiles', () =>
+        HttpResponse.json({ success: true, profiles: [] }),
+      ),
+      http.get('/api/library/v2/albums/42/queue-status', () =>
+        HttpResponse.json({ tracks: {}, albums: {} }),
+      ),
+    );
+
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AlbumTrackTable albumId={42} onAction={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    const mark = await screen.findByRole('img', { name: /most played tracks on this album/ });
+    expect(mark).toHaveAttribute('title', expect.stringContaining('ListenBrainz'));
+  });
+
   it('shows media-server recognition in its own column', async () => {
     server.use(
       http.get('/api/library/v2/albums/42', () =>
@@ -341,7 +413,8 @@ describe('library v2 album track table', () => {
 
     const recognition = await screen.findByLabelText('Recognised by Navidrome and Plex');
     expect(recognition).toHaveAttribute('title', 'Recognised by Navidrome and Plex');
-    expect(recognition).toHaveTextContent('✓2');
+    // one grouped mark in a table cell: both logos, one tick
+    expect(recognition.querySelectorAll('img')).toHaveLength(2);
     expect(screen.getByRole('columnheader', { name: 'Media server' })).toBeInTheDocument();
     expect(recognition.closest('td')).not.toContainElement(screen.getByText('Track Seven'));
     expect(screen.queryByText('Navidrome')).not.toBeInTheDocument();
@@ -379,7 +452,9 @@ describe('library v2 album track table', () => {
 
       const { container } = render(
         <QueryClientProvider client={createTestQueryClient()}>
-          <AlbumTrackTable albumId={42} onAction={vi.fn()} />
+          <LibraryV2CanWriteContext.Provider value>
+            <AlbumTrackTable albumId={42} onAction={vi.fn()} />
+          </LibraryV2CanWriteContext.Provider>
         </QueryClientProvider>,
       );
 
@@ -1024,12 +1099,12 @@ describe('library v2 album track table', () => {
     );
 
     await screen.findByRole('table');
-    const settings = screen.getByRole('button', {
+    const settings = screen.queryByRole('button', {
       name: 'View Settings',
     });
-    expect(settings).toBeDisabled();
+    // view settings write the shared layout: not offered read-only (#2210)
+    expect(settings).toBeNull();
     expect(screen.queryByRole('separator', { name: /Resize/ })).not.toBeInTheDocument();
-    fireEvent.click(settings);
     expect(writes).toBe(0);
   });
 

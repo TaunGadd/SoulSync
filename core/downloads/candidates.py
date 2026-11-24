@@ -109,19 +109,15 @@ def _preferred_version_hit(r):
     return 1 if getattr(r, 'preferred_version_hit', False) else 0
 
 
-# Streaming plugins identify themselves via ``TrackResult.username``. Soulseek
-# peers use the sharing username, so they are everything else. Keep this list
-# in sync with ``core.downloads.validation._STREAMING_USERNAMES`` — imported
-# lazily would cycle (validation → candidates).
 # Soulseek candidates whose confidence is within this of the band leader are
 # equally likely to be the right file; a normal pathname's noise (a year, a
 # format tag) moves the score more than this.
 _CONFIDENCE_BAND_WIDTH = 0.08
 
-_STREAMING_USERNAMES = frozenset({
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'soundcloud',
-    'amazon', 'torrent', 'usenet', 'lidarr',
-})
+# Streaming plugins identify themselves via ``TrackResult.username``. Soulseek
+# peers use the sharing username, so they are everything else. The set is
+# source_policy's, shared with validation, so the two can't drift again.
+from core.downloads.source_policy import STREAMING_SOURCE_NAMES as _STREAMING_USERNAMES  # noqa: E402
 
 
 def _candidate_source_name(r) -> str:
@@ -749,6 +745,8 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                     'total_discs': explicit_album.get('total_discs', 1),
                     'album_type': explicit_album.get('album_type', 'album'),
                     'album_type_locked': bool(explicit_album.get('album_type_locked')),
+                    # the release's runtime: $albumtype's store rule (5 tracks, 44 min is an album)
+                    'duration_ms': explicit_album.get('duration_ms') or 0,
                     'artists': explicit_album.get('artists', [{'name': spotify_artist_context.get('name', '')}]),
                     # #2068: the album's explicit flag, for $explicit in a folder.
                     # the batch works it out over every track (_album_explicit)
@@ -787,6 +785,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                     # that sent no type gets its album's real one (#1605)
                     'album_type': fallback_album.get('album_type') or None,
                     'album_type_locked': bool(fallback_album.get('album_type_locked')),
+                    'duration_ms': fallback_album.get('duration_ms') or 0,
                     'total_tracks': fallback_album.get('total_tracks', 0),
                     'total_discs': fallback_album.get('total_discs', 1),
                     'artists': _fallback_album_artists

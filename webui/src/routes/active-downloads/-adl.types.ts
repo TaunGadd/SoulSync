@@ -77,15 +77,24 @@ export interface AdlDownload {
   /** In-flight rows only — what the engine is doing right now (#1156). */
   live_detail?: AdlLiveDetail;
 
+  /**
+   * Live rows started by a quality upgrade: the file it replaces, as it is
+   * now (core/downloads/upgrade_rows.py). `label` is short, "MP3 320".
+   */
+  upgrade_of?: AdlUpgradeOf | null;
+
   /** The artist's photo from the library or watchlist (core/downloads/row_art.py). */
   artist_image?: string;
   /** History rows only: 'download' | 'podcast' (library_history.event_type). */
   event_type?: string;
   /** History rows only: what acoustid said about the file. */
   acoustid_result?: string;
-  /** History rows only: what we asked for, to show beside what we got. */
+  /** History rows only: what we asked for (the row's own title/artist). */
   expected_title?: string;
   expected_artist?: string;
+  /** History rows only: what the source handed over, to show beside the ask. */
+  got_title?: string;
+  got_artist?: string;
 }
 
 /**
@@ -270,6 +279,16 @@ export interface AdlQuarantineEntry {
   actual_length_s?: number | null;
 }
 
+/** the file a quality upgrade replaces, as it is now */
+export interface AdlUpgradeOf {
+  format?: string;
+  bitrate?: number | null;
+  bit_depth?: number | null;
+  sample_rate?: number | null;
+  label?: string;
+  lib2_track_id?: number;
+}
+
 // ── Filters ───────────────────────────────────────────────────────────────
 
 export const ADL_FILTERS = [
@@ -278,6 +297,8 @@ export const ADL_FILTERS = [
   { value: 'queued', label: 'Queued' },
   { value: 'completed', label: 'Completed' },
   { value: 'failed', label: 'Failed' },
+  // across every status: the rows replacing a file you already have
+  { value: 'upgrades', label: 'Upgrades' },
 ] as const;
 
 export type AdlFilter = (typeof ADL_FILTERS)[number]['value'] | 'unverified' | 'clients';
@@ -302,9 +323,13 @@ export interface ClientTorrentItem {
   content_path?: string | null;
   /** the client's own category (qbittorrent category, transmission/deluge label). */
   category?: string | null;
+  /** the tracker's host, never its announce url (#2123). */
+  tracker?: string | null;
+  /** the client has it stopped, even when state says completed (#2125). */
+  paused?: boolean;
   error?: string | null;
-  /** present when SoulSync itself dispatched this item. */
-  soulsync?: { kind?: string; title?: string };
+  /** present when SoulSync itself dispatched this item; indexer = the grab's indexer. */
+  soulsync?: { kind?: string; title?: string; indexer?: string };
 }
 
 export interface ClientUsenetItem {

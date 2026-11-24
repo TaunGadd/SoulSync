@@ -184,6 +184,9 @@ def safe_move_file(src, dst):
     """Atomically publish ``src`` at ``dst`` without pre-deleting ``dst``."""
     src = Path(src)
     dst = Path(dst)
+    # the folder watcher must not index a file before its own import records it
+    from core.library import own_writes
+    own_writes.note(src, dst)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -833,7 +836,7 @@ def downsample_hires_flac(final_path, context, enabled=None):
                 "-y", temp_path,
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=300,
         )
 
@@ -993,7 +996,7 @@ def create_lossy_copy(final_path, settings=None):
             "-map_metadata", "0",
         ] + extra_args + ["-y", out_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
 
         if result.returncode == 0:
             logger.info(f"[Lossy Copy] Created {quality_label} copy: {os.path.basename(out_path)}")

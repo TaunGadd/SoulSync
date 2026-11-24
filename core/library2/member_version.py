@@ -41,7 +41,8 @@ _WATCHED = (
     ("lib2_track_artists", "INSERT"),
     ("lib2_track_artists", "DELETE"),
     ("lib2_track_artists", "UPDATE"),
-    # the Artists index's release-artist arm (library_index_artist_ids_sql)
+    # the release-artist arm's joint-album claim can rest on a primary album
+    # credit (sql_util.co_lead_sql, #2142)
     ("lib2_album_artists", "INSERT"),
     ("lib2_album_artists", "DELETE"),
     ("lib2_album_artists", "UPDATE"),

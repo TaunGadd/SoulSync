@@ -1,6 +1,8 @@
 import { useNavigate } from '@tanstack/react-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { SoulseekLoginBanner } from '@/features/downloads/soulseek-login';
+
 import type { AdlBatch, AdlDeletedEntry, AdlDownload, AdlQuarantineEntry } from '../-adl.types';
 import type { ReviewActionHandlers } from './adl-review';
 
@@ -58,6 +60,7 @@ import {
   AdlUnverifiedRow,
 } from './adl-review';
 import { useReportActive } from './dl-header';
+import { useOpenRecycleBin } from './use-open-recycle-bin';
 
 const toast = (message: string, type: string) => window.showToast?.(message, type);
 
@@ -103,6 +106,11 @@ export function ActiveDownloadsPage() {
     };
   }, []);
   const reviewing = state.filter === 'unverified';
+  // #2128: the Library's recycle bin button: Review, then Deleted
+  useOpenRecycleBin(() => {
+    downloads.setFilter('unverified');
+    verification.setSubView('deleted');
+  });
 
   const refresh = useCallback(() => void downloads.refresh(), [downloads]);
   const refreshQuarantine = useCallback(
@@ -444,6 +452,8 @@ export function ActiveDownloadsPage() {
             onClearEverything={() => void onClearEverything()}
             cancelAllPending={cancelAllPending}
           />
+
+          <SoulseekLoginBanner />
 
           {state.filterBatchId ? (
             <BatchFilterBanner

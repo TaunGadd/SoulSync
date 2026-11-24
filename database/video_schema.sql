@@ -983,6 +983,18 @@ CREATE INDEX IF NOT EXISTS idx_vreq_profile ON video_requests(profile_id);
 CREATE INDEX IF NOT EXISTS idx_vreq_status  ON video_requests(status);
 CREATE INDEX IF NOT EXISTS idx_vreq_title   ON video_requests(kind, tmdb_id);
 
+-- every request a profile filed, kept when the request row is withdrawn or
+-- cleared from the history: the request limit counts asks from here, so
+-- deleting your own rows doesn't hand the asks back (v73)
+CREATE TABLE IF NOT EXISTS video_request_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id  INTEGER NOT NULL,
+    request_id  INTEGER UNIQUE,                  -- the video_requests row it was (gone or not)
+    kind        TEXT,                            -- movie | show | episode | youtube (v75)
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_vreq_log_profile ON video_request_log(profile_id, created_at);
+
 CREATE TABLE IF NOT EXISTS video_issues (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     profile_id     INTEGER NOT NULL DEFAULT 1,
@@ -1225,4 +1237,32 @@ CREATE TABLE IF NOT EXISTS video_title_freshness (
     source      TEXT NOT NULL,            -- server | metadata | ratings
     checked_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (kind, item_id, source)
+);
+
+-- ── Shelf Life ──
+-- the Shelf Life maintenance job's result per title: a 0-100 score (NULL when
+-- a gate protects the title), the gate, each signal's value and the reasons in
+-- plain words. rewritten for a kind on every run; the library and detail pages
+-- only read it, they never score.
+CREATE TABLE IF NOT EXISTS video_shelf_life (
+    kind TEXT NOT NULL,              -- movie | show
+    item_id INTEGER NOT NULL,        -- movies.id | shows.id
+    score INTEGER,
+    gate TEXT,
+    signals_json TEXT NOT NULL DEFAULT '{}',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    size_bytes INTEGER,
+    scored_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, item_id)
+);
+
+-- titles an admin marked Keep: Shelf Life never scores or flags them. keyed by
+-- tmdb id, not the row id, so a server re-key (a fresh row for the same title)
+-- doesn't drop the mark.
+CREATE TABLE IF NOT EXISTS video_shelf_life_keep (
+    kind TEXT NOT NULL,              -- movie | show
+    tmdb_id INTEGER NOT NULL,
+    set_by INTEGER,
+    set_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, tmdb_id)
 );

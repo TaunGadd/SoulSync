@@ -26,7 +26,8 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request, send_file
 
 from core.database_update_worker import DatabaseUpdateWorker
-from core.profile_context import admin_only
+from core.permissions import requires
+from core.profile_context import admin_only, is_admin_request
 from core.runtime_state import add_activity_item
 from utils.logging_config import get_logger
 
@@ -423,22 +424,27 @@ def _known_library_files(db):
     return known
 
 
-def _run_soulsync_full_refresh():
+def _run_soulsync_full_refresh(incremental=False):
     """Re-index the standalone output folder through the native import writer.
 
     This is an explicit local import/recovery operation, not a media-server
     sync.  It never clears catalogue rows or server mappings up front.
+
+    ``incremental`` indexes only the files the library doesn't know yet and
+    skips the re-read of every known file. it used to skip the run outright
+    and still say complete, so a file dropped in by hand never showed (#2111).
     """
+    label = "SoulSync Incremental Update" if incremental else "SoulSync Full Refresh"
     try:
         transfer_path = docker_resolve_path(config_manager.get('soulseek.transfer_path', './Transfer'))
         if not os.path.isdir(transfer_path):
-            _db_update_error_callback(f"Output folder not found: {transfer_path}")
+            _db_update_error_callback(f"Music library folder not found: {transfer_path}")
             return
 
-        logger.info("[SoulSync Full Refresh] Re-indexing local files: %s", transfer_path)
+        logger.info("[%s] Indexing local files: %s", label, transfer_path)
         db = get_database()
 
-        _db_update_phase_callback('Scanning output folder...')
+        _db_update_phase_callback('Scanning music library folder...')
         audio_exts = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
         audio_files = []
         for root, _dirs, files in os.walk(transfer_path):
@@ -450,7 +456,7 @@ def _run_soulsync_full_refresh():
         audio_files.sort()
 
         total = len(audio_files)
-        logger.info("[SoulSync Full Refresh] Found %d audio files", total)
+        logger.info("[%s] Found %d audio files", label, total)
         _db_update_phase_callback(f'Importing local index from {total} files...')
         successful = 0
         failed = 0
@@ -460,6 +466,7 @@ def _run_soulsync_full_refresh():
         # one album per performer). 3.6.1 rebuilt one row per file.
         known = _known_library_files(db)
         reactivated = kept = 0
+        new_file_ids = []
         from core.library2.autolink import link_download_into_library_v2
         for index, file_path in enumerate(audio_files, 1):
             existing = known.get(_file_key(file_path))
@@ -488,15 +495,28 @@ def _run_soulsync_full_refresh():
                 )
                 if file_id is None:
                     raise RuntimeError("native import returned no file row")
+                new_file_ids.append(int(file_id))
                 successful += 1
             except Exception as exc:
                 failed += 1
-                logger.error("[SoulSync Full Refresh] Could not import %s: %s", file_path, exc)
+                logger.error("[%s] Could not import %s: %s", label, file_path, exc)
             if index % 50 == 0:
                 _db_update_phase_callback(f'Importing local index... {index}/{total}')
 
-        logger.info("[SoulSync Full Refresh] %d already indexed, %d back from missing, %d new",
-                    kept, reactivated, successful - kept - reactivated)
+        logger.info("[%s] %d already indexed, %d back from missing, %d new",
+                    label, kept, reactivated, successful - kept - reactivated)
+
+        if incremental:
+            artist_count, album_count = _artist_album_counts(db, new_file_ids)
+            summary = (f"Incremental update complete: {len(new_file_ids)} new local tracks indexed, "
+                       f"{kept + reactivated} already in the library")
+            if failed > 0:
+                summary += f" ({failed} failed)"
+            logger.info("[%s] %s", label, summary)
+            add_activity_item("", label, summary, "Now")
+            _db_update_finished_callback(artist_count, album_count, len(new_file_ids),
+                                         successful, failed)
+            return
 
         # Existing rows that disappeared enter the normal two-scan missing
         # lifecycle.  They are never hard-deleted by this recovery scan.
@@ -527,23 +547,7 @@ def _run_soulsync_full_refresh():
             from core.library2.scan import rescan_files
             rescan_files(db, file_ids=scoped_file_ids)
 
-        artist_ids, album_ids = set(), set()
-        with db._get_connection() as conn:
-            for start in range(0, len(scoped_file_ids), 500):
-                chunk = scoped_file_ids[start:start + 500]
-                marks = ",".join("?" for _ in chunk)
-                for row in conn.execute(
-                    f"""SELECT ar.id,al.id
-                           FROM lib2_track_files f
-                           JOIN lib2_tracks t ON t.id=f.track_id
-                           JOIN lib2_albums al ON al.id=t.album_id
-                           JOIN lib2_artists ar ON ar.id=al.primary_artist_id
-                          WHERE f.id IN ({marks})""",
-                    chunk,
-                ):
-                    artist_ids.add(int(row[0]))
-                    album_ids.add(int(row[1]))
-        artist_count, album_count = len(artist_ids), len(album_ids)
+        artist_count, album_count = _artist_album_counts(db, scoped_file_ids)
         summary = (f"Full refresh complete: {successful} local tracks indexed "
                    f"from {album_count} albums by {artist_count} artists")
         if failed > 0:
@@ -553,10 +557,31 @@ def _run_soulsync_full_refresh():
         _db_update_finished_callback(artist_count, album_count, total, successful, failed)
 
     except Exception as e:
-        logger.error(f"[SoulSync Full Refresh] {e}")
+        logger.error(f"[{label}] {e}")
         import traceback
         traceback.print_exc()
-        _db_update_error_callback(f"Full refresh failed: {e}")
+        _db_update_error_callback(f"{'Incremental update' if incremental else 'Full refresh'} failed: {e}")
+
+
+def _artist_album_counts(db, file_ids):
+    """(artists, albums) the given file rows belong to."""
+    artist_ids, album_ids = set(), set()
+    with db._get_connection() as conn:
+        for start in range(0, len(file_ids), 500):
+            chunk = file_ids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"""SELECT ar.id,al.id
+                       FROM lib2_track_files f
+                       JOIN lib2_tracks t ON t.id=f.track_id
+                       JOIN lib2_albums al ON al.id=t.album_id
+                       JOIN lib2_artists ar ON ar.id=al.primary_artist_id
+                      WHERE f.id IN ({marks})""",
+                chunk,
+            ):
+                artist_ids.add(int(row[0]))
+                album_ids.add(int(row[1]))
+    return len(artist_ids), len(album_ids)
 
 
 def _run_soulsync_deep_scan():
@@ -573,10 +598,10 @@ def _run_soulsync_deep_scan():
         staging_path = docker_resolve_path(config_manager.get('import.staging_path', './Staging'))
 
         if not os.path.isdir(transfer_path):
-            _db_update_error_callback(f"Output folder not found: {transfer_path}")
+            _db_update_error_callback(f"Music library folder not found: {transfer_path}")
             return
 
-        logger.info(f"[SoulSync Deep Scan] Starting — Transfer: {transfer_path}")
+        logger.info(f"[SoulSync Deep Scan] Starting — music library folder: {transfer_path}")
         _db_update_phase_callback('scanning')
 
         # Phase 1: Collect all audio files in Transfer
@@ -587,7 +612,7 @@ def _run_soulsync_deep_scan():
                 if os.path.splitext(filename)[1].lower() in audio_extensions:
                     transfer_files.add(os.path.realpath(os.path.join(root, filename)))
 
-        logger.info(f"[SoulSync Deep Scan] Found {len(transfer_files)} audio files in Transfer")
+        logger.info(f"[SoulSync Deep Scan] Found {len(transfer_files)} audio files in the music library folder")
 
         # Phase 2: Get all imported file rows that resolve inside Transfer.
         # Entity server_source is deliberately irrelevant: standalone/import
@@ -882,6 +907,15 @@ def _post_scan_hook_with_own_libraries(server_type, deep):
         _run_own_library_scans(server_type, deep)
         if _reconcile_after_scan:
             _reconcile_after_scan(worker)
+        # a file that moved to another row of its album leaves its old row
+        # behind with no file, and only a scan sees that happen (#2094)
+        if getattr(worker, 'database', None) is not None:
+            _db_update_phase_callback("Finishing up: folding leftover track rows...")
+            from core.library2.dedup_repair import fold_leftovers_after_scan
+            fold_leftovers_after_scan(worker.database)
+            # albums of one name a scan merged into one row (#2110)
+            from core.library2.release_split import split_same_named_after_scan
+            split_same_named_after_scan(worker.database)
     return hook
 
 
@@ -901,6 +935,15 @@ def _capture_task_epoch(run_epoch):
         )
 
 
+def _scan_media_client(server_type):
+    """The client a scan reads, by the server's registered name. a list of
+    plex, jellyfin and navidrome here left music assistant out, so every
+    scan of it failed with "not available" (#2111)."""
+    if not server_type or media_server_engine is None:
+        return None
+    return media_server_engine.client(server_type)
+
+
 def _run_db_update_task(full_refresh, server_type, run_epoch=None):
     """The actual function that runs in the background thread.
 
@@ -915,23 +958,10 @@ def _run_db_update_task(full_refresh, server_type, run_epoch=None):
 
     # SoulSync standalone
     if server_type == "soulsync":
-        if full_refresh:
-            _run_soulsync_full_refresh()
-        else:
-            # Incremental: library updates at download/import time, nothing to do
-            logger.warning("[SoulSync Standalone] Incremental scan skipped — library updates at download time. Use Deep Scan or Full Refresh.")
-            _db_update_finished_callback(0, 0, 0, 0, 0)
+        _run_soulsync_full_refresh(incremental=not full_refresh)
         return
 
-    media_client = None
-
-    if server_type == "plex":
-        media_client = media_server_engine.client('plex')
-    elif server_type == "jellyfin":
-        media_client = media_server_engine.client('jellyfin')
-    elif server_type == "navidrome":
-        media_client = media_server_engine.client('navidrome')
-
+    media_client = _scan_media_client(server_type)
     if not media_client:
         _db_update_error_callback(f"Media client for '{server_type}' not available.")
         return
@@ -980,20 +1010,13 @@ def _run_deep_scan_task(server_type, run_epoch=None):
 
     _capture_task_epoch(run_epoch)
 
-    media_client = None
-
-    if server_type == "plex":
-        media_client = media_server_engine.client('plex')
-    elif server_type == "jellyfin":
-        media_client = media_server_engine.client('jellyfin')
-    elif server_type == "navidrome":
-        media_client = media_server_engine.client('navidrome')
-    elif server_type == "soulsync":
+    if server_type == "soulsync":
         # SoulSync standalone deep scan: find untracked files → move to Staging,
         # remove stale DB records where files no longer exist on disk
         _run_soulsync_deep_scan()
         return
 
+    media_client = _scan_media_client(server_type)
     if not media_client:
         _db_update_error_callback(f"Media client for '{server_type}' not available.")
         return
@@ -1028,13 +1051,24 @@ def _run_deep_scan_task(server_type, run_epoch=None):
     db_update_worker.run_deep_scan()
 
 
+# what a member gets from /api/database/stats (#2207): how big their
+# library is. the database's size and path, the server and the scan times
+# are the admin's
+MEMBER_DB_STATS_KEYS = ('artists', 'albums', 'tracks')
+
+
 @bp.route('/api/database/stats', methods=['GET'])
+@requires("music.access")
 def get_database_stats():
     """Endpoint to get current database statistics."""
     try:
         # This endpoint returns the same stats shape the UI expects.
         db = get_database()
+        # read in the caller's library scope, so a member's counts are the
+        # library they browse
         stats = db.get_database_info_for_server()
+        if not is_admin_request():
+            stats = {k: stats.get(k, 0) for k in MEMBER_DB_STATS_KEYS}
         return jsonify(stats)
     except Exception as e:
         logger.error(f"Error getting database stats: {e}")
@@ -1083,6 +1117,7 @@ def start_database_update():
     return jsonify({"success": True, "message": "Database update started."})
 
 @bp.route('/api/database/update/status', methods=['GET'])
+@admin_only
 def get_database_update_status():
     """Endpoint to poll for the current update status."""
     _check_db_update_stall()  # self-heal a hung job before reporting (#859)
@@ -1357,6 +1392,7 @@ def download_backup_endpoint(filename):
 # ===============================
 
 @bp.route('/api/database/maintenance/info', methods=['GET'])
+@admin_only
 def database_maintenance_info():
     """Get database size, free pages, and auto_vacuum mode."""
     try:
@@ -1374,8 +1410,25 @@ def database_maintenance_info():
         free_bytes = free_pages * page_size
         auto_vacuum_labels = {0: 'None', 1: 'Full', 2: 'Incremental'}
 
+        from core import db_housekeeping
+        from database.music_database import DB_CACHE_MB, DB_JOURNAL_SIZE_LIMIT_MB, DB_MMAP_MB
+        wal_bytes = db_housekeeping.wal_size(db_path)
+        try:
+            free_disk = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path))).free
+        except OSError:
+            free_disk = None
+
         return jsonify({
             'success': True,
+            'wal_size': wal_bytes,
+            'wal_size_display': f'{wal_bytes / 1024 / 1024:.1f} MB',
+            'free_disk': free_disk,
+            # VACUUM writes a whole new copy before it swaps it in
+            'vacuum_needs': total_bytes,
+            'vacuum_has_room': free_disk is None or free_disk > total_bytes * 1.1,
+            'tuning': {'cache_mb': DB_CACHE_MB, 'wal_limit_mb': DB_JOURNAL_SIZE_LIMIT_MB,
+                       'mmap_mb': DB_MMAP_MB,
+                       'checkpoint_minutes': db_housekeeping.CHECKPOINT_MINUTES},
             'total_size': total_bytes,
             'total_size_display': f'{total_bytes / 1024 / 1024:.1f} MB',
             'free_pages': free_pages,
@@ -1412,6 +1465,21 @@ def database_vacuum():
 
         # Get size before
         size_before = os.path.getsize(db_path)
+
+        # VACUUM builds a full copy of the database before it replaces the
+        # original: without room for it, it fails part way after a long wait
+        body = request.get_json(silent=True) or {}
+        try:
+            free_disk = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path))).free
+        except OSError:
+            free_disk = None
+        if free_disk is not None and free_disk < size_before * 1.1 and not body.get('force'):
+            return jsonify({
+                'success': False,
+                'error': (f'not enough free disk space to compact: VACUUM needs about '
+                          f'{size_before / 1024 / 1024 / 1024:.1f} GB free next to the database, '
+                          f'there is {free_disk / 1024 / 1024 / 1024:.1f} GB'),
+            }), 409
 
         conn = sqlite3.connect(db_path)
         start = time.time()
@@ -1476,4 +1544,60 @@ def enable_incremental_vacuum():
         })
     except Exception as e:
         logger.error(f"Failed to enable incremental vacuum: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/database/maintenance/tables', methods=['GET'])
+@admin_only
+def database_table_sizes():
+    """what is taking the room (#2205). sizes come from a measuring pass that
+    reads every page, so it runs on its own thread: ``?measure=1`` starts it,
+    and this returns the last result plus the planner's row estimates now."""
+    try:
+        from core import db_housekeeping
+        db_path = os.environ.get('DATABASE_PATH', 'database/music_library.db')
+        started = False
+        if request.args.get('measure') in ('1', 'true', 'yes'):
+            started = db_housekeeping.start_measure(db_path)
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            # row estimates only: dbstat here would read the whole file inline
+            estimates = db_housekeeping.table_sizes(conn, use_dbstat=False)
+        finally:
+            conn.close()
+        state = db_housekeeping.measure_state()
+        return jsonify({'success': True, 'started': started, 'measure': state,
+                        'estimates': estimates.get('tables', [])})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/database/maintenance/optimize', methods=['POST'])
+@admin_only
+def database_optimize():
+    """the safe tidy-up, no VACUUM: prune the caches and logs that keep their
+    own retention, merge the search indexes, refresh planner stats, and fold
+    the wal back in. it never deletes listening history or library rows."""
+    try:
+        from core import db_housekeeping
+        db_path = os.environ.get('DATABASE_PATH', 'database/music_library.db')
+        start = time.time()
+        conn = sqlite3.connect(db_path, timeout=30)
+        try:
+            conn.execute('PRAGMA busy_timeout = 30000')
+            pruned = db_housekeeping.prune(conn)
+            optimized = db_housekeeping.optimize(conn)
+        finally:
+            conn.close()
+        wal = db_housekeeping.checkpoint(db_path, truncate_over=0)
+        elapsed = time.time() - start
+        logger.info("database optimize: pruned %s, fts %s, wal %.1f -> %.1f MB in %.1fs",
+                    pruned, optimized.get('fts_optimized'), wal['wal_before'] / 1e6,
+                    wal['wal_after'] / 1e6, elapsed)
+        return jsonify({'success': True, 'pruned': pruned, 'elapsed_seconds': round(elapsed, 1),
+                        'fts_optimized': optimized.get('fts_optimized', []),
+                        'wal_before': wal['wal_before'], 'wal_after': wal['wal_after'],
+                        'wal_busy': bool(wal.get('busy'))})
+    except Exception as e:
+        logger.error(f"Database optimize failed: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500

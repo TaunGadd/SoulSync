@@ -13,6 +13,7 @@ import {
   liveDetailLines,
   statusClass,
   statusLabel,
+  upgradeLine,
   verificationHistoryId,
 } from '../-adl.helpers';
 import { unverifiedAudit, unverifiedPlay } from '../-adl.verif-actions';
@@ -209,9 +210,10 @@ function sheetFacts(dl: AdlDownload, detail: AdlTaskDetail | null, compact: bool
       ? `track ${dl.batch_position} of ${dl.batch_total}`
       : '';
   const file = dl.file_path || detail?.file_path || d?.filename || '';
-  const asked = dl.expected_title || detail?.expected?.title || '';
-  const askedArtist = dl.expected_artist || detail?.expected?.artist || '';
-  const got = detail?.downloaded?.title || dl.title;
+  // the row's title is the ask. what the source handed over rides beside it.
+  const asked = dl.expected_title || detail?.expected?.title || dl.title || '';
+  const got = dl.got_title || detail?.downloaded?.title || '';
+  const gotArtist = dl.got_artist || detail?.downloaded?.artist || '';
   return [
     ['Source', source ? `${source}${peer}` : ''],
     [
@@ -230,9 +232,9 @@ function sheetFacts(dl: AdlDownload, detail: AdlTaskDetail | null, compact: bool
     ],
     // only worth a line when the file we got isn't the one we asked for
     [
-      'Asked for',
-      asked && asked.toLowerCase() !== String(got || '').toLowerCase()
-        ? [askedArtist, asked].filter(Boolean).join(' · ')
+      'Got',
+      got && got.trim().toLowerCase() !== asked.trim().toLowerCase()
+        ? [gotArtist, got].filter(Boolean).join(' · ')
         : '',
     ],
     ['File', file, { mono: true, copy: file || undefined }],
@@ -341,6 +343,7 @@ export function AdlRow({
   const speed = downloading ? formatSpeed(dl.live_detail?.speed) : '';
   const eta = downloading ? transferEta(dl) : '';
   const sub = subLine(dl, Boolean(compact));
+  const upgrade = upgradeLine(dl);
   const tag = dl.status === 'completed' ? formatTag(dl.quality) : '';
   const when =
     dl.status === 'completed'
@@ -435,6 +438,15 @@ export function AdlRow({
         </div>
 
         <div className="dlc-meta">
+          {upgrade ? (
+            <span
+              className="dlc-tag"
+              data-upgrade="true"
+              title="A quality upgrade: replaces the file you already have once this one verifies"
+            >
+              {upgrade}
+            </span>
+          ) : null}
           <RetryTag dl={dl} />
           {downloading ? (
             <>

@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { HTTPError } from 'ky';
 import { useEffect, useState, type ReactNode } from 'react';
 
 import type {
@@ -12,6 +13,7 @@ import {
   fetchLibraryV2ReorganizeQueueSnapshot,
   LIBRARY_V2_QUERY_KEY,
   previewLibraryV2AlbumReorganize,
+  RENAME_CHECK_QUERY_KEY,
 } from '../-library-v2.api';
 import { FilePathCellBody } from './file-path-cell';
 import styles from './library-v2-page.module.css';
@@ -57,6 +59,21 @@ function useReorganizeQueueItem(queueId: string | null): LibraryV2ReorganizeQueu
   }, [queueId]);
 
   return item;
+}
+
+type PreviewTrack = LibraryV2ReorganizeTrackPreview & { release_title?: string };
+
+/** #2194: a release with nothing left to plan (removed, or its files gone
+ *  since the page loaded) answers 404. In the all-releases scope that one
+ *  release is passed over and named, instead of failing every other one. */
+function releaseIsGone(error: unknown): boolean {
+  return error instanceof HTTPError && error.response.status === 404;
+}
+
+/** a release's files of its own: tracks_present also counts audio held under
+ *  another release, which renaming this one can't move */
+function releaseFiles(album: { tracks_present: number; own_files_present?: number }): number {
+  return album.own_files_present ?? album.tracks_present;
 }
 
 /** Compact status line for a polled queue item — queued/running/done/failed. */
@@ -129,6 +146,14 @@ export function AlbumReorganizeModal({
     watchingBulk,
   );
 
+  // #2141: the artist page's "to rename" counts are stale once files moved
+  const finished =
+    queueItem?.status === 'done' ||
+    (watchingBulk && bulkProgress !== null && !bulkProgress.running && bulkProgress.queued === 0);
+  useEffect(() => {
+    if (finished) void queryClient.invalidateQueries({ queryKey: RENAME_CHECK_QUERY_KEY });
+  }, [finished, queryClient]);
+
   // The plan is computed from the catalogue, so it does not vary by source or
   // mode and the query key has nothing else to depend on.
   const previewQuery = useQuery({
@@ -140,23 +165,30 @@ export function AlbumReorganizeModal({
           allReleases.albums.map((a) => a.id),
         ]
       : [...LIBRARY_V2_QUERY_KEY, 'reorganize-preview', albumId],
-    queryFn: async () => {
+    queryFn: async (): Promise<{ tracks: PreviewTrack[]; skipped?: string[] }> => {
       if (!allReleases) return previewLibraryV2AlbumReorganize(albumId, {});
-      const tracks: Array<LibraryV2ReorganizeTrackPreview & { release_title?: string }> = [];
+      const tracks: PreviewTrack[] = [];
+      const skipped: string[] = [];
       // Bound file-reading work while loading every release in the selected scope.
       for (let offset = 0; offset < allReleases.albums.length; offset += 4) {
         const batch = await Promise.all(
           allReleases.albums.slice(offset, offset + 4).map(async (album) => {
-            const preview = await queryClient.fetchQuery({
-              queryKey: [...LIBRARY_V2_QUERY_KEY, 'reorganize-preview', album.id],
-              queryFn: () => previewLibraryV2AlbumReorganize(album.id, {}),
-            });
-            return preview.tracks.map((track) => ({ ...track, release_title: album.title }));
+            try {
+              const preview = await queryClient.fetchQuery({
+                queryKey: [...LIBRARY_V2_QUERY_KEY, 'reorganize-preview', album.id],
+                queryFn: () => previewLibraryV2AlbumReorganize(album.id, {}),
+              });
+              return preview.tracks.map((track) => ({ ...track, release_title: album.title }));
+            } catch (caught) {
+              if (!releaseIsGone(caught)) throw caught;
+              skipped.push(album.title);
+              return [];
+            }
           }),
         );
         tracks.push(...batch.flat());
       }
-      return { tracks };
+      return { tracks, skipped };
     },
   });
 
@@ -192,8 +224,8 @@ export function AlbumReorganizeModal({
   }
 
   const applied = queueId !== null || notQueuedReason !== null || bulkResult !== null;
-  const tracks: Array<LibraryV2ReorganizeTrackPreview & { release_title?: string }> =
-    previewQuery.data?.tracks ?? [];
+  const tracks: PreviewTrack[] = previewQuery.data?.tracks ?? [];
+  const skippedReleases = previewQuery.data?.skipped ?? [];
   const moving = tracks.filter(
     (t) => t.matched && !t.unchanged && !t.collision && Boolean(t.new_path_abs || t.new_path),
   );
@@ -262,6 +294,13 @@ export function AlbumReorganizeModal({
         </div>
       ) : null}
       {error ? <div className={styles.searchError}>{error}</div> : null}
+      {skippedReleases.length ? (
+        <div className={styles.previewQuiet}>
+          Skipped{' '}
+          {skippedReleases.length === 1 ? 'a release' : `${skippedReleases.length} releases`} with
+          no files left to rename: {skippedReleases.join(', ')}
+        </div>
+      ) : null}
 
       <div className={styles.resultsWrap}>
         {previewQuery.isLoading ? (
@@ -374,7 +413,7 @@ export function ArtistReorganizeAllModal({
   albums = [],
 }: {
   artistId: number;
-  albums?: Array<{ id: number; title: string; tracks_present: number }>;
+  albums?: Array<{ id: number; title: string; tracks_present: number; own_files_present?: number }>;
   artistName: string;
   /** Dismiss the tool entirely. Always what the dialog's ✕ does. */
   onClose: () => void;
@@ -388,8 +427,12 @@ export function ArtistReorganizeAllModal({
   const [result, setResult] = useState<string | null>(null);
   const [watching, setWatching] = useState(false);
   const [previewAlbum, setPreviewAlbum] = useState<{ id: number; title: string } | null>(null);
-  const releasesWithFiles = albums.filter((a) => a.tracks_present > 0);
+  const releasesWithFiles = albums.filter((a) => releaseFiles(a) > 0);
   const progress = useArtistReorganizeQueueProgress(artistName, watching);
+  const finished = watching && progress !== null && !progress.running && progress.queued === 0;
+  useEffect(() => {
+    if (finished) void queryClient.invalidateQueries({ queryKey: RENAME_CHECK_QUERY_KEY });
+  }, [finished, queryClient]);
 
   async function apply() {
     setBusy(true);
@@ -450,9 +493,7 @@ export function ArtistReorganizeAllModal({
             <div key={album.id} className={styles.reorganizeRelease}>
               <div>
                 <strong>{album.title}</strong>
-                <span className={styles.previewQuiet}>
-                  {album.tracks_present} tracks with files
-                </span>
+                <span className={styles.previewQuiet}>{releaseFiles(album)} tracks with files</span>
               </div>
               <button
                 type="button"
@@ -505,10 +546,15 @@ export function ArtistRenamePreviewModal({
 }: {
   artistId: number;
   artistName: string;
-  albums: Array<{ id: number; title: string; tracks_present: number }>;
+  albums: Array<{
+    id: number;
+    title: string;
+    tracks_present: number;
+    own_files_present?: number;
+  }>;
   onClose: () => void;
 }) {
-  const releases = albums.filter((album) => album.tracks_present > 0);
+  const releases = albums.filter((album) => releaseFiles(album) > 0);
   const [selectedId, setSelectedId] = useState('all');
   const selected = releases.find((album) => String(album.id) === selectedId);
   if (!releases.length)
@@ -536,8 +582,7 @@ export function ArtistRenamePreviewModal({
             <option value="all">All releases · {releases.length} releases</option>
             {releases.map((album) => (
               <option key={album.id} value={album.id}>
-                {album.title} · {album.tracks_present}{' '}
-                {album.tracks_present === 1 ? 'file' : 'files'}
+                {album.title} · {releaseFiles(album)} {releaseFiles(album) === 1 ? 'file' : 'files'}
               </option>
             ))}
           </select>

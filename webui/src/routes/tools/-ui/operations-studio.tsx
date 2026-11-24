@@ -226,12 +226,13 @@ export const VIDEO_PILLARS: readonly StrategicPillar[] = [
     glow: '56, 189, 248',
     tagline: 'Broken files, extra copies, names and disk you could reclaim',
     description:
-      'Finds truncated or stub files, titles you own twice, file names that drift from your templates, watched movies taking up disk, and YouTube downloads whose file is gone.',
+      'Finds truncated or stub files, titles you own twice, file names that drift from your templates, watched movies taking up disk, the titles that have earned their space least, and YouTube downloads whose file is gone.',
     jobIds: [
       'broken_files',
       'duplicate_movies',
       'naming_conformance',
       'watched_cleanup',
+      'shelf_life',
       'youtube_ghosts',
     ],
     findingTypes: [
@@ -239,7 +240,9 @@ export const VIDEO_PILLARS: readonly StrategicPillar[] = [
       'duplicate_movie',
       'duplicate_episode',
       'naming_mismatch',
+      'naming_id_missing',
       'watched_cleanup',
+      'shelf_life',
       'youtube_ghost',
       'youtube_mass_missing',
     ],
@@ -622,7 +625,8 @@ export function OperationsStudio({
         <div className="tools-section-head">
           <h3 className="tools-section-title">Areas</h3>
           <span className="tools-section-blurb">
-            The jobs grouped by what they look after. Put an area on its schedule, or check it now.
+            The jobs grouped by what they look after. Put an area on its schedule, or run all of its
+            jobs now, scheduled or not.
           </span>
         </div>
 
@@ -730,7 +734,7 @@ export function OperationsStudio({
                   className="operations-pillar-scan-btn"
                   disabled={isRunning}
                   onClick={() => void handlePillarScan(pillar)}
-                  title={`Check ${pillar.title} now`}
+                  title={`Run every job in ${pillar.title} now, scheduled or not`}
                 >
                   {isRunning ? 'Checking…' : 'Check now'}
                 </button>

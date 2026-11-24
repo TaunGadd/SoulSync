@@ -1,15 +1,19 @@
-**SoulSync 3.6.6 is out** :musical_note:
+**SoulSync 3.6.9 is out** :musical_note:
 
-The video library is now a full library manager. The Library page shows your movies and shows as posters, as a sortable table of titles, or as a table of the files themselves, with filters for what needs a look and for what the files are. You can act on a selection or on everything a filter matches: rename with a preview, move to another drive or library, set a quality profile, look for upgrades, fetch subtitles and more. Every rename, move and delete is recorded and can be undone, and a padlock keeps automation away from a title you have finished curating.
+**Heads up.** The auth proxy header is now ignored until you add your proxy's address under Settings > System > Security > Trusted proxy addresses. Until then people get the PIN screen.
 
-Movie and show pages now manage their own seasons, episodes and files: rename, renumber and delete with a preview, stop hunting single episodes, and undo any change from the page. Pages also keep themselves current, checking your media server, the metadata provider and ratings in the background when they have gone stale.
+**The player.** Open the player from the sidebar and everything you own plays in one full-screen app: music, movies, TV, YouTube, audiobooks and podcasts. A home each profile arranges, a TV guide of channels made from your library, SoulSync's own playlists with Get what you don't have, transcoding for files a browser can't play, synced lyrics, watching now and a watchlist.
 
-It is fast. On a large library the Files view went from several seconds a page to instant.
+**Settings, rebuilt.** Nine tabs with pills, side sheets for every source and service, one search over every label, and a save status that says what's holding a save.
 
-Server Activity now shows album and book covers for music and audiobooks (thanks SeadogsBooty, #2089), and its drawer no longer sits under the floating buttons (#2090).
+**Music apps.** Any Subsonic or OpenSubsonic app can play from SoulSync as one profile, with conversion for mobile data. Pair it from the new Settings > Devices.
 
-Thanks to onnwee for two contributions: cam releases are caught however they are spelled (#2088), and a new setting starts SoulSync's torrents on a qBittorrent that adds them stopped (#2087).
+**Folder watching.** Off by default. Turn it on in Settings > Library > Folders: local disks are watched live, network shares on a timer.
 
-Also: live albums and live tracks are separate rules (#2082), original release and clean version filters (#2080, #2081), Albums You're Missing no longer lists albums you own (#2083), dead file rows can be removed (thanks wolf39us, #2086), Discogs artist images download again (thanks Ktzenjammer, #2079), anime numbered as one long season is handled (thanks Thibs), one shared page frame across the app, a security pass, MetaSync pairing now gives the node a read-only key (#2099), and a lighter sidebar and player on phones.
+**Library and listening.** A coverage check for your media server's folders, Spotify history import, your own plays on every artist page, a full Discover for new profiles, Your Year extras, blends that need consent and filled tags.
+
+**Downloads.** Downloads wait out a lost Soulseek login, near-misses clear themselves, and Lidarr gets album requests as one album (thanks savemosca, #2219, #2225, #2226).
+
+**Fixes.** Releases stay whole under their first artist (thanks Ericsson, #2239, #2240), manual search for TV shows (thanks Thibs, #2233), the move a track dialog (thanks Vidariondr, #2241), dead files and playlist readback (thanks carlosjfcasero), the download chain and streaming imports (thanks PfannkuchenWolf), Greek and Cyrillic names (thanks selimovd), big wishlists (thanks xcrittpm), and more. First loads are about 3 MB instead of 16.
 
 Full notes on GitHub.

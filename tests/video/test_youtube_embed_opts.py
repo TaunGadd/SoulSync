@@ -15,8 +15,11 @@ from core.video.youtube_download import media_embed_opts, ydl_download_opts
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 _YTD = (_ROOT / "core" / "video" / "youtube_download.py").read_text(encoding="utf-8")
-_SETTINGS_JS = (_ROOT / "webui" / "static" / "video" / "video-settings.js").read_text(encoding="utf-8")
 _INDEX = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
+_TABS = _ROOT / "webui" / "src" / "features" / "settings" / "tabs"
+# the Organization card's Video panel is React (SETTINGS_PORT.md video pass V2b)
+_PANEL = (_TABS / "library-video-organization.tsx").read_text(encoding="utf-8")
+_ORG = (_TABS / "video-organization.ts").read_text(encoding="utf-8")
 
 
 def _keys(pps):
@@ -73,6 +76,11 @@ def test_worker_plumbs_the_settings_into_every_download():
 
 
 def test_settings_ui_has_the_fields():
-    for frag in ("vo-sponsorblock", "vo-yt-subs", "youtube_sponsorblock", "youtube_embed_subs"):
-        assert frag in _SETTINGS_JS, frag
-    assert 'id="vo-sponsorblock"' in _INDEX and 'id="vo-yt-subs"' in _INDEX
+    for frag in ("youtube_sponsorblock: s('youtube_sponsorblock')", "youtube_embed_subs: b('youtube_embed_subs')"):
+        assert frag in _ORG, frag
+    # Quality > YouTube draws them (settings-bic phase 4, DESIGN 3.3): what a
+    # YouTube file contains
+    assert "onChange={(value) => save('youtube_sponsorblock', value)}" in _PANEL
+    assert 'id="vo-yt-subs"\n          field="youtube_embed_subs"' in _PANEL
+    quality = (_TABS / "quality" / "quality-page.tsx").read_text(encoding="utf-8")
+    assert "<YoutubeFileOptions />" in quality

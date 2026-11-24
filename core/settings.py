@@ -109,6 +109,7 @@ class ConfigManager:
         # Download sources
         'soulseek.api_key',
         'deezer_download.arl',
+        'soundcloud_download.oauth_token',
         'lidarr_download.api_key',
         'prowlarr.api_key',
         'torrent_client.password',
@@ -563,6 +564,11 @@ class ConfigManager:
                 # speed. Opt in explicitly; 0 also disables fallback.
                 "observed_speed_fallback_enabled": False,
                 "min_observed_download_speed_kbps": 250,
+                # slskd logged out of the Soulseek server (a ban, a reconnect):
+                # Soulseek downloads wait this long for the login without
+                # spending retries, then move on to the next source
+                # (core/soulseek_session.py). 0 = never wait.
+                "login_wait_minutes": 45,
                 "download_timeout": 600,
                 # Reddit report (YeloMelo95, Bell Canada): the existing
                 # 35-per-220s sliding-window cap allows all 35 searches in
@@ -649,6 +655,11 @@ class ConfigManager:
                 # engine off while existing configs got it on. CI caught the
                 # split: its fresh default config failed all 7 requeue tests).
                 "retry_next_candidate_on_mismatch": True,
+                # a track that imports clears the near-misses it quarantined
+                # on the way (to the recycle bin, restorable); and Review
+                # items older than N days go there too (0 = keep them)
+                "clear_near_misses_on_success": True,
+                "review_auto_reject_days": 0,
                 # Opt-in exhaustive retry: budget retries PER SOURCE so every
                 # source (Soulseek, then HiFi/Tidal/…) gets its own attempts
                 # before the track gives up. Default off (single global cap).
@@ -698,6 +709,15 @@ class ConfigManager:
                 "enabled": False,
                 "profile_id": 1,
             },
+            # soulsync answering as seerr for video request apps (#2151). off
+            # by default. a missing or unknown X-Api-User is refused on a new
+            # install (#2166); an install from before has no refuse_unknown
+            # key and keeps acting as profile_id until the admin switches it
+            "seerr_compat": {
+                "enabled": False,
+                "profile_id": 1,
+                "refuse_unknown": True,
+            },
             # ai clients over /mcp, with an api key. off by default
             "mcp": {
                 "enabled": False,
@@ -708,6 +728,19 @@ class ConfigManager:
                 "root_folder": "",
                 "quality_profile": "Any",
                 "cleanup_after_import": True,
+                # The download dialogs' "Whole album via Lidarr" toggle starts
+                # on; automatic (wishlist) downloads use this value too. Off,
+                # Lidarr is skipped and the next hybrid source is used.
+                "whole_album_default": True,
+                # Where Lidarr-sourced tracks are imported. Lidarr already put
+                # the album in its own root folder, so a copy in the library
+                # would be a duplicate; empty = the shared transfer folder.
+                "transfer_path": "",
+                # Where the Lidarr source copies a track out of Lidarr's import;
+                # empty = soulseek.download_path.
+                "download_path": "",
+                # Seconds to wait for a grabbed album to finish importing.
+                "download_timeout": 21600,
             },
             # Prowlarr — indexer aggregator. Feeds the torrent / usenet
             # download plugins. Not a standalone source.
@@ -787,11 +820,11 @@ class ConfigManager:
                 "remove_completed": "off",
             },
             "soundcloud_download": {
-                # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
-                # added later, with credentials living under a "session" subkey
-                # alongside Tidal/Qobuz. No quality knob: anonymous SoundCloud
-                # caps at the upload's transcoding (typically 128 kbps MP3 or
-                # AAC). yt-dlp resolves bestaudio at download time.
+                # a free account's oauth_token cookie. with it, a track whose
+                # uploader turned on the free download comes as the original
+                # file instead of the ~128 kbps stream (#2116). empty stays
+                # anonymous. never go+, that needs a paid account.
+                "oauth_token": "",
             },
             "listenbrainz": {
                 "base_url": "",
@@ -860,6 +893,9 @@ class ConfigManager:
             "metadata_enhancement": {
                 "enabled": True,
                 "embed_album_art": True,
+                # the player saves an LRClib hit beside a library song as a
+                # .lrc / .txt (core.lyrics_local), never over an existing one
+                "lrclib_cache_player": True,
                 "post_process_order": ["musicbrainz", "deezer", "audiodb", "tidal", "qobuz", "lastfm", "genius"],
                 # Ordered preferred cover-art sources (empty = use the
                 # download's own art, i.e. today's behavior). Resolved + walked
@@ -952,6 +988,17 @@ class ConfigManager:
             },
             "library": {
                 "music_paths": [],
+                # live folder watching (core/library/folder_watch.py): a change
+                # in a music library folder rescans that album folder. local
+                # disks are watched live, network shares checked every
+                # watch_poll_minutes. watch_root_modes holds a per-folder
+                # choice ({folder: "auto"|"live"|"polling"|"off"}).
+                # watch_max_live_folders caps the folders watched live before
+                # a library is checked on a timer instead (Linux inotify).
+                "watch_folders": False,
+                "watch_poll_minutes": 15,
+                "watch_root_modes": {},
+                "watch_max_live_folders": 100000,
                 "music_videos_path": "",
                 "podcasts_path": default_podcast_path,
                 "audiobooks_path": default_audiobook_path,
@@ -977,6 +1024,8 @@ class ConfigManager:
                 # import creates it. Jellyfin/Kodi/Emby use it to identify
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
+                # #2138: the same switch writes poster.jpg / background.jpg
+                # beside it when the artist folder has no artwork.
                 "write_artist_nfo": False,
                 # Library v2: a monitored track whose file was deleted outside
                 # SoulSync is downloaded again (Lidarr behaviour). Off, the
@@ -1059,7 +1108,10 @@ class ConfigManager:
                 # off: staging keeps whatever an import didn't move (the user's
                 # own files). on: a folder whose every track was imported or
                 # found already in the library is removed from staging.
-                "clear_finished_from_staging": False
+                "clear_finished_from_staging": False,
+                # the import matcher's search picker opens on this source
+                # (#2203). '' is Any source: the primary, then the chain.
+                "default_search_source": ""
             },
             "m3u_export": {
                 "enabled": False,
@@ -1166,6 +1218,19 @@ class ConfigManager:
                 # copy, and a listener who prefers the per-file layout opts
                 # out by leaving this off.
                 "merge_m4b": False,
+            },
+            "server_activity": {
+                # remote upload speed in Mbps; None hides the bar
+                "upload_mbps": None,
+                "geo_lookup": True,
+                # play log days; 0 keeps it forever
+                "retention_days": 0,
+                "stop_presets": [
+                    "The server is restarting for an update. Back in 5 minutes.",
+                    "Server maintenance, back soon.",
+                    "Too many streams right now, please try again later.",
+                    "Please watch at home tonight.",
+                ],
             },
             "podcasts": {
                 "download_path": default_podcast_path,

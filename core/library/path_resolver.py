@@ -263,11 +263,18 @@ def resolve_library_file_path_with_diagnostic(
     if not isinstance(file_path, str) or not file_path:
         return None, attempt
 
-    if os.path.exists(file_path):
+    from core.library.path_mappings import foreign_rooted
+    if not foreign_rooted(file_path) and os.path.exists(file_path):
         if library_root and not _inside_library_root(file_path, library_root):
             return None, attempt
         attempt.raw_path_existed = True
         return file_path, attempt
+
+    # a folder override the user set (Settings > Library > Folders) is asked
+    # before any guessing: it is the user's own word for where this mount is
+    override = _from_override(file_path)
+    if override and (not library_root or _inside_library_root(override, library_root)):
+        return override, attempt
 
     path_parts = [part for part in file_path.replace("\\", "/").split("/") if part]
     if not path_parts or ".." in path_parts:
@@ -316,13 +323,41 @@ def resolve_library_file_path_with_diagnostic(
 
     sibling = _resolve_via_sibling_album_folder(path_parts, base_dirs)
     if sibling and allowed(sibling):
-        return sibling, attempt
+        return _unless_another_records(file_path, sibling), attempt
     # Filename wrong as well as the album folder — Navidrome synthesizes the
     # whole path from tags, so no exact segment is left to match on (#1127).
     resolved = _resolve_via_synthesized_filename(path_parts, base_dirs)
     if resolved and not allowed(resolved):
         resolved = None
-    return resolved, attempt
+    return _unless_another_records(file_path, resolved), attempt
+
+
+def _from_override(file_path: str) -> Optional[str]:
+    """the user's folder override for this path, when one finds the file"""
+    try:
+        from core.library.path_mappings import local_path
+        return local_path(file_path, media_type="music")
+    except Exception as exc:  # noqa: BLE001 - the resolver never raises
+        logger.debug("folder override lookup failed for %r: %s", file_path, exc)
+        return None
+
+
+def _unless_another_records(file_path: str, found: Optional[str]) -> Optional[str]:
+    """A last-resort match, unless the Library records that file under another
+    record (core/library2/paths.held_by_another_record). Both last resorts
+    answer "which file did this path mean", and the old record of a file that
+    moved means none: the file they find is another record's."""
+    if not found:
+        return found
+    try:
+        from core.library2.paths import held_by_another_record
+        if held_by_another_record(file_path, found):
+            logger.debug("%r is not on disk; the file found for it, %s, belongs "
+                         "to another record", file_path, found)
+            return None
+    except Exception as exc:  # noqa: BLE001 - the resolver never raises
+        logger.debug("holder check failed for %r: %s", file_path, exc)
+    return found
 
 
 def _inside_library_root(path, root):
@@ -382,6 +417,29 @@ def _resolve_ignoring_case(path_parts: List[str], base_dirs: List[str], *, accep
     return _single_physical_match(matches) if matches else None
 
 
+def _own_album_folders(path_parts: List[str], base_dirs: List[str]) -> List[str]:
+    """the stored path's own album folder, where it exists under a base.
+
+    both last resorts below are for a path whose ALBUM segment is wrong. when
+    that folder is there, the segment is right and a file missing from it is
+    gone, not elsewhere: wolf39us deleted `Maroon 5/2014 - V/15 - Lost
+    Stars.flac` and Refresh kept finding `2014 - Lost Stars/01 - Lost
+    Stars.flac` in another album folder, so the record never went missing
+    (and was measured as that other file)."""
+    if len(path_parts) < 3:
+        return []
+    artist_segment, album_segment = path_parts[-3], path_parts[-2]
+    if not artist_segment or not album_segment or "." in (artist_segment, album_segment) \
+            or ".." in (artist_segment, album_segment):
+        return []
+    folders = []
+    for base in base_dirs:
+        folder = os.path.join(base, artist_segment, album_segment)
+        if os.path.isdir(folder) and folder not in folders:
+            folders.append(folder)
+    return folders
+
+
 def _resolve_via_sibling_album_folder(
     path_parts: List[str], base_dirs: List[str]
 ) -> Optional[str]:
@@ -413,7 +471,6 @@ def _resolve_via_sibling_album_folder(
     artist_segment = path_parts[-3]
     if not basename or not artist_segment or artist_segment in (".", ".."):
         return None
-
     matches: List[str] = []
     for base in base_dirs:
         artist_dir = os.path.join(base, artist_segment)
@@ -451,6 +508,16 @@ _LEADING_TRACK_NUM = re.compile(
     r"^\d{1,3}[-_.]\d{1,3}[\s._-]+"   # disc-track: "01-01 - ", "1-01 ", "01-01. "
     r"|^\d{1,3}\s*[-_.]\s*"           # track + a real separator: "01 - ", "01.", "01_"
 )
+
+
+def _leading_track(basename: str) -> Optional[int]:
+    """the track number a filename starts with ("15 - x" 15, "01-01 - x" 1),
+    None without one"""
+    m = _LEADING_TRACK_NUM.match(basename or "")
+    if not m:
+        return None
+    digits = re.findall(r"\d{1,3}", m.group(0))
+    return int(digits[-1]) if digits else None
 
 
 def _strip_track_number(basename: str) -> str:
@@ -546,6 +613,13 @@ def _resolve_via_synthesized_filename(
         return None
     synth = _SYNTH_NAME.match(wanted_base)
     album_segment = path_parts[-2]
+    # the album folder is there, so a same-titled file in ANOTHER album folder
+    # is only this one when its track number agrees too: wolf39us deleted
+    # `2014 - V/15 - Lost Stars.flac` and this found the single's
+    # `01 - Lost Stars.flac`. a renamed folder (#1127, numbering 01-01 vs 01)
+    # keeps its number, so it still resolves
+    own_folders = {os.path.normcase(f) for f in _own_album_folders(path_parts, base_dirs)}
+    wanted_track = _leading_track(wanted_base)
 
     matches: List[str] = []
     prefixed: List[str] = []
@@ -568,6 +642,7 @@ def _resolve_via_synthesized_filename(
             except OSError:
                 continue
         for album_dir in album_dirs:
+            elsewhere = bool(own_folders) and os.path.normcase(album_dir.path) not in own_folders
             try:
                 entries = list(os.scandir(album_dir.path))
             except OSError:
@@ -580,6 +655,9 @@ def _resolve_via_synthesized_filename(
                     continue
                 entry_base, entry_ext = os.path.splitext(entry.name)
                 if entry_ext.lower() != wanted_ext.lower():
+                    continue
+                if elsewhere and (wanted_track is None
+                                  or _leading_track(entry_base) != wanted_track):
                     continue
                 if _strip_track_number(entry_base) == wanted_stem:
                     if entry.path not in matches:
@@ -626,5 +704,7 @@ def resolve_via_last_resort_fallbacks(
     if not isinstance(file_path, str) or not file_path or not base_dirs:
         return None
     path_parts = file_path.replace("\\", "/").split("/")
-    return (_resolve_via_sibling_album_folder(path_parts, base_dirs)
-            or _resolve_via_synthesized_filename(path_parts, base_dirs))
+    return _unless_another_records(
+        file_path,
+        _resolve_via_sibling_album_folder(path_parts, base_dirs)
+        or _resolve_via_synthesized_filename(path_parts, base_dirs))

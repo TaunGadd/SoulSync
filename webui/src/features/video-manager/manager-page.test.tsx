@@ -21,7 +21,7 @@ import {
 import { describeDone } from './manager-bulk';
 import { EpisodesTab } from './manager-extras';
 import { ManagerPage } from './manager-page';
-import { PosterGrid } from './manager-views';
+import { PosterGrid, TitleTable } from './manager-views';
 import { changedFields } from './title-sheet';
 import { EMPTY_FILTERS } from './types';
 
@@ -159,6 +159,8 @@ const ALIEN = title({
 interface Server {
   calls: { url: string; method: string; body: unknown }[];
   forbidden: boolean;
+  /** the Shelf Life job is on and has scored: rows carry it, with the threshold */
+  shelf: boolean;
   bulk: BulkStatus;
   views: unknown[];
 }
@@ -193,6 +195,15 @@ function answer(url: string, method: string): unknown {
   if (path === '/api/video/manager/titles') {
     const needs = u.searchParams.get('needs') || '';
     const rows = [title(), ALIEN].filter((r) => !needs.includes('copies') || r.extra_copies > 0);
+    if (server.shelf)
+      return page(
+        rows.map((r) =>
+          r.id === 1
+            ? { ...r, shelf_life: { score: 12, gate: null, gate_text: null } }
+            : { ...r, shelf_life: { score: null, gate: 'keep', gate_text: 'marked Keep' } },
+        ),
+        { shelf_life_threshold: 30 },
+      );
     return page(rows);
   }
   if (path === '/api/video/manager/files')
@@ -354,6 +365,7 @@ beforeEach(() => {
   server = {
     calls: [],
     forbidden: false,
+    shelf: false,
     views: [],
     bulk: {
       running: false,
@@ -471,6 +483,48 @@ describe('the views', () => {
     expect(window.localStorage.getItem('vmgr:view')).toBe('"table"');
   });
 
+  it('a long title truncates in the table and shows in full on hover', async () => {
+    await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Titles' }));
+    const name = await screen.findByText('Alien');
+    expect(name).toHaveAttribute('title', 'Alien');
+    fireEvent.click(screen.getByRole('button', { name: 'Files' }));
+    const file = (await screen.findAllByText('The Matrix'))[0];
+    expect(file).toHaveAttribute('title', 'The Matrix');
+  });
+
+  it('a long language list is cut short in the table and shown in full on hover', () => {
+    render(
+      <TitleTable
+        rows={[
+          title({
+            audio_languages: ['en', 'fr', 'de', 'es'],
+            subtitle_languages: ['en', 'fr', 'de', 'es', 'it', 'ja'],
+          }),
+        ]}
+        side="movies"
+        facets={null}
+        columns={['audio', 'subtitles']}
+        onColumns={() => {}}
+        sort={{ by: 'title', dir: 'asc' }}
+        onSort={() => {}}
+        selected={new Set()}
+        onToggle={() => {}}
+        onTogglePage={() => {}}
+        loading={false}
+        onEdit={() => {}}
+      />,
+    );
+    expect(screen.getByText('EN, FR, DE, ES +2')).toHaveAttribute(
+      'title',
+      'EN, FR, DE, ES, IT, JA',
+    );
+    expect(screen.getByText('EN, FR, DE +1 · Atmos')).toHaveAttribute(
+      'title',
+      'EN, FR, DE, ES · Atmos',
+    );
+  });
+
   it('sorts by a column on the server, and flips on a second click', async () => {
     await mount();
     fireEvent.click(screen.getByRole('button', { name: 'Titles' }));
@@ -497,6 +551,58 @@ describe('the views', () => {
     expect(await screen.findByText('Plain Poster')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Titles' })).toBeNull();
     expect(screen.queryByText('Filters')).toBeNull();
+  });
+});
+
+describe('Shelf Life', () => {
+  it('a card shows its score in a band, or a shield when a gate protects it', async () => {
+    server.shelf = true;
+    await mount();
+    const matrix = screen.getByTitle('Shelf Life 12, flagged for cleanup');
+    expect(matrix).toHaveTextContent('12');
+    expect(matrix).toHaveAttribute('data-band', 'low');
+    expect(
+      screen.getByRole('img', { name: 'Shelf Life: protected, marked Keep' }),
+    ).toBeInTheDocument();
+  });
+
+  it('nothing shows while the job is off or has not scored', async () => {
+    await mount();
+    expect(screen.queryByTitle(/^Shelf Life/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Titles' }));
+    await screen.findByText('Alien');
+    expect(screen.queryByRole('button', { name: /^Shelf Life/ })).toBeNull();
+  });
+
+  it('the table has a Shelf Life column that sorts lowest first', async () => {
+    server.shelf = true;
+    await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Titles' }));
+    await screen.findByText('Alien');
+    fireEvent.click(await screen.findByRole('button', { name: /^Shelf Life/ }));
+    await waitFor(() =>
+      expect(lastCall('manager/titles')?.url).toContain('sort=shelf_life&dir=asc'),
+    );
+  });
+
+  it('a score just above the line is amber, well above it green', () => {
+    render(
+      <PosterGrid
+        rows={[
+          title({ id: 1, shelf_life: { score: 40, gate: null, gate_text: null } }),
+          title({ id: 2, title: 'Brazil', shelf_life: { score: 80, gate: null, gate_text: null } }),
+        ]}
+        side="movies"
+        selected={new Set()}
+        selecting={false}
+        loading={false}
+        onToggle={() => {}}
+        onEdit={() => {}}
+        shelfThreshold={30}
+      />,
+    );
+    expect(screen.getByTitle('Shelf Life 40')).toHaveAttribute('data-band', 'mid');
+    expect(screen.getByTitle('Shelf Life 80')).toHaveAttribute('data-band', 'ok');
   });
 });
 
