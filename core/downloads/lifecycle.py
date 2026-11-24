@@ -885,7 +885,10 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
         try:
             if deps.automation_engine:
                 _credits = _batch_event_credits(batch, queue)
-                deps.automation_engine.emit('batch_complete', {
+                from core.automation.owners import owned
+                # the batch's profile; a batch that downloaded nothing and
+                # only pays an earlier batch's scan is the install's
+                deps.automation_engine.emit('batch_complete', owned({
                     'playlist_name': playlist_name,
                     'artist': _credits['artist'],
                     'title': _credits['title'],
@@ -894,7 +897,7 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
                     'completed_tracks': str(successful_downloads),
                     'failed_tracks': str(failed_count),
                     'more_batches_pending': 'true' if more_pending else 'false',
-                })
+                }, batch.get('profile_id') if successful_downloads > 0 else None))
         except Exception as e:
             logger.debug("batch_complete emit failed: %s", e)
 
@@ -1071,6 +1074,15 @@ def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: Lifecyc
         # already in its folder, or navidrome shows two albums
         _adopt_loose_tracks(_cons_files, cons_tag, batch.get('album_context'))
 
+    # LIDARR HANDOFF (lidarr_download.import_through_lidarr): Lidarr imports
+    # the batch into the library. Last, because it identifies each file by the
+    # album tags the consistency pass above has just made agree.
+    try:
+        from core.downloads.lidarr_handoff import hand_batch_to_lidarr
+        hand_batch_to_lidarr(batch_id, batch, tasks_snapshot)
+    except Exception as _handoff_err:  # noqa: BLE001 — the batch is already complete
+        logger.warning(f"{tag} Lidarr handoff failed (files stay in the Lidarr imports folder): {_handoff_err}")
+
 
 def on_download_completed(batch_id: str, task_id: str, success: bool, deps: LifecycleDeps) -> None:
     """Handle a finished task, then offer the freed slot to whoever is waiting.
@@ -1086,10 +1098,40 @@ def on_download_completed(batch_id: str, task_id: str, success: bool, deps: Life
     `finally`, not a trailing call: the lock is released by the time the inner
     function has returned, and a slot may have freed even if it raised.
     """
+    near_misses = _take_near_misses(batch_id, task_id, success)
     try:
         _on_download_completed(batch_id, task_id, success, deps)
     finally:
         _wake_waiting_batches(batch_id, deps)
+        if near_misses:
+            _clear_near_misses(near_misses)
+
+
+def _take_near_misses(batch_id: str, task_id: str, success: bool) -> list:
+    """The quarantined near-misses a finished task leaves for clearing:
+    its earlier candidates when it imported, everything when an automatic
+    upgrade gave up (the current file stays). Taken off the task under the
+    lock; the files move after it, outside the lock."""
+    try:
+        from core.downloads import near_misses
+        with tasks_lock:
+            task = download_tasks.get(task_id)
+            if task is None:
+                return []
+            imported = bool(success) and task.get('status') in ('completed', 'post_processing')
+            return near_misses.take_entries_to_clear(
+                task, download_batches.get(batch_id), imported)
+    except Exception as exc:  # noqa: BLE001 - review cleanup never blocks a completion
+        logger.debug("near-miss lookup for %s failed: %s", task_id, exc)
+        return []
+
+
+def _clear_near_misses(entry_ids: list) -> None:
+    try:
+        from core.downloads import near_misses
+        near_misses.clear_after_task(entry_ids)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not clear near-misses %s: %s", entry_ids, exc)
 
 
 def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: LifecycleDeps) -> None:
@@ -1168,11 +1210,14 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
 
                     try:
                         if deps.automation_engine:
-                            deps.automation_engine.emit('download_failed', {
+                            from core.automation.owners import owned
+                            _owner = (download_tasks.get(task_id) or {}).get('profile_id') \
+                                or download_batches[batch_id].get('profile_id')
+                            deps.automation_engine.emit('download_failed', owned({
                                 'artist': track_info.get('artist_name', ''),
                                 'title': track_info.get('track_name', ''),
                                 'reason': track_info.get('failure_reason', 'Unknown'),
-                            })
+                            }, _owner))
                     except Exception as e:
                         logger.debug("download_failed emit failed: %s", e)
 

@@ -45,7 +45,7 @@ def get_background_profile():
 
 __all__ = ["set_background_profile", "reset_background_profile", "get_background_profile",
            "get_current_profile_id", "is_admin_profile", "is_admin_request",
-           "admin_only", "admin_or_api_key"]
+           "admin_only", "admin_or_api_key", "admin_or_api_key_refusal"]
 
 
 # ── request-side accessors ───────────────────────────────────────────────────
@@ -80,9 +80,8 @@ def get_current_profile_id() -> Optional[int]:
             req_pin = bool(config_manager.get('security.require_pin_on_launch', False)) if config_manager else False
             if req_pin and not req_login:
                 from flask import request
-                from core.security.auth_proxy import trusted_proxy_user
-                proxy_hdr = (config_manager.get('security.auth_proxy_header', '') or '') if config_manager else ''
-                proxy_authed = bool(trusted_proxy_user(request.headers.get, proxy_hdr))
+                from core.security.auth_proxy import request_proxy_user
+                proxy_authed = bool(request_proxy_user(request, config_manager.get if config_manager else None))
                 if not session.get('launch_pin_verified', False) and not proxy_authed:
                     return None
         except Exception:  # noqa: S110 — unreadable config falls through to session/background
@@ -161,9 +160,8 @@ def is_admin_request() -> bool:
             req_pin = bool(config_manager.get('security.require_pin_on_launch', False)) if config_manager else False
             if req_pin:
                 from flask import request
-                from core.security.auth_proxy import trusted_proxy_user
-                proxy_hdr = (config_manager.get('security.auth_proxy_header', '') or '') if config_manager else ''
-                proxy_authed = bool(trusted_proxy_user(request.headers.get, proxy_hdr))
+                from core.security.auth_proxy import request_proxy_user
+                proxy_authed = bool(request_proxy_user(request, config_manager.get if config_manager else None))
                 if not session.get('launch_pin_verified', False) and not proxy_authed:
                     return False
         except Exception:  # noqa: S110 — unreadable config falls through to profile inspection
@@ -211,6 +209,8 @@ def admin_only(view_fn):
                 "error": "Admin access required",
             }), 403
         return view_fn(*args, **kwargs)
+    # the route inventory (tests/test_route_permissions.py) reads this
+    wrapper._soulsync_access = ("admin", None)
     return wrapper
 
 
@@ -228,14 +228,24 @@ def admin_or_api_key(view_fn):
     """
     import functools
 
-    from flask import g
-
-    admin_fn = admin_only(view_fn)
-
     @functools.wraps(view_fn)
     def wrapper(*args, **kwargs):
-        from api.auth import apply_api_key_request_context
-        if apply_api_key_request_context() and getattr(g, 'is_admin', False):
-            return view_fn(*args, **kwargs)
-        return admin_fn(*args, **kwargs)
+        refused = admin_or_api_key_refusal()
+        if refused is not None:
+            return refused
+        return view_fn(*args, **kwargs)
+    wrapper._soulsync_access = ("admin", None)
     return wrapper
+
+
+def admin_or_api_key_refusal():
+    """the @admin_or_api_key check on its own, for a blueprint's
+    before_request: None when the caller may go on, else the 403."""
+    from flask import g, jsonify
+
+    from api.auth import apply_api_key_request_context
+    if apply_api_key_request_context() and getattr(g, 'is_admin', False):
+        return None
+    if is_admin_request():
+        return None
+    return jsonify({"success": False, "error": "Admin access required"}), 403

@@ -28,6 +28,7 @@ from core.imports.context import (
 )
 from core.imports.collab_artist import collab_primary, library_has_artist, library_has_identified_artist
 from core.imports.compilation import VARIOUS_ARTIST_NAMES
+from core.imports.library_names import library_names, swap_credit, swap_names
 from core.metadata.artist_resolution import resolve_track_artists
 from core.metadata.registry import get_itunes_client
 from database.music_database import get_database
@@ -620,6 +621,23 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
 
     if pp["release_mbid"] and release_detail:
         from core.metadata.musicbrainz_tags import release_tags, credit_tags
+        # #2259: When a release has an explicit release-level artist-credit (e.g.
+        # "12th Planet" on an EP where track 2 is by "DJ Evol"), ensure album_artist
+        # reflects the release artist rather than leaking the track artist into
+        # ALBUMARTIST.
+        _rel_ac = [c for c in (release_detail.get("artist-credit") or []) if isinstance(c, dict)]
+        if _rel_ac:
+            _rel_parts = []
+            for _c in _rel_ac:
+                _cname = (_c.get("artist") or {}).get("name") or _c.get("name") or ""
+                if _cname:
+                    _rel_parts.append(_cname + (_c.get("joinphrase") or ""))
+            _rel_artist = "".join(_rel_parts).strip()
+            _cur_aa = (metadata.get("album_artist") or "").strip()
+            _cur_tr = (metadata.get("artist") or "").strip()
+            if _rel_artist and _rel_artist.casefold() != "various artists":
+                if not _cur_aa or (_cur_tr and _cur_aa.casefold() == _cur_tr.casefold() and _rel_artist.casefold() != _cur_tr.casefold()):
+                    metadata["album_artist"] = _rel_artist
         # #1510: ALBUMARTISTSORT names the sort names of the album artist(s)
         # the primary source settled on (album_artist, plus the full list when
         # the album context names more than one) — or is left out entirely
@@ -1728,7 +1746,11 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
             from core.genre_filter import filter_genres as _filter_genres
             from core.genre_filter import _normalize_for_match
 
-            enrichment_genres = _filter_genres(enrichment_genres, cfg)
+            enrichment_genres = _filter_genres(
+                enrichment_genres,
+                cfg,
+                artist_names=[metadata.get("artist"), metadata.get("album_artist")],
+            )
             source_genres = [g.strip() for g in str(metadata.get("genre", "")).split(",") if g.strip()]
             seen = set()
             merged = []
@@ -2405,6 +2427,39 @@ def evaluate_batch_album_distrust(original_search, track_info, album_ctx, explic
     }
 
 
+def album_artist_override(verdict: dict):
+    """``(name, artists)`` when the track's own album artist outranks the
+    explicit artist context (#1316): the two name different artists and the
+    album context is trusted. None otherwise.
+
+    The ALBUMARTIST tag and the folder both take it (#2222): the tag used to
+    follow this rule while the folder kept the explicit context, so a
+    wishlist download asked for as "Δέσποινα Βανδή" on an album credited to
+    "Despina Vandi" was tagged Despina Vandi and filed under a greek folder.
+    """
+    if not isinstance(verdict, dict):
+        return None
+    explicit = str(verdict.get("explicit_name") or "").strip()
+    own = str(verdict.get("own_album_artist") or "").strip()
+    if (explicit and own and own.casefold() != explicit.casefold()
+            and not verdict.get("ctx_artist_untrusted")):
+        return own, verdict.get("own_album_artists")
+    return None
+
+
+def _known_total_discs(album_info: Any, album_ctx: Any, disc_number: Any) -> int:
+    """the release's disc count as far as the import knows it, 1 when it
+    doesn't. a track on disc 3 proves at least three."""
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+    found = [_int(source.get("total_discs")) for source in (album_info, album_ctx)
+             if isinstance(source, dict)]
+    return max([1, _int(disc_number), *found])
+
+
 def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> dict:
     if album_info is None:
         album_info = {}
@@ -2464,6 +2519,10 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # track object). Deezer-direct contexts populate `original_search.artists`
     # directly. Pure helper handles all three shapes.
     all_artists = resolve_track_artists(original_search, track_info, artist_dict)
+    # #2165: the library's name for each artist it knows by another one (the
+    # source says "Machine Gun Kelly", the library, which finds them by id,
+    # "mgk"). the same names the folder was built with
+    library_artist_names = library_names(context, artist_dict)
     if all_artists:
         # Deezer upgrade path: Deezer's `/search` endpoint only returns
         # the primary artist for each track. The full contributors
@@ -2498,6 +2557,7 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         # "artists" key for Vorbis) when `write_multi_artist` is on.
         # Without this assignment the field was always empty and the
         # multi-artist write path silently no-op'd.
+        all_artists = swap_names(list(all_artists), library_artist_names)
         metadata["_artists_list"] = list(all_artists)
 
         # `feat_in_title` (when true): pull featured artists out of the
@@ -2543,7 +2603,8 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
                 artist_separator, metadata["artist"],
             )
     else:
-        metadata["artist"] = artist_dict.get("name", "") or get_import_clean_artist(context)
+        metadata["artist"] = swap_credit(
+            artist_dict.get("name", "") or get_import_clean_artist(context), library_artist_names)
         logger.info("Metadata: Using primary artist: '%s'", metadata["artist"])
 
     raw_album_artist = artist_dict.get("name", "") or metadata["artist"]
@@ -2583,16 +2644,17 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         # unless the "track's own album artist" is itself an uncorroborated
         # stranger from the batch context (wire 3 above fired), in which
         # case the batch context is poisoned and gets quarantined below.
+        # The folder takes the same answer (core/imports/paths.py, #2222).
         if (own_album_artist
                 and own_album_artist.strip().casefold() != explicit_name.strip().casefold()):
-            if not _ctx_artist_untrusted:
+            _override = album_artist_override(_verdict)
+            if _override:
                 logger.warning(
                     "Metadata: explicit artist context '%s' disagrees with the track's "
                     "own album artist '%s' — trusting the track data (#1316)",
                     explicit_name, own_album_artist,
                 )
-                raw_album_artist = own_album_artist
-                album_artists_for_collab = own_album_artists
+                raw_album_artist, album_artists_for_collab = _override
             # (wire 3 fired: quarantine below overrides raw_album_artist)
         else:
             raw_album_artist = explicit_name
@@ -2655,11 +2717,12 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
                             raw_album_artist = resolved
                 except Exception as e:
                     logger.debug("itunes primary artist resolve failed: %s", e)
-    metadata["album_artist"] = raw_album_artist
+    metadata["album_artist"] = swap_credit(raw_album_artist, library_artist_names)
     # every album artist, for the multi-value ALBUMARTISTS tag. only from an
     # album context that names more than one. track artists aren't album
     # artists, a feature doesn't make it a collab album
-    metadata["_album_artists_list"] = _album_artist_names(album_artists_for_collab)
+    metadata["_album_artists_list"] = swap_names(
+        _album_artist_names(album_artists_for_collab), library_artist_names)
 
     # 'Unknown Album' in any slot is the no-album placeholder, not a name —
     # tracks from paste-link playlists / discovery-pool rows / TXT imports
@@ -2746,13 +2809,23 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # as disc-less and ungroup the track in Jellyfin/Plex).
     from core.imports.track_number import resolve_disc_for_track
     metadata["disc_number"] = resolve_disc_for_track(original_search, album_info)
+    # the disc total the import already knows (the album context, or the path
+    # builder that filed this track under "Disc 1"): it was never handed to
+    # the tag writer, so every multi-disc import wrote "1" with no total and
+    # Library Re-tag filed "Disc total: empty -> 3" for each track (#2217).
+    # a one-disc release writes none, as before: there is nothing missing
+    total_discs = _known_total_discs(
+        album_info, {} if batch_album_distrusted else album_ctx, metadata["disc_number"])
+    if total_discs > 1:
+        metadata["total_discs"] = total_discs
     reference = context.get('_metadata_reference')
     if reference:
         for key, ref_key in (('title', 'title'), ('artist', 'track_artist'), ('album', 'album_title'), ('album_artist', 'artist_name')):
             if reference.get(ref_key):
                 metadata[key] = reference[ref_key]
         metadata.update(track_number=reference.get('track_number') or metadata['track_number'], total_tracks=reference.get('track_count'),
-                        disc_number=reference.get('disc_number') or metadata['disc_number'], total_discs=reference.get('total_discs'))
+                        disc_number=reference.get('disc_number') or metadata['disc_number'],
+                        total_discs=reference.get('total_discs') or metadata.get('total_discs'))
 
     if album_ctx and album_ctx.get("release_date") and not batch_album_distrusted:
         release_date = _normalize_release_date_tag(album_ctx.get("release_date"))
@@ -2776,7 +2849,11 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     if genres:
         from core.genre_filter import filter_genres
 
-        filtered = filter_genres(list(genres[:2]), cfg)
+        filtered = filter_genres(
+            list(genres[:2]),
+            cfg,
+            artist_names=[metadata.get("artist"), metadata.get("album_artist")],
+        )
         if filtered:
             metadata["genre"] = ", ".join(filtered)
 

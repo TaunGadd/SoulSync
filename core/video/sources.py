@@ -1233,6 +1233,8 @@ class PlexVideoSource:
             "play_count": int(getattr(m, "viewCount", 0) or 0),
             "last_viewed_at": _iso_dt(getattr(m, "lastViewedAt", None)),
             "view_offset_ms": int(getattr(m, "viewOffset", 0) or 0),   # resume position
+            # when it went into Plex (immutable), not when SoulSync first saw it
+            "server_added_at": _iso_dt(getattr(m, "addedAt", None)),
             "genres": self._tags(getattr(m, "genres", None)),
             "runtime_minutes": int(dur / 60000) if dur else None,
             "files": self._part_files(m),
@@ -1326,7 +1328,7 @@ class PlexVideoSource:
 
 # ── Jellyfin ────────────────────────────────────────────────────────────────
 _JF_MOVIE_FIELDS = ("Overview,Path,MediaSources,ProductionYear,OfficialRating,RunTimeTicks,Studios,"
-                    "ProviderIds,Genres,Taglines,CommunityRating,CriticRating,UserData")
+                    "ProviderIds,Genres,Taglines,CommunityRating,CriticRating,DateCreated,UserData")
 _JF_EP_FIELDS = ("Overview,Path,MediaSources,PremiereDate,RunTimeTicks,IndexNumber,ParentIndexNumber,"
                  "ProviderIds,CommunityRating,DateCreated,UserData")
 _JF_SHOW_FIELDS = ("Overview,ProductionYear,OfficialRating,ProviderIds,Genres,Taglines,CommunityRating,"
@@ -1780,7 +1782,7 @@ class JellyfinVideoSource:
                     return True
                 try:
                     r = requests.get(base + "/Shows/" + str(sid) + "/Episodes", headers=headers,
-                                     timeout=10, params={"season": int(sn)})
+                                     timeout=10, params={"season": int(sn), "IsMissing": "false"})
                     eps = (r.json() or {}).get("Items", []) if r.ok else []
                     if any(int(e.get("IndexNumber") or -1) == int(en) for e in eps):
                         return True
@@ -1793,7 +1795,7 @@ class JellyfinVideoSource:
         def total(view, itype):
             resp = self._req(f"/Users/{self.uid}/Items", {
                 "ParentId": view["Id"], "IncludeItemTypes": itype,
-                "Recursive": "true", "Limit": "0"}) or {}
+                "Recursive": "true", "CollapseBoxSetItems": "false", "Limit": "0"}) or {}
             return int(resp.get("TotalRecordCount", 0) or 0)
         m = sum(total(v, "Movie") for v in self._scan_views("movies", self._movies_lib))
         sh = sum(total(v, "Series") for v in self._scan_views("tvshows", self._tv_lib))
@@ -1875,8 +1877,11 @@ class JellyfinVideoSource:
     def iter_movies(self, incremental=False, since=None):
         path = f"/Users/{self.uid}/Items"
         for view in self._scan_views("movies", self._movies_lib):
+            # with "group movies into collections" on, jellyfin answers a query
+            # that doesn't say otherwise with one BoxSet in place of the films in it
             params = {"ParentId": view["Id"], "IncludeItemTypes": "Movie",
-                      "Recursive": "true", "Fields": _JF_MOVIE_FIELDS}
+                      "Recursive": "true", "CollapseBoxSetItems": "false",
+                      "Fields": _JF_MOVIE_FIELDS}
             if incremental and since is not None:
                 # Delta: DateLastSaved bumps when metadata is (re-)saved — a re-match or
                 # edit on an EXISTING movie — so MinDateLastSaved catches changes, not
@@ -1945,6 +1950,8 @@ class JellyfinVideoSource:
             "last_viewed_at": _iso_dt((it.get("UserData") or {}).get("LastPlayedDate")),
             # JF ticks are 100ns units → ms
             "view_offset_ms": int(((it.get("UserData") or {}).get("PlaybackPositionTicks") or 0) // 10_000),
+            # when it went into Jellyfin, not when SoulSync first saw it
+            "server_added_at": _iso_dt(it.get("DateCreated")),
             "genres": it.get("Genres") or [],
             "runtime_minutes": int(ticks / 600_000_000) if ticks else None,
             "files": self._files(it),
@@ -1974,8 +1981,10 @@ class JellyfinVideoSource:
     def iter_shows(self, incremental=False, since=None):
         path = f"/Users/{self.uid}/Items"
         for view in self._scan_views("tvshows", self._tv_lib):
+            # same for "group shows into collections" (see iter_movies)
             params = {"ParentId": view["Id"], "IncludeItemTypes": "Series",
-                      "Recursive": "true", "Fields": _JF_SHOW_FIELDS}
+                      "Recursive": "true", "CollapseBoxSetItems": "false",
+                      "Fields": _JF_SHOW_FIELDS}
             if incremental and since is not None:
                 # Delta: metadata (re-)saved since the last scan — catches re-matches + edits.
                 params.update({"MinDateLastSaved": since.isoformat()})
@@ -2007,8 +2016,10 @@ class JellyfinVideoSource:
         series_id = str(it["Id"])
         seasons = []
         try:
+            # an api-key request gets jellyfin's virtual (missing) episodes too,
+            # each with a media source but no file. they are not owned
             eps_resp = self._req(f"/Shows/{series_id}/Episodes", {
-                "UserId": self.uid, "Fields": _JF_EP_FIELDS}) or {}
+                "UserId": self.uid, "IsMissing": "false", "Fields": _JF_EP_FIELDS}) or {}
             by_season: dict[int, list] = {}
             for ep in eps_resp.get("Items", []):
                 enum = ep.get("IndexNumber")

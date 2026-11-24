@@ -43,14 +43,16 @@ _RESOLVED_RECURRENCE_GRACE_DAYS = 7
 _SUPERSEDED_BY_SCAN_ACTION = "superseded by a newer scan"
 
 
-def _publish_video_event(event_type: str, data: dict) -> None:
+def _publish_video_event(event_type: str, data: dict, owner=None) -> None:
     """Relay a library change to the video automation event bus. The DB layer is
     the one spine every wishlist/watchlist write flows through, so publishing
     here means no caller can forget. Lazy import; a missing forwarder (tests,
-    early startup) makes it a no-op — never disturbs the write itself."""
+    early startup) makes it a no-op — never disturbs the write itself.
+    ``owner`` is the profile whose list changed (an admin approving a request
+    writes the requester's wishlist: the event is the requester's)."""
     try:
-        from core.video.download_events import publish
-        publish(event_type, data)
+        from core.video.download_events import owned, publish
+        publish(event_type, owned(data, owner))
     except Exception:   # noqa: BLE001
         logger.debug("video event publish failed for %s", event_type, exc_info=True)
 
@@ -89,7 +91,7 @@ def _yt_skip_reason(state) -> str | None:
     return "%d failed attempt%s — will try again on the next run" % (
         attempts, "" if attempts == 1 else "s")
 
-SCHEMA_VERSION = 72   # v72: idx_episodes_summary (the library manager sums a show up from the index alone); v71: video_title_freshness (when each source was last asked about a title, for the detail page refresh); v70: video_file_changes (file history and undo) + movies/shows.hands_off (the padlock: automation leaves the title and its files alone); v69: episode_scene_numbers (a lumped anime season the server numbers TMDB's way is searched by its split numbers) + re-sync those shows; v68: re-sync anime whose split the anime map's stale or early entries held back (Dandadan, Apothecary Diaries, Tokyo Revengers); v67: video_wishlist.filed_library_id (the library a wish files into, for the wanted list's library filter, #2029); v66: second copies in another library (video_title_copies, video_library_id on wishlist / downloads / movies / shows, the movie wishlist unique per library, #2029); v65: video_libraries + video_title_libraries (#2029, the main and 4K folders become libraries); v64: re-sync anime TMDB lumped that AniList splits; v63: video_title_profiles (a quality profile picked for a title before it lands); v62: video_watch_state (per-profile watch state, #1941); v61: anime layer (anime_id_map, video_anime, anilist by id, on for everyone once); v60: media_files audio/subtitle languages (#Thibs language tags); v59: re-sync shows left with day-apart lumped-season rows; v58: video_airing_offers (airing auto-wishlist receipts); v57: video_repair_findings.last_error + video_repair_job_runs.error_text (findings parity); v56: re-sync shows TMDB lumped into one season (tvdb regroup); v54: shows.library_name + show_type_hints (anime by library); v53: tvdb_episode_cache (scene numbering); v52: subtitle_overrides ("Replace Bazarr" Phase 3); v51: subtitle_fetch_history + subtitle_quota ("Replace Bazarr" Phase 2); v50: subtitle_wanted ("Replace Bazarr" subtitle wanted queue); v49: per-profile video_watchlist/video_wishlist isolation; v48: video_manual_matches ("I have this" manual library links); v47: video_extto_cache (Fresh Releases match cache); v46: media_files format facts (channels/HDR/Atmos badges); v45: per-episode watch state + resume offsets (Continue Watching); v44: video_wishlist.search_attempts/last_search_at
+SCHEMA_VERSION = 76   # v76: video_requests.acquisition + video_wishlist.awaiting_selection (an approved request held for a release pick, #2199); v75: video_request_log.kind (music, movies and TV each have their own request limit); v74: quality_profiles.media_type (movie | tv | NULL = both, #2168); v73: video_request_log (the request limit counts asks, not surviving rows) + video_downloads/video_download_history.profile_id (who started a grab); v72: idx_episodes_summary (the library manager sums a show up from the index alone); v71: video_title_freshness (when each source was last asked about a title, for the detail page refresh); v70: video_file_changes (file history and undo) + movies/shows.hands_off (the padlock: automation leaves the title and its files alone); v69: episode_scene_numbers (a lumped anime season the server numbers TMDB's way is searched by its split numbers) + re-sync those shows; v68: re-sync anime whose split the anime map's stale or early entries held back (Dandadan, Apothecary Diaries, Tokyo Revengers); v67: video_wishlist.filed_library_id (the library a wish files into, for the wanted list's library filter, #2029); v66: second copies in another library (video_title_copies, video_library_id on wishlist / downloads / movies / shows, the movie wishlist unique per library, #2029); v65: video_libraries + video_title_libraries (#2029, the main and 4K folders become libraries); v64: re-sync anime TMDB lumped that AniList splits; v63: video_title_profiles (a quality profile picked for a title before it lands); v62: video_watch_state (per-profile watch state, #1941); v61: anime layer (anime_id_map, video_anime, anilist by id, on for everyone once); v60: media_files audio/subtitle languages (#Thibs language tags); v59: re-sync shows left with day-apart lumped-season rows; v58: video_airing_offers (airing auto-wishlist receipts); v57: video_repair_findings.last_error + video_repair_job_runs.error_text (findings parity); v56: re-sync shows TMDB lumped into one season (tvdb regroup); v54: shows.library_name + show_type_hints (anime by library); v53: tvdb_episode_cache (scene numbering); v52: subtitle_overrides ("Replace Bazarr" Phase 3); v51: subtitle_fetch_history + subtitle_quota ("Replace Bazarr" Phase 2); v50: subtitle_wanted ("Replace Bazarr" subtitle wanted queue); v49: per-profile video_watchlist/video_wishlist isolation; v48: video_manual_matches ("I have this" manual library links); v47: video_extto_cache (Fresh Releases match cache); v46: media_files format facts (channels/HDR/Atmos badges); v45: per-episode watch state + resume offsets (Continue Watching); v44: video_wishlist.search_attempts/last_search_at
 
 _DEFAULT_DB_PATH = "database/video_library.db"
 
@@ -232,11 +234,11 @@ _BACKFILL = {
 _BACKFILL_COLS = {
     "fanart": {"logo_url", "backdrop_url", "poster_url", "clearart_url", "banner_url"},
     "opensubtitles": {"subtitle_langs"},
-    "trakt": {"trakt_rating", "trakt_votes"},
+    "trakt": {"trakt_rating", "trakt_votes", "trakt_lists"},
     "tvmaze": {"tvmaze_rating"},
     "anilist": {"anilist_score"},
     "wikidata": {"wikidata_url"},
-    "streaming": {"streaming"},
+    "streaming": {"streaming", "streaming_count"},
     "mediastinger": {"mediastinger"},
     "awards": {"awards"},
 }
@@ -438,6 +440,8 @@ _COLUMN_MIGRATIONS = [
     ("movies", "trakt_status", "TEXT"), ("movies", "trakt_attempted", "TEXT"),
     ("shows", "trakt_rating", "REAL"), ("shows", "trakt_votes", "INTEGER"),
     ("shows", "trakt_status", "TEXT"), ("shows", "trakt_attempted", "TEXT"),
+    # how many Trakt user lists hold the title (its following)
+    ("movies", "trakt_lists", "INTEGER"), ("shows", "trakt_lists", "INTEGER"),
     # TVmaze community rating backfill (TV only)
     ("shows", "tvmaze_rating", "REAL"),
     ("shows", "tvmaze_status", "TEXT"), ("shows", "tvmaze_attempted", "TEXT"),
@@ -454,6 +458,11 @@ _COLUMN_MIGRATIONS = [
     ("movies", "streaming_status", "TEXT"), ("movies", "streaming_attempted", "TEXT"),
     ("shows", "streaming", "TEXT"),
     ("shows", "streaming_status", "TEXT"), ("shows", "streaming_attempted", "TEXT"),
+    # when the server added the movie (Plex addedAt / Jellyfin DateCreated);
+    # added_at is when SoulSync first saw the row
+    ("movies", "server_added_at", "TEXT"),
+    # how many services carry it in the region (1 = one exit, 0 = none: not_found)
+    ("movies", "streaming_count", "INTEGER"), ("shows", "streaming_count", "INTEGER"),
     # Mediastinger (TMDB keywords → after/during-credits scene) for its overlay badge
     ("movies", "mediastinger", "INTEGER"),
     ("movies", "mediastinger_status", "TEXT"), ("movies", "mediastinger_attempted", "TEXT"),
@@ -535,6 +544,27 @@ _COLUMN_MIGRATIONS = [
     # a season's monitored flag was set by the user (the season toggle), so
     # nothing automatic may move it. 0 = never set by hand.
     ("seasons", "monitor_locked", "INTEGER NOT NULL DEFAULT 0"),
+    # v73: the profile that started a grab by hand (NULL = an automatic one,
+    # the admin's). a member may cancel only their own, and sees only their
+    # own in the queue and the history
+    ("video_downloads", "profile_id", "INTEGER"),
+    ("video_download_history", "profile_id", "INTEGER"),
+    # v74: what a quality profile is for (#2168): 'movie', 'tv', or NULL for
+    # both, so nothing disappears on upgrade. requests only offer a member
+    # the profiles for that kind of title
+    ("quality_profiles", "media_type", "TEXT"),
+    # v75: what each logged ask was for (movie | show | episode | youtube):
+    # movies and TV each have their own request limit now. a row from before
+    # it whose request is gone stays NULL and counts toward both
+    ("video_request_log", "kind", "TEXT"),
+    # v76 (#2199): how an approved request gets its release. 'manual' = an
+    # admin picks it; NULL / 'auto' = the wishlist drain, as before. its
+    # wishlist rows carry awaiting_selection = 1 while they wait for that
+    # pick, and nothing automatic (the drain, retries, rss, search all)
+    # touches a held row. every existing row stays 0: nothing changes on
+    # upgrade
+    ("video_requests", "acquisition", "TEXT"),
+    ("video_wishlist", "awaiting_selection", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -764,6 +794,18 @@ _VOLATILE_COLS = {
 
 # how often a title's page asks each source again, in seconds
 _FRESH_SOURCES = ("server", "metadata", "ratings")
+
+
+def _ids_disagree(row, metadata: dict) -> bool:
+    """True when a provider's tmdb_id / imdb_id name a different title than
+    the ids the row already holds (either one differing is enough)."""
+    for col in ("tmdb_id", "imdb_id"):
+        have, got = row[col], metadata.get(col)
+        if have in (None, "") or got in (None, ""):
+            continue
+        if str(have).strip().lower() != str(got).strip().lower():
+            return True
+    return False
 
 
 class VideoDatabase:
@@ -1195,6 +1237,19 @@ class VideoDatabase:
                 "AND EXISTS (SELECT 1 FROM episodes l WHERE l.show_id=e.show_id "
                 "AND l.season_number>e.season_number AND l.server_id IS NOT NULL))")
 
+        if prev_version < 75:
+            # v75: the asks already logged take their request's kind
+            conn.execute(
+                "UPDATE video_request_log SET kind=(SELECT r.kind FROM video_requests r "
+                "WHERE r.id=video_request_log.request_id) WHERE kind IS NULL")
+
+        if prev_version < 73:
+            # v73: the request limit counts from video_request_log, so the
+            # requests already filed count as they did before
+            conn.execute(
+                "INSERT OR IGNORE INTO video_request_log (profile_id, request_id, created_at, kind) "
+                "SELECT profile_id, id, created_at, kind FROM video_requests")
+
         if prev_version < 59:
             # v59: the v56 regroup moved an episode only to a TVDB episode on
             # the same day, and late-night anime slips a day between TMDB and
@@ -1251,7 +1306,60 @@ class VideoDatabase:
         # after the v49 step above that may have just rebuilt it
         conn.execute("DROP INDEX IF EXISTS idx_video_wishlist_movie")
 
+        # streaming_count is new: a title the streaming worker already found a
+        # service for has its name but no count, and the worker only visits a
+        # row once. send those back through the queue once; the name stays
+        # (backfill_mark never clobbers), only the count is filled. not_found
+        # rows already mean 0 and are left alone
+        if conn.execute("SELECT 1 FROM video_settings WHERE key = ?",
+                        (VideoDatabase._STREAMING_COUNT_MARKER,)).fetchone() is None:
+            requeued = 0
+            for tbl in ("movies", "shows"):
+                requeued += conn.execute(
+                    f"UPDATE {tbl} SET streaming_status = NULL "
+                    "WHERE streaming_status = 'ok' AND streaming_count IS NULL").rowcount
+            conn.execute("INSERT INTO video_settings (key, value) VALUES (?, '1') "
+                         "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                         (VideoDatabase._STREAMING_COUNT_MARKER,))
+            if requeued:
+                logger.info("streaming: %d title(s) queued once to count their services", requeued)
+
+        # trakt_lists is new: a title Trakt already rated has no list count,
+        # and the worker only visits a row once. send those back through the
+        # queue once; the rating stays (backfill_mark never clobbers)
+        if conn.execute("SELECT 1 FROM video_settings WHERE key = ?",
+                        (VideoDatabase._TRAKT_LISTS_MARKER,)).fetchone() is None:
+            requeued = 0
+            for tbl in ("movies", "shows"):
+                requeued += conn.execute(
+                    f"UPDATE {tbl} SET trakt_status = NULL "
+                    "WHERE trakt_status = 'ok' AND trakt_lists IS NULL").rowcount
+            conn.execute("INSERT INTO video_settings (key, value) VALUES (?, '1') "
+                         "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                         (VideoDatabase._TRAKT_LISTS_MARKER,))
+            if requeued:
+                logger.info("trakt: %d title(s) queued once to count their lists", requeued)
+
+        # TVDB now reads a series' remoteIds (its IMDb and TMDB ids), but the
+        # worker only visits a matched show once. send the matched shows still
+        # missing either id back through the queue once; enrichment only fills
+        # empty columns, so nothing a show already has changes
+        if conn.execute("SELECT 1 FROM video_settings WHERE key = ?",
+                        (VideoDatabase._TVDB_REMOTE_IDS_MARKER,)).fetchone() is None:
+            requeued = conn.execute(
+                "UPDATE shows SET tvdb_match_status = NULL "
+                "WHERE tvdb_match_status = 'matched' AND tvdb_id IS NOT NULL "
+                "AND (imdb_id IS NULL OR imdb_id = '' OR tmdb_id IS NULL)").rowcount
+            conn.execute("INSERT INTO video_settings (key, value) VALUES (?, '1') "
+                         "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                         (VideoDatabase._TVDB_REMOTE_IDS_MARKER,))
+            if requeued:
+                logger.info("tvdb: %d show(s) queued once to read their linked ids", requeued)
+
     _SEASON_MONITOR_MARKER = "season_monitor_backfill_done"
+    _STREAMING_COUNT_MARKER = "streaming_count_backfill_done"
+    _TRAKT_LISTS_MARKER = "trakt_lists_backfill_done"
+    _TVDB_REMOTE_IDS_MARKER = "tvdb_remote_ids_backfill_done"
 
     # ── enrichment plumbing (per-source match status, like music) ─────────────
     def enrichment_next(self, service: str, retry_days: int = 30, priority=None) -> dict | None:
@@ -1340,6 +1448,18 @@ class VideoDatabase:
             # User-locked fields belong to the user — enrichment never touches
             # them, not even to fill a deliberately-blanked value.
             locked = self._locked_fields_set(conn, tbl, item_id)
+            had_tmdb = None
+            if service == "tvdb" and tbl == "shows" and metadata and (
+                    metadata.get("tmdb_id") is not None or metadata.get("imdb_id")):
+                had_tmdb = conn.execute("SELECT tmdb_id, imdb_id FROM shows WHERE id=?",
+                                        (item_id,)).fetchone()
+                # the ids TVDB links the series to only fill a gap when they
+                # agree with the ids the show already has: a series that names
+                # another TMDB or IMDb id is another show (a stored tvdb id that
+                # was a title-search guess), and its other id would be wrong too
+                if had_tmdb is not None and _ids_disagree(had_tmdb, metadata):
+                    metadata = {k: v for k, v in metadata.items() if k not in ("tmdb_id", "imdb_id")}
+                    had_tmdb = None
             sql, params = build(True, locked)
             try:
                 conn.execute(sql, params)
@@ -1347,6 +1467,13 @@ class VideoDatabase:
                 conn.rollback()
                 sql, params = build(False, locked)   # keep existing id, just record status/metadata
                 conn.execute(sql, params)
+            # a TMDB id TVDB just filled in: TMDB can now enrich the show by id,
+            # so send it back through TMDB's queue rather than wait out a
+            # not_found retry
+            if had_tmdb is not None and had_tmdb["tmdb_id"] is None and metadata.get("tmdb_id") is not None:
+                conn.execute("UPDATE shows SET tmdb_match_status = NULL, tmdb_last_attempted = NULL "
+                             "WHERE id=? AND tmdb_id IS NOT NULL "
+                             "AND COALESCE(tmdb_match_status, '') != 'matched'", (item_id,))
             # Genres backfill — only when the item has none yet (enrichment fills
             # the gap the server didn't). Written to the normalised link tables.
             genres = (metadata or {}).get("genres")
@@ -2660,8 +2787,8 @@ class VideoDatabase:
         "overview", "tagline", "status", "rating", "rating_critic", "content_rating",
         "network", "studio", "first_air_date", "last_air_date", "airs_time",
         "release_date", "runtime_minutes", "tmdb_collection_id", "tmdb_collection_name",
-        "trakt_rating", "trakt_votes", "tvmaze_rating", "anilist_score",
-        "wikidata_url", "streaming", "mediastinger", "awards", "subtitle_langs",
+        "trakt_rating", "trakt_votes", "trakt_lists", "tvmaze_rating", "anilist_score",
+        "wikidata_url", "streaming", "streaming_count", "mediastinger", "awards", "subtitle_langs",
     }
 
     def item_matches(self, kind: str, item_id: int) -> list | None:
@@ -3398,7 +3525,8 @@ class VideoDatabase:
                   "client_ref",   # torrent/usenet client tracking id
                   "indexer_id",   # prowlarr indexer that served it (per indexer seed goals)
                   "quality_profile_id",   # the profile the grab was judged under (P2)
-                  "video_library_id")     # a second copy's library (#2029)
+                  "video_library_id",     # a second copy's library (#2029)
+                  "profile_id")           # who started it by hand (None = automatic)
 
     def add_video_download(self, rec: dict) -> int:
         """Insert a download row (status defaults to 'downloading'); returns its id."""
@@ -3416,13 +3544,18 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def list_video_downloads(self, limit: int = 100) -> list:
+    def list_video_downloads(self, limit: int = 100, profile_id=None) -> list:
+        """the queue, live rows first. ``profile_id`` keeps only the rows that
+        profile started by hand (a member's own queue)."""
+        where, args = "", []
+        if profile_id is not None:
+            where, args = "WHERE profile_id = ? ", [int(profile_id)]
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                "SELECT * FROM video_downloads ORDER BY "
+                "SELECT * FROM video_downloads " + where + "ORDER BY "
                 "CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, "
-                "id DESC LIMIT ?", (int(limit),)
+                "id DESC LIMIT ?", (*args, int(limit))
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -4693,15 +4826,17 @@ class VideoDatabase:
                        (download_id, kind, media_type, title, year, season_number, episode_number,
                         release_title, source, username, filename, dest_path, size_bytes,
                         quality_label, resolution, video_codec, media_id, media_source, poster_url,
-                        outcome, error, grabbed_at, completed_at, channel_id, published_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        outcome, error, grabbed_at, completed_at, channel_id, published_at,
+                        profile_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (row.get("id"), kind, media_type, row.get("title"), row.get("year"), sn, en,
                  rel, row.get("source"), row.get("username"), fn, row.get("dest_path"),
                  int(row.get("size_bytes") or 0), row.get("quality_label"),
                  self._parse_resolution(rel, fn, row.get("quality_label")), self._codec(rel, fn),
                  row.get("media_id"), row.get("media_source"), row.get("poster_url"),
                  outcome, row.get("error"), row.get("created_at"),
-                 row.get("completed_at"), channel_id, published_at))
+                 row.get("completed_at"), channel_id, published_at,
+                 int(row["profile_id"]) if row.get("profile_id") is not None else None))
             # Opportunistic LOG trim (the user-visible diary keeps a rolling year;
             # the YouTube ownership ledger is exempt and lives forever).
             conn.execute(
@@ -4717,9 +4852,10 @@ class VideoDatabase:
             conn.close()
 
     def query_download_history(self, *, kind=None, search=None, outcome=None,
-                               page=1, limit=40) -> dict:
+                               page=1, limit=40, profile_id=None) -> dict:
         """Paged history slice for the modal. ``kind`` ∈ movie|show (None=all);
-        ``outcome`` filters by result. Newest first. {items, pagination}."""
+        ``outcome`` filters by result; ``profile_id`` keeps only the grabs that
+        profile started (a member's own). Newest first. {items, pagination}."""
         try:
             page = max(1, int(page or 1)); limit = max(1, min(200, int(limit or 40)))
         except (TypeError, ValueError):
@@ -4738,6 +4874,8 @@ class VideoDatabase:
             where.append(_yt)
         if outcome:
             where.append("outcome = ?"); args.append(outcome)
+        if profile_id is not None:
+            where.append("profile_id = ?"); args.append(int(profile_id))
         s = (search or "").strip()
         if s:
             where.append("(title LIKE ? OR release_title LIKE ?) COLLATE NOCASE")
@@ -4766,7 +4904,7 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def download_history_counts(self) -> dict:
+    def download_history_counts(self, profile_id=None) -> dict:
         """{movie, show(=TV: episodes + show/season packs), youtube, total} of completed
         grabs (for the modal tabs/badge). Classifies by kind+source so episodes (kind=
         'episode') land under TV and YouTube (source='youtube') gets its own bucket —
@@ -4780,7 +4918,9 @@ class VideoDatabase:
                 "SUM(CASE WHEN kind = 'movie' AND NOT " + _yt + " THEN 1 ELSE 0 END) AS mv, "
                 "SUM(CASE WHEN kind <> 'movie' AND NOT " + _yt + " THEN 1 ELSE 0 END) AS tv, "
                 "COUNT(*) AS total FROM video_download_history "
-                "WHERE outcome='completed' AND cleared_at IS NULL").fetchone()
+                "WHERE outcome='completed' AND cleared_at IS NULL"
+                + ("" if profile_id is None else " AND profile_id = ?"),
+                () if profile_id is None else (int(profile_id),)).fetchone()
             return {"movie": row["mv"] or 0, "show": row["tv"] or 0,
                     "youtube": row["yt"] or 0, "total": row["total"] or 0}
         finally:
@@ -5605,7 +5745,7 @@ class VideoDatabase:
         cast = [{"name": r["name"], "character": r["character"], "photo": r["photo_url"],
                  "tmdb_id": r["tmdb_id"]}
                 for r in rows if r["department"] == "cast"][:cast_limit]
-        crew = [{"name": r["name"], "job": r["job"], "tmdb_id": r["tmdb_id"]}
+        crew = [{"name": r["name"], "job": r["job"], "tmdb_id": r["tmdb_id"], "photo": r["photo_url"]}
                 for r in rows if r["department"] == "crew"]
         return {"cast": cast, "crew": crew}
 
@@ -5615,7 +5755,7 @@ class VideoDatabase:
         (default); a FULL scan passes False for a clean reset."""
         conn = self._get_connection()
         try:
-            self._resilient_upsert(conn, "movies", {
+            base = {
                 "server_source": server_source, "server_id": item["server_id"],
                 "title": item.get("title"), "sort_title": _sort_title(item.get("title")),
                 "year": item.get("year"), "overview": item.get("overview"),
@@ -5627,8 +5767,15 @@ class VideoDatabase:
                 "view_offset_ms": item.get("view_offset_ms"),
                 "poster_url": item.get("poster_url"),
                 "has_file": 1 if (item.get("files") or item.get("file")) else 0,
-            }, {"tmdb_id": item.get("tmdb_id"), "imdb_id": item.get("imdb_id")},
-                preserve_enrichment=preserve_enrichment)
+            }
+            # when the SERVER added it (added_at is when SoulSync first saw the
+            # row). only written when the scan has one, so a path that doesn't
+            # carry it never blanks a stored date
+            if item.get("server_added_at"):
+                base["server_added_at"] = item["server_added_at"]
+            self._resilient_upsert(conn, "movies", base,
+                                   {"tmdb_id": item.get("tmdb_id"), "imdb_id": item.get("imdb_id")},
+                                   preserve_enrichment=preserve_enrichment)
             movie_id = conn.execute(
                 "SELECT id FROM movies WHERE server_source=? AND server_id=?",
                 (server_source, item["server_id"]),
@@ -7741,6 +7888,17 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def hands_off_ids(self) -> set:
+        """{(kind, library id)} of every padlocked movie and show, one read"""
+        conn = self._get_connection()
+        try:
+            return {(kind, int(r[0])) for kind, table in (("movie", "movies"), ("show", "shows"))
+                    for r in conn.execute(f"SELECT id FROM {table} WHERE hands_off=1")}
+        except sqlite3.Error:
+            return set()
+        finally:
+            conn.close()
+
     def hands_off_tmdb_ids(self) -> dict:
         """{'movie': {tmdb ids}, 'show': {tmdb ids}} of the padlocked titles"""
         out = {"movie": set(), "show": set()}
@@ -9310,6 +9468,322 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    # ── Shelf Life (core/video/shelf_life.py, repair/shelf_life.py) ──────────
+    _SL_RATING_COLS = ("rating", "imdb_rating", "rt_rating", "metacritic", "anilist_score",
+                       "trakt_votes", "trakt_lists", "awards", "streaming_status", "streaming_count")
+
+    def shelf_life_movies(self, trust_after_days: int = 90) -> list:
+        """every owned movie with what Shelf Life scores it on: ratings,
+        streaming, runtime, when it came into the library, the owner's watch
+        state and the size of all its files.
+
+        the server's add date (Plex addedAt / Jellyfin DateCreated) often comes
+        from the file, and an *arr that stamps files with the release date makes
+        it the release date. so it only counts when it falls trust_after_days or
+        more after the release; otherwise it's the day SoulSync first saw the
+        movie (``added_from`` says which), so a title's time unwatched is never
+        overstated."""
+        cols = ", ".join("m." + c for c in self._SL_RATING_COLS)
+        trusted = ("(m.server_added_at IS NOT NULL AND m.release_date IS NOT NULL "
+                   "AND julianday(m.server_added_at) - julianday(m.release_date) >= ?)")
+        days = int(trust_after_days)
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT m.id, m.tmdb_id, m.server_source, m.title, m.year, "
+                f"CASE WHEN {trusted} THEN m.server_added_at ELSE m.added_at END AS added_at, "
+                f"CASE WHEN {trusted} THEN 'server' ELSE 'first_seen' END AS added_from, "
+                "m.runtime_minutes, m.hands_off, "
+                "m.play_count, m.last_viewed_at, m.view_offset_ms, " + cols + ", "
+                "(SELECT COALESCE(SUM(f.size_bytes), 0) FROM media_files f WHERE f.movie_id = m.id) "
+                "AS size_bytes "
+                "FROM movies m WHERE m.has_file = 1", (days, days))]
+        finally:
+            conn.close()
+
+    def shelf_life_shows(self, trust_after_days: int = 90) -> list:
+        """every show with at least one owned episode, with ratings, streaming,
+        airing status, the owned episodes' size and runtime (an episode with no
+        runtime borrows the show's), and the owner's watch state over those
+        episodes: how many watched, plays, last watch, and the last watch of an
+        episode left part-way.
+
+        it came into the library with its earliest episode whose server add
+        date falls trust_after_days or more after that episode aired (an earlier
+        one may be the air date stamped on the file); with none, the day
+        SoulSync first saw the show (``added_from`` says which)."""
+        cols = ", ".join("s." + c for c in self._SL_RATING_COLS)
+        trusted = ("MIN(CASE WHEN e.added_at IS NOT NULL AND e.air_date IS NOT NULL "
+                   "AND julianday(e.added_at) - julianday(e.air_date) >= ? THEN e.added_at END)")
+        days = int(trust_after_days)
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT s.id, s.tmdb_id, s.server_source, s.title, s.year, s.status, s.series_type, s.hands_off, "
+                f"COALESCE({trusted}, s.added_at) AS added_at, "
+                f"CASE WHEN {trusted} IS NULL THEN 'first_seen' ELSE 'server' END AS added_from, "
+                + cols + ", "
+                "COUNT(e.id) AS owned_episodes, "
+                "SUM(CASE WHEN COALESCE(e.play_count, 0) > 0 THEN 1 ELSE 0 END) AS watched_episodes, "
+                "COALESCE(SUM(e.play_count), 0) AS plays, "
+                "MAX(e.last_viewed_at) AS last_viewed_at, "
+                "MAX(CASE WHEN COALESCE(e.view_offset_ms, 0) > 0 THEN e.last_viewed_at END) "
+                "AS in_progress_at, "
+                "SUM(COALESCE(e.runtime_minutes, s.runtime_minutes)) AS runtime_minutes, "
+                "(SELECT COALESCE(SUM(f.size_bytes), 0) FROM media_files f "
+                " JOIN episodes e2 ON e2.id = f.episode_id WHERE e2.show_id = s.id) AS size_bytes "
+                "FROM shows s JOIN episodes e ON e.show_id = s.id AND e.has_file = 1 "
+                "GROUP BY s.id", (days, days))]
+        finally:
+            conn.close()
+
+    def shelf_life_show_watch_by_profile(self) -> dict:
+        """{show_id: {profile_id: {watched_episodes, plays, last_viewed_at,
+        in_progress_at}}} from each profile's own watch state, over owned
+        episodes only -- the show-side twin of repair_movie_watch_by_profile."""
+        conn = self._get_connection()
+        try:
+            out: dict = {}
+            for r in conn.execute(
+                    "SELECT e.show_id, w.profile_id, "
+                    "SUM(CASE WHEN w.play_count > 0 THEN 1 ELSE 0 END) AS watched_episodes, "
+                    "SUM(w.play_count) AS plays, MAX(w.last_viewed_at) AS last_viewed_at, "
+                    "MAX(CASE WHEN w.view_offset_ms > 0 THEN w.last_viewed_at END) AS in_progress_at "
+                    "FROM video_watch_state w JOIN episodes e ON e.id = w.item_id AND e.has_file = 1 "
+                    "WHERE w.kind = 'episode' GROUP BY e.show_id, w.profile_id"):
+                out.setdefault(r["show_id"], {})[r["profile_id"]] = {
+                    "watched_episodes": r["watched_episodes"] or 0, "plays": r["plays"] or 0,
+                    "last_viewed_at": r["last_viewed_at"], "in_progress_at": r["in_progress_at"]}
+            return out
+        finally:
+            conn.close()
+
+    def shelf_life_episode_shows(self, episode_ids) -> dict:
+        """{episode id: show id} for owned episodes among ``episode_ids`` --
+        how a play of one episode counts toward its show."""
+        ids = [int(i) for i in (episode_ids or [])]
+        out: dict = {}
+        conn = self._get_connection()
+        try:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                q = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                        f"SELECT id, show_id FROM episodes WHERE has_file = 1 AND id IN ({q})", chunk):
+                    out[int(r[0])] = int(r[1])
+            return out
+        finally:
+            conn.close()
+
+    def shelf_life_external_index(self) -> dict:
+        """how a play on a server the library wasn't scanned from finds its
+        rows: {'movie': {tmdb id: [movie ids]}, 'show': {('tmdb'|'tvdb', id):
+        [show ids]}, 'episode': {(show id, season, episode): episode id}}, for
+        owned movies and episodes only."""
+        out: dict = {"movie": {}, "show": {}, "episode": {}}
+        conn = self._get_connection()
+        try:
+            for mid, tmdb in conn.execute(
+                    "SELECT id, tmdb_id FROM movies WHERE has_file = 1 AND tmdb_id IS NOT NULL"):
+                out["movie"].setdefault(int(tmdb), []).append(int(mid))
+            for sid, tmdb, tvdb in conn.execute(
+                    "SELECT id, tmdb_id, tvdb_id FROM shows WHERE tmdb_id IS NOT NULL OR tvdb_id IS NOT NULL"):
+                if tmdb is not None:
+                    out["show"].setdefault(("tmdb", int(tmdb)), []).append(int(sid))
+                if tvdb is not None:
+                    out["show"].setdefault(("tvdb", int(tvdb)), []).append(int(sid))
+            for eid, sid, sn, en in conn.execute(
+                    "SELECT id, show_id, season_number, episode_number FROM episodes WHERE has_file = 1"):
+                out["episode"][(int(sid), int(sn), int(en))] = int(eid)
+            return out
+        finally:
+            conn.close()
+
+    def shelf_life_requests(self) -> dict:
+        """{(kind, tmdb_id): {profile_id, available_at}} -- the latest APPROVED
+        movie or show request per title."""
+        conn = self._get_connection()
+        try:
+            out: dict = {}
+            for r in conn.execute(
+                    "SELECT kind, tmdb_id, profile_id, available_at FROM video_requests "
+                    "WHERE status = 'approved' AND kind IN ('movie', 'show') AND tmdb_id > 0 "
+                    "ORDER BY COALESCE(resolved_at, created_at), id"):
+                out[(r["kind"], int(r["tmdb_id"]))] = {"profile_id": r["profile_id"],
+                                                        "available_at": r["available_at"]}
+            return out
+        finally:
+            conn.close()
+
+    def shelf_life_failed_grabs(self) -> dict:
+        """{(kind, media_source, media_id): count} of grabs that failed or failed
+        to import, from the download history. media_source is 'tmdb' (grabbed
+        from the TMDB page) or 'library' (NULL on older rows counts as library)."""
+        conn = self._get_connection()
+        try:
+            return {(r["kind"], r["src"], str(r["media_id"])): int(r["n"]) for r in conn.execute(
+                "SELECT kind, COALESCE(media_source, 'library') AS src, media_id, COUNT(*) AS n "
+                "FROM video_download_history WHERE outcome IN ('failed', 'import_failed') "
+                "AND media_id IS NOT NULL AND kind IN ('movie', 'show') "
+                "GROUP BY kind, src, media_id")}
+        finally:
+            conn.close()
+
+    def shelf_life_grab_history_ids(self) -> set:
+        """{(kind, media_source, media_id)} of every title with ANY grab in the
+        history -- a title never grabbed here has no grab data at all, which is
+        not the same as grabbing it first time."""
+        conn = self._get_connection()
+        try:
+            return {(r["kind"], r["src"], str(r["media_id"])) for r in conn.execute(
+                "SELECT DISTINCT kind, COALESCE(media_source, 'library') AS src, media_id "
+                "FROM video_download_history WHERE media_id IS NOT NULL AND kind IN ('movie', 'show')")}
+        finally:
+            conn.close()
+
+    def shelf_life_followed_airing(self, profile_ids) -> set:
+        """tmdb ids of shows still airing that someone follows: an explicit
+        follow, or the default follow an airing library show has for every
+        profile that hasn't muted it (the watchlist's own rule). airing is
+        the calendar's loose rule (_LOOSE_ACTIVE_SHOW_SQL): a show whose
+        status isn't known yet counts as airing, the safe side for a delete."""
+        pids = sorted({int(p) for p in (profile_ids or [])}) or [1]
+        conn = self._get_connection()
+        try:
+            out = set()
+            for r in conn.execute(
+                    "SELECT s.tmdb_id, "
+                    "(SELECT COUNT(*) FROM video_watchlist w WHERE w.kind = 'show' "
+                    " AND w.tmdb_id = s.tmdb_id AND w.state = 'follow') AS follows, "
+                    "(SELECT COUNT(DISTINCT w.profile_id) FROM video_watchlist w WHERE w.kind = 'show' "
+                    " AND w.tmdb_id = s.tmdb_id AND w.state = 'mute' AND w.profile_id IN ("
+                    + ",".join("?" * len(pids)) + ")) AS mutes "
+                    "FROM shows s WHERE s.tmdb_id IS NOT NULL AND "
+                    # the calendar's loose rule: a show with no status yet is
+                    # not assumed ended, so an enrichment gap never lets it go
+                    "(s.status IS NULL OR TRIM(s.status) = '' "
+                    " OR LOWER(s.status) NOT IN ('ended', 'canceled', 'cancelled'))", pids):
+                if r["follows"] or r["mutes"] < len(pids):
+                    out.add(int(r["tmdb_id"]))
+            return out
+        finally:
+            conn.close()
+
+    def shelf_life_pending_entities(self, finding_type: str) -> set:
+        """entity ids of PENDING findings of one type (e.g. 'm:12' for
+        watched_cleanup), so two jobs never flag the same title."""
+        conn = self._get_connection()
+        try:
+            return {r["entity_id"] for r in conn.execute(
+                "SELECT entity_id FROM video_repair_findings WHERE finding_type = ? "
+                "AND status = 'pending' AND entity_id IS NOT NULL", (finding_type,))}
+        finally:
+            conn.close()
+
+    def shelf_life_keeps(self) -> set:
+        """{(kind, tmdb_id)} an admin marked Keep."""
+        conn = self._get_connection()
+        try:
+            return {(r["kind"], int(r["tmdb_id"])) for r in conn.execute(
+                "SELECT kind, tmdb_id FROM video_shelf_life_keep")}
+        finally:
+            conn.close()
+
+    def shelf_life_badges(self, kind: str) -> dict:
+        """{item_id: {score, gate}} for every title of one kind the job stored,
+        for the library page's badges and sort (none of the reasons)."""
+        if kind not in ("movie", "show"):
+            return {}
+        conn = self._get_connection()
+        try:
+            return {r["item_id"]: {"score": r["score"], "gate": r["gate"]} for r in conn.execute(
+                "SELECT item_id, score, gate FROM video_shelf_life WHERE kind = ?", (kind,))}
+        finally:
+            conn.close()
+
+    def shelf_life_scored(self, kind: str) -> bool:
+        """has the Shelf Life job stored any result for this kind yet?"""
+        if kind not in ("movie", "show"):
+            return False
+        conn = self._get_connection()
+        try:
+            return conn.execute("SELECT 1 FROM video_shelf_life WHERE kind = ? LIMIT 1", (kind,)).fetchone() is not None
+        finally:
+            conn.close()
+
+    def shelf_life_title(self, kind: str, item_id) -> dict | None:
+        """{id, tmdb_id, title, year} of one library movie or show, or None."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table:
+            return None
+        conn = self._get_connection()
+        try:
+            r = conn.execute(f"SELECT id, tmdb_id, title, year FROM {table} WHERE id = ?", (int(item_id),)).fetchone()
+            return dict(r) if r else None
+        finally:
+            conn.close()
+
+    def shelf_life_set_keep(self, kind: str, tmdb_id, keep: bool, set_by=None) -> bool:
+        """mark (or unmark) a title Keep. False for a bad kind or no tmdb id."""
+        if kind not in ("movie", "show") or not tmdb_id:
+            return False
+        conn = self._get_connection()
+        try:
+            if keep:
+                conn.execute("INSERT INTO video_shelf_life_keep (kind, tmdb_id, set_by) VALUES (?, ?, ?) "
+                             "ON CONFLICT(kind, tmdb_id) DO UPDATE SET set_by = excluded.set_by, "
+                             "set_at = datetime('now')", (kind, int(tmdb_id), set_by))
+            else:
+                conn.execute("DELETE FROM video_shelf_life_keep WHERE kind = ? AND tmdb_id = ?",
+                             (kind, int(tmdb_id)))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def shelf_life_save(self, kind: str, results: list) -> int:
+        """replace a kind's stored scores with this run's: each result is
+        {item_id, score, gate, signals, reasons, size_bytes}. a title the run
+        didn't score (gone from the library) drops out. returns rows written."""
+        if kind not in ("movie", "show"):
+            return 0
+        conn = self._get_connection()
+        try:
+            conn.execute("DELETE FROM video_shelf_life WHERE kind = ?", (kind,))
+            conn.executemany(
+                "INSERT INTO video_shelf_life (kind, item_id, score, gate, signals_json, reasons_json, "
+                "size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(kind, int(r["item_id"]), r.get("score"), r.get("gate"),
+                  json.dumps(r.get("signals") or {}), json.dumps(r.get("reasons") or []),
+                  r.get("size_bytes")) for r in results])
+            conn.commit()
+            return len(results)
+        finally:
+            conn.close()
+
+    def shelf_life_get(self, kind: str, item_ids) -> dict:
+        """{item_id: {score, gate, signals, reasons, size_bytes, scored_at}} for
+        the ids given; a title never scored is simply absent."""
+        ids = [int(i) for i in (item_ids or [])]
+        if kind not in ("movie", "show") or not ids:
+            return {}
+        conn = self._get_connection()
+        try:
+            out = {}
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                for r in conn.execute(
+                        "SELECT item_id, score, gate, signals_json, reasons_json, size_bytes, scored_at "
+                        "FROM video_shelf_life WHERE kind = ? AND item_id IN (" + ",".join("?" * len(chunk)) + ")",
+                        [kind] + chunk):
+                    out[r["item_id"]] = {"score": r["score"], "gate": r["gate"],
+                                         "signals": json.loads(r["signals_json"] or "{}"),
+                                         "reasons": json.loads(r["reasons_json"] or "[]"),
+                                         "size_bytes": r["size_bytes"], "scored_at": r["scored_at"]}
+            return out
+        finally:
+            conn.close()
+
     def repair_mark_movie_fileless(self, movie_id) -> None:
         """After a cleanup fix recycled the movie's file: reflect reality now
         (has_file=0, file rows gone) instead of waiting for the weekly deep
@@ -9380,7 +9854,7 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             movies = [dict(r) for r in conn.execute(
-                "SELECT 'movie' AS scope, m.id AS item_id, f.id AS file_id, "
+                "SELECT 'movie' AS scope, m.id AS item_id, m.id AS title_id, f.id AS file_id, "
                 "m.title, m.year, m.tmdb_id, m.imdb_id, NULL AS tvdb_id, "
                 "NULL AS season, NULL AS episode, "
                 "NULL AS episode_title, NULL AS series, "
@@ -9388,7 +9862,7 @@ class VideoDatabase:
                 "FROM movies m JOIN media_files f ON f.movie_id = m.id "
                 "WHERE m.has_file = 1 AND m.hands_off = 0")]
             eps = [dict(r) for r in conn.execute(
-                "SELECT 'episode' AS scope, e.id AS item_id, f.id AS file_id, "
+                "SELECT 'episode' AS scope, e.id AS item_id, e.show_id AS title_id, f.id AS file_id, "
                 "s.title AS title, "
                 # the show's year, as mass rename reads it -- a NULL here rendered
                 # every '$series ($year)' episode path without its year
@@ -10167,7 +10641,7 @@ class VideoDatabase:
             conn.commit()
             # A refresh-upsert of an existing follow is not a new follow.
             if not (was and was["state"] == "follow"):
-                _publish_video_event("video_watchlist_added", {"kind": kind, "title": title})
+                _publish_video_event("video_watchlist_added", {"kind": kind, "title": title}, owner=profile_id)
             return True
         except Exception:
             logger.exception("add_to_watchlist failed (%s %s)", kind, tmdb_id)
@@ -10288,6 +10762,38 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def wishing_profile_ids(self, *, kind: str, tmdb_id=None, season_number=None,
+                            episode_number=None, youtube_id=None) -> list:
+        """the profiles whose wishlist wants this title: a movie, one episode
+        (or a whole season with no episode), or a youtube video. whose a
+        download is when nobody grabbed it by hand. [] on any error."""
+        conn = self._get_connection()
+        try:
+            if youtube_id:
+                rows = conn.execute("SELECT DISTINCT profile_id FROM video_wishlist "
+                                    "WHERE kind='video' AND source_id=?", (str(youtube_id),))
+            elif kind == "movie" and tmdb_id:
+                rows = conn.execute("SELECT DISTINCT profile_id FROM video_wishlist "
+                                    "WHERE kind='movie' AND tmdb_id=?", (int(tmdb_id),))
+            elif tmdb_id:
+                sql = "SELECT DISTINCT profile_id FROM video_wishlist WHERE kind='episode' AND tmdb_id=?"
+                args = [int(tmdb_id)]
+                if season_number not in (None, ""):
+                    sql += " AND season_number=?"
+                    args.append(int(season_number))
+                if episode_number not in (None, ""):
+                    sql += " AND episode_number=?"
+                    args.append(int(episode_number))
+                rows = conn.execute(sql, args)
+            else:
+                return []
+            return sorted(int(r[0]) for r in rows if r[0] is not None)
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.debug("wishing_profile_ids failed", exc_info=True)
+            return []
+        finally:
+            conn.close()
+
     def remove_from_watchlist(self, kind: str, tmdb_id: int, profile_id: int = 1) -> bool:
         """Un-follow. Stored as a 'mute' tombstone (not a delete) so an
         actively-airing library show — watched by default — is not silently
@@ -10313,7 +10819,7 @@ class VideoDatabase:
             # (muting something never followed is just a tombstone write).
             if was and was["state"] == "follow":
                 _publish_video_event("video_watchlist_removed",
-                                     {"kind": kind, "title": was["title"] or ""})
+                                     {"kind": kind, "title": was["title"] or ""}, owner=profile_id)
             return True
         finally:
             conn.close()
@@ -10569,7 +11075,8 @@ class VideoDatabase:
     def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None,
                               library_id=None, server_source=None, status='wanted',
                               detail_json=None, profile_id: int = 1,
-                              video_library_id=None, quality_profile_id=None) -> bool:
+                              video_library_id=None, quality_profile_id=None,
+                              awaiting_selection: bool = False) -> bool:
         """Wish for a movie. Idempotent upsert on (profile_id, tmdb id, video
         library). ``video_library_id`` wishes a second copy in that library
         (#2029); None is the title's own library, as every wish was before.
@@ -10585,6 +11092,10 @@ class VideoDatabase:
         ``detail_json`` is a rich TMDB-detail blob (backdrop/overview/genres/cast/etc.,
         captured at add time) so the wishlist renders a full card without re-fetching; it's
         only filled in, never wiped, on re-add.
+
+        ``awaiting_selection`` holds the row for a release pick (#2199, a
+        request approved that way): set on the add itself, so no drain tick
+        can take it in between. a re-add never clears a hold.
         """
         if not tmdb_id or not title:
             return False
@@ -10603,10 +11114,11 @@ class VideoDatabase:
                 "AND video_library_id IS ?",
                 (int(profile_id), int(tmdb_id), vlib)).fetchone()
             conn.execute(
-                """INSERT INTO video_wishlist (profile_id, kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, video_library_id, quality_profile_id)
-                   VALUES (?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO video_wishlist (profile_id, kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, video_library_id, quality_profile_id, awaiting_selection)
+                   VALUES (?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(profile_id, tmdb_id, COALESCE(video_library_id, 0)) WHERE kind='movie' DO UPDATE SET
                        title=excluded.title,
+                       awaiting_selection=MAX(video_wishlist.awaiting_selection, excluded.awaiting_selection),
                        poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
                        year=COALESCE(excluded.year, video_wishlist.year),
                        library_id=COALESCE(excluded.library_id, video_wishlist.library_id),
@@ -10614,11 +11126,11 @@ class VideoDatabase:
                        status=CASE WHEN video_wishlist.status='monitored' AND excluded.status='wanted'
                                    THEN 'wanted' ELSE video_wishlist.status END""",
                 (int(profile_id), int(tmdb_id), title, poster_url, year, library_id, server_source, status,
-                 detail_json, vlib, quality_profile_id))
+                 detail_json, vlib, quality_profile_id, 1 if awaiting_selection else 0))
             conn.commit()
             if not existed:   # a refresh-upsert is not a new wish
                 _publish_video_event("video_wishlist_item_added",
-                                     {"kind": "movie", "title": title, "count": 1})
+                                     {"kind": "movie", "title": title, "count": 1}, owner=profile_id)
             return True
         except Exception:
             logger.exception("add_movie_to_wishlist failed (%s)", tmdb_id)
@@ -10702,6 +11214,8 @@ class VideoDatabase:
                 "(SELECT m.imdb_id FROM movies m WHERE m.tmdb_id=w.tmdb_id) AS imdb_id "
                 "FROM video_wishlist w "
                 "WHERE w.kind='movie' AND w.status='wanted' AND w.tmdb_id IS NOT NULL "
+                # held for a release pick (#2199): an admin chooses, not the drain
+                "AND w.awaiting_selection = 0 "
                 + _pf
                 + (" AND " + _due_sql("w") + " " if due_only else "")
                 +
@@ -10885,7 +11399,9 @@ class VideoDatabase:
                 # still airing has no pack yet, so the drain shouldn't look for one
                 "(SELECT MAX(e.air_date) FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number) AS season_last_air "
-                "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id IS NOT NULL " + _pf
+                "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id IS NOT NULL "
+                # held for a release pick (#2199): an admin chooses, not the drain
+                "AND w.awaiting_selection = 0 " + _pf
                 + (" AND " + _due_sql("w") + " " if due_only else "")
                 # Un-following a show means stop bothering with it. The airing scan
                 # already refuses to ADD episodes for a muted show; episodes wished
@@ -10918,7 +11434,9 @@ class VideoDatabase:
         """Wishlist rows shaped EXACTLY like the to_download queries, for a
         user-initiated 'Search now' — but WITHOUT the release-window gate and
         (movies) without the status gate: the click is the override, same as
-        Sonarr's manual search. scope: 'movie' → that movie; 'show' → every
+        Sonarr's manual search. a row held for a release pick (#2199) is left
+        out: this search grabs the best match itself (and the download
+        monitor's retries come through here), the held row waits for a pick. scope: 'movie' → that movie; 'show' → every
         wished episode of the show; 'season' → that season; 'episode' → one row."""
         if not tmdb_id:
             return []
@@ -10942,7 +11460,7 @@ class VideoDatabase:
                     "   AND tp.tmdb_id = w.tmdb_id)) END) AS quality_profile_id, "
                     "(SELECT m.imdb_id FROM movies m WHERE m.tmdb_id=w.tmdb_id) AS imdb_id "
                     "FROM video_wishlist w "
-                    "WHERE w.profile_id=? AND w.kind='movie' AND w.tmdb_id=?" + vsql.replace(
+                    "WHERE w.profile_id=? AND w.kind='movie' AND w.tmdb_id=? AND w.awaiting_selection = 0" + vsql.replace(
                         "video_library_id", "w.video_library_id"),
                     [int(profile_id), int(tmdb_id)] + vargs)]
             where, args = "", [int(tmdb_id)]
@@ -10978,18 +11496,20 @@ class VideoDatabase:
                 "(SELECT MAX(s.imdb_id) FROM shows s WHERE s.tmdb_id = w.tmdb_id) AS imdb_id, "
                 "(SELECT MIN(COALESCE(s.year, CAST(substr(NULLIF(s.first_air_date, ''), 1, 4) AS INTEGER))) "
                 "  FROM shows s WHERE s.tmdb_id = w.tmdb_id) AS show_year "
-                "FROM video_wishlist w WHERE w.profile_id=? AND w.kind='episode' AND w.tmdb_id=?" + where +
+                "FROM video_wishlist w WHERE w.profile_id=? AND w.kind='episode' AND w.tmdb_id=? AND w.awaiting_selection = 0" + where +
                 " ORDER BY w.season_number, w.episode_number", [int(profile_id)] + args)]
         finally:
             conn.close()
 
     def add_episodes_to_wishlist(self, show_tmdb_id, show_title, episodes, *,
                                  poster_url=None, library_id=None, server_source=None,
-                                 profile_id: int = 1) -> int:
+                                 profile_id: int = 1, awaiting_selection: bool = False) -> int:
         """Wish for one or more episodes of a show (the show's tmdb id keys them).
         ``episodes`` = [{season_number, episode_number, title?, air_date?}, …].
         Idempotent per (profile, show, season, episode). Returns the count of
-        genuinely-new rows (re-wishing an already-wished episode returns 0 for it)."""
+        genuinely-new rows (re-wishing an already-wished episode returns 0 for it).
+        ``awaiting_selection`` holds the rows for a release pick (#2199); a
+        re-add never clears a hold."""
         if not show_tmdb_id or not show_title or not episodes:
             return 0
         conn = self._get_connection()
@@ -11005,10 +11525,11 @@ class VideoDatabase:
                     """INSERT INTO video_wishlist
                            (profile_id, kind, tmdb_id, title, poster_url, season_number, episode_number,
                             episode_title, still_url, episode_overview, season_poster_url,
-                            air_date, library_id, server_source)
-                       VALUES (?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            air_date, library_id, server_source, awaiting_selection)
+                       VALUES (?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(profile_id, tmdb_id, season_number, episode_number) WHERE kind='episode' DO UPDATE SET
                            title=excluded.title,
+                           awaiting_selection=MAX(video_wishlist.awaiting_selection, excluded.awaiting_selection),
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
                            episode_title=COALESCE(excluded.episode_title, video_wishlist.episode_title),
                            still_url=COALESCE(excluded.still_url, video_wishlist.still_url),
@@ -11018,14 +11539,14 @@ class VideoDatabase:
                            library_id=COALESCE(excluded.library_id, video_wishlist.library_id)""",
                     (int(profile_id), int(show_tmdb_id), show_title, poster_url, int(sn), int(en),
                      e.get("title"), e.get("still_url"), e.get("overview"), e.get("season_poster_url"),
-                     e.get("air_date"), library_id, server_source))
+                     e.get("air_date"), library_id, server_source, 1 if awaiting_selection else 0))
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE profile_id=? AND kind='episode' AND tmdb_id=?",
                 (int(profile_id), int(show_tmdb_id),)).fetchone()[0] - before_count
             conn.commit()
             if new_rows > 0:   # refresh-upserts of already-wished episodes don't fire
                 _publish_video_event("video_wishlist_item_added",
-                                     {"kind": "episode", "title": show_title, "count": new_rows})
+                                     {"kind": "episode", "title": show_title, "count": new_rows}, owner=profile_id)
             return new_rows
         except Exception:
             logger.exception("add_episodes_to_wishlist failed (%s)", show_tmdb_id)
@@ -11401,7 +11922,7 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             return [dict(r) for r in conn.execute(
-                "SELECT id, name, cutoff, items FROM quality_profiles ORDER BY name COLLATE NOCASE")]
+                "SELECT id, name, cutoff, items, media_type FROM quality_profiles ORDER BY name COLLATE NOCASE")]
         except sqlite3.Error:
             logger.exception("named_quality_profiles failed")
             return []
@@ -11411,7 +11932,7 @@ class VideoDatabase:
     def get_named_quality_profile(self, profile_id) -> dict | None:
         conn = self._get_connection()
         try:
-            row = conn.execute("SELECT id, name, cutoff, items FROM quality_profiles WHERE id=?",
+            row = conn.execute("SELECT id, name, cutoff, items, media_type FROM quality_profiles WHERE id=?",
                                (int(profile_id),)).fetchone()
             return dict(row) if row else None
         except (sqlite3.Error, TypeError, ValueError):
@@ -11445,6 +11966,27 @@ class VideoDatabase:
         except sqlite3.Error:
             logger.exception("upsert_named_quality_profile failed")
             return None
+        finally:
+            conn.close()
+
+    QUALITY_MEDIA_TYPES = ("movie", "tv")
+
+    def set_named_quality_profile_media_type(self, profile_id, media_type) -> bool:
+        """what a named profile is for: 'movie', 'tv', or None for both.
+        anything else is refused (ValueError), never stored."""
+        if media_type in ("", "both"):
+            media_type = None
+        if media_type is not None and media_type not in self.QUALITY_MEDIA_TYPES:
+            raise ValueError("media_type is movie, tv or null")
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("UPDATE quality_profiles SET media_type=? WHERE id=?",
+                               (media_type, int(profile_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.Error:
+            logger.exception("set_named_quality_profile_media_type failed")
+            return False
         finally:
             conn.close()
 
@@ -11934,6 +12476,55 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def episode_air_date(self, show_tmdb_id, season_number, episode_number):
+        """the episode's air date (YYYY-MM-DD) from the library, or None. a
+        daily show's release is named by it, so a manual search judges by it
+        the way the wishlist does (#2233). never raises."""
+        try:
+            args = (int(show_tmdb_id), int(season_number), int(episode_number))
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT e.air_date FROM episodes e JOIN shows s ON s.id = e.show_id "
+                "WHERE s.tmdb_id = ? AND e.season_number = ? AND e.episode_number = ? "
+                "AND e.air_date IS NOT NULL AND e.air_date <> '' LIMIT 1", args).fetchone()
+            return str(row["air_date"])[:10] if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def show_episode_census(self, show_id=None, tmdb_id=None) -> dict:
+        """{(season, episode): have} for every episode the library knows of a
+        show, named by its library id or its tmdb id. every library row of
+        that tmdb id counts, so an episode one server has is had. manual
+        search reads it to say what a pack covers and what you already have
+        (#2233). empty when the show isn't in the library. never raises."""
+        conn = self._get_connection()
+        try:
+            if tmdb_id in (None, "") and show_id not in (None, ""):
+                row = conn.execute("SELECT tmdb_id FROM shows WHERE id=?", (int(show_id),)).fetchone()
+                tmdb_id = row["tmdb_id"] if row else None
+            if tmdb_id not in (None, ""):
+                rows = conn.execute(
+                    "SELECT e.season_number AS s, e.episode_number AS e, MAX(e.has_file) AS have "
+                    "FROM episodes e WHERE e.show_id IN (SELECT id FROM shows WHERE tmdb_id = ?) "
+                    "GROUP BY e.season_number, e.episode_number", (int(tmdb_id),)).fetchall()
+            elif show_id not in (None, ""):
+                rows = conn.execute(
+                    "SELECT season_number AS s, episode_number AS e, has_file AS have "
+                    "FROM episodes WHERE show_id = ?", (int(show_id),)).fetchall()
+            else:
+                return {}
+            return {(int(r["s"]), int(r["e"])): bool(r["have"]) for r in rows
+                    if r["s"] is not None and r["e"] is not None}
+        except (sqlite3.Error, TypeError, ValueError):
+            return {}
+        finally:
+            conn.close()
+
     # ── requests (in-app Overseerr; arr-parity P4) ────────────────────────────
     def add_video_request(self, *, profile_id, requester_name, kind, tmdb_id, title,
                           year=None, poster_url=None, note=None, monitor="future",
@@ -11977,6 +12568,9 @@ class VideoDatabase:
                  str(youtube_id) if youtube_id else None,
                  str(channel_youtube_id) if channel_youtube_id else None,
                  str(channel_title) if channel_title else None))
+            # the request limit counts from this log, which outlives the row
+            conn.execute("INSERT OR IGNORE INTO video_request_log (profile_id, request_id, kind) "
+                         "VALUES (?, ?, ?)", (int(profile_id), cur.lastrowid, kind))
             conn.commit()
             return cur.lastrowid, True
         except sqlite3.Error:
@@ -12348,6 +12942,112 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    # ── approved requests held for a release pick (#2199) ───────────────
+    # video_requests.acquisition = 'manual' on the approved rows, and their
+    # wishlist rows awaiting_selection = 1 until the picked release lands
+    # (the import takes the row off the wishlist the usual way).
+
+    def set_video_requests_acquisition(self, ids, mode) -> int:
+        ids = [int(i) for i in ids or []]
+        if not ids or mode not in ("auto", "manual"):
+            return 0
+        ph = ",".join("?" * len(ids))
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(f"UPDATE video_requests SET acquisition=? WHERE id IN ({ph})", (mode, *ids))
+            conn.commit()
+            return cur.rowcount
+        except sqlite3.Error:
+            logger.exception("set_video_requests_acquisition failed")
+            return 0
+        finally:
+            conn.close()
+
+    def manual_video_requests(self) -> list:
+        """approved requests held for a pick, oldest approval first. arrived
+        or not: a show counts as arrived with its first episode, and the
+        rest of it can still be waiting for a pick."""
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM video_requests WHERE status='approved' AND acquisition='manual' "
+                "ORDER BY resolved_at, id")]
+        except sqlite3.Error:
+            logger.exception("manual_video_requests failed")
+            return []
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _held_where(kind, tmdb_id, season_number=None, episode_number=None, profile_ids=None):
+        wk = "movie" if kind == "movie" else "episode"
+        where = "kind=? AND tmdb_id=? AND awaiting_selection=1"
+        args: list = [wk, int(tmdb_id)]
+        if wk == "episode" and season_number is not None:
+            where += " AND season_number=?"
+            args.append(int(season_number))
+            if episode_number is not None:
+                where += " AND episode_number=?"
+                args.append(int(episode_number))
+        if profile_ids is not None:
+            pids = [int(p) for p in profile_ids] or [-1]
+            where += " AND profile_id IN (%s)" % ",".join("?" * len(pids))
+            args += pids
+        return where, args
+
+    def held_wishlist_rows(self, kind, tmdb_id, *, season_number=None, episode_number=None,
+                           profile_ids=None) -> list:
+        """the held rows of one title (a movie, or a show's episodes)."""
+        if not tmdb_id:
+            return []
+        where, args = self._held_where(kind, tmdb_id, season_number, episode_number, profile_ids)
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, profile_id, kind, tmdb_id, title, year, poster_url, season_number, "
+                "episode_number, episode_title, air_date, status FROM video_wishlist WHERE " + where +
+                " ORDER BY season_number, episode_number", args)]
+        except sqlite3.Error:
+            logger.exception("held_wishlist_rows failed")
+            return []
+        finally:
+            conn.close()
+
+    def wishlist_held(self, kind, tmdb_id, *, season_number=None, episode_number=None) -> bool:
+        """is any profile's row for this item held for a pick? the download
+        monitor asks before it retries a failed pick with another release.
+        True on a read error: never pick for an admin on a guess."""
+        if not tmdb_id:
+            return False
+        where, args = self._held_where(kind, tmdb_id, season_number, episode_number)
+        conn = self._get_connection()
+        try:
+            return conn.execute("SELECT 1 FROM video_wishlist WHERE " + where + " LIMIT 1",
+                                args).fetchone() is not None
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("wishlist_held failed")
+            return True
+        finally:
+            conn.close()
+
+    def release_held_wishlist(self, kind, tmdb_id, *, profile_ids=None, season_number=None,
+                              episode_number=None) -> int:
+        """held rows go back to the drain ("download it automatically
+        instead"). returns rows released."""
+        if not tmdb_id:
+            return 0
+        where, args = self._held_where(kind, tmdb_id, season_number, episode_number, profile_ids)
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("UPDATE video_wishlist SET awaiting_selection=0 WHERE " + where, args)
+            conn.commit()
+            return cur.rowcount
+        except sqlite3.Error:
+            logger.exception("release_held_wishlist failed")
+            return 0
+        finally:
+            conn.close()
+
     def approved_requests_awaiting_arrival(self) -> list:
         conn = self._get_connection()
         try:
@@ -12377,17 +13077,28 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def count_video_requests_since(self, profile_id, days) -> int:
+    def count_video_requests_since(self, profile_id, days, kinds=None) -> int | None:
         """how many requests a profile filed in the last ``days`` days (any
-        status: a declined ask still spent the quota)."""
+        status: a declined ask still spent the quota). counted from the
+        request log, so withdrawing a request or clearing it from the history
+        doesn't hand the ask back. ``kinds`` narrows it to those request
+        kinds (one limit's asks); a logged ask whose kind isn't known (from
+        before v75, its request gone) counts toward every limit. None when
+        the count can't be read: the caller treats that as no asks left."""
         conn = self._get_connection()
         try:
-            return int(conn.execute(
-                "SELECT COUNT(*) FROM video_requests WHERE profile_id=? "
-                "AND created_at >= datetime('now', ?)",
-                (int(profile_id), f"-{int(days)} days")).fetchone()[0])
+            sql = ("SELECT COUNT(*) FROM video_request_log WHERE profile_id=? "
+                   "AND created_at >= datetime('now', ?)")
+            args = [int(profile_id), f"-{int(days)} days"]
+            if kinds is not None:
+                kinds = [str(k) for k in kinds]
+                marks = ",".join("?" * len(kinds))
+                sql += (" AND (kind IS NULL OR kind IN (%s))" % marks) if kinds else " AND kind IS NULL"
+                args += kinds
+            return int(conn.execute(sql, args).fetchone()[0])
         except (sqlite3.Error, TypeError, ValueError):
-            return 0
+            logger.warning("video request count failed for profile %s", profile_id, exc_info=True)
+            return None
         finally:
             conn.close()
 
@@ -12622,7 +13333,7 @@ class VideoDatabase:
                 (int(profile_id), youtube_surrogate_id(cid), title, channel.get("avatar_url"), cid))
             conn.commit()
             if not (was and was["state"] == "follow"):
-                _publish_video_event("video_watchlist_added", {"kind": "channel", "title": title})
+                _publish_video_event("video_watchlist_added", {"kind": "channel", "title": title}, owner=profile_id)
             return True
         except Exception:
             logger.exception("add_channel_to_watchlist failed (%s)", cid)
@@ -12645,7 +13356,7 @@ class VideoDatabase:
             conn.commit()
             if was and cur.rowcount:
                 _publish_video_event("video_watchlist_removed",
-                                     {"kind": "channel", "title": was["title"] or ""})
+                                     {"kind": "channel", "title": was["title"] or ""}, owner=profile_id)
             return True
         finally:
             conn.close()
@@ -12844,7 +13555,7 @@ class VideoDatabase:
                 (int(profile_id), youtube_surrogate_id(pid), title, (playlist or {}).get("thumbnail_url"), pid))
             conn.commit()
             if not (was and was["state"] == "follow"):
-                _publish_video_event("video_watchlist_added", {"kind": "playlist", "title": title})
+                _publish_video_event("video_watchlist_added", {"kind": "playlist", "title": title}, owner=profile_id)
             return True
         except Exception:
             logger.exception("add_playlist_to_watchlist failed (%s)", pid)
@@ -12865,7 +13576,7 @@ class VideoDatabase:
             conn.commit()
             if was and cur.rowcount:
                 _publish_video_event("video_watchlist_removed",
-                                     {"kind": "playlist", "title": was["title"] or ""})
+                                     {"kind": "playlist", "title": was["title"] or ""}, owner=profile_id)
             return True
         finally:
             conn.close()
@@ -12963,7 +13674,7 @@ class VideoDatabase:
             conn.commit()
             if new_rows > 0:   # refresh-upserts of already-wished videos don't fire
                 _publish_video_event("video_wishlist_item_added",
-                                     {"kind": "youtube", "title": ctitle, "count": new_rows})
+                                     {"kind": "youtube", "title": ctitle, "count": new_rows}, owner=profile_id)
             return n
         except Exception:
             logger.exception("add_videos_to_wishlist failed (%s)", cid)
@@ -13247,26 +13958,47 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def youtube_wishlist_to_download(self, limit: int = 0, profile_id: int | None = None) -> list:
+    def youtube_wishlist_to_download(self, limit: int = 0, profile_id: int | None = None,
+                                     owner_may_download=None) -> list:
         """Flat list of wished YouTube videos for the fulfillment worker to grab, newest
         upload first. Each carries what organising + the download row need: the video id,
         its channel, the video title, thumbnail, and upload date. (A completed download
         removes its wishlist row, so this list naturally shrinks as the queue drains.)
 
         ``profile_id=None`` (default) covers ALL profiles — the drain feeds the
-        shared library. Pass a profile id to restrict to one profile's rows."""
+        shared library. Pass a profile id to restrict to one profile's rows.
+
+        ``owner_may_download(profile_id) -> bool``: a row a follow wished on its
+        own (auto_wish) is left out when its owner may not download. A row the
+        person wished themselves, or an approved request filed for them, stays."""
         conn = self._get_connection()
         try:
             pf, pargs = ("", []) if profile_id is None else ("AND profile_id=? ", [int(profile_id)])
             sql = ("SELECT source_id AS video_id, parent_source_id AS channel_id, "
                    "title AS channel_title, episode_title AS video_title, "
-                   "still_url AS thumbnail_url, air_date AS published_at "
+                   "still_url AS thumbnail_url, air_date AS published_at, "
+                   "profile_id AS _owner, "
+                   "(json_valid(detail_json) AND json_extract(detail_json, '$.auto_wish') = 1) AS _auto "
                    "FROM video_wishlist WHERE kind='video' AND source='youtube' "
                    + pf +
                    "AND source_id IS NOT NULL ORDER BY air_date DESC, id DESC")
-            if limit and int(limit) > 0:
+            if limit and int(limit) > 0 and owner_may_download is None:
                 sql += " LIMIT %d" % int(limit)
             rows = [dict(r) for r in conn.execute(sql, pargs)]
+            if owner_may_download is not None:
+                verdicts: dict = {}
+
+                def _allowed(owner) -> bool:
+                    if owner not in verdicts:
+                        verdicts[owner] = bool(owner_may_download(owner))
+                    return verdicts[owner]
+
+                rows = [r for r in rows if not r["_auto"] or _allowed(r["_owner"])]
+                if limit and int(limit) > 0:
+                    rows = rows[:int(limit)]
+            for r in rows:
+                r.pop("_owner", None)
+                r.pop("_auto", None)
             # Per-profile wishlists can hold the same video twice; the drain
             # feeds the shared library, so collapse to one row per video.
             return _dedupe_wishlist_by_media(rows, lambda r: ("video", r.get("video_id")))

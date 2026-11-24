@@ -7,9 +7,57 @@ import type { MirroredPipelineState } from '@/routes/sync/-sync.pipeline';
 
 import type { ShellProfileContext, ShellRouteDefinition, ShellPageId } from './bridge';
 
+/** the profile fields the sidebar rule reads (profile-nav.js) */
+interface SoulSyncNavProfile {
+  id: number;
+  is_admin: boolean;
+  can_download?: boolean;
+  allowed_pages?: string[] | null;
+  allowed_sides?: string | null;
+  home_page?: string | null;
+}
+
 declare global {
   interface Window {
-    showToast?: (message: string, type?: string, durationOrContext?: number | string) => void;
+    /** static/downloads.js. opts.history false shows the toast but keeps it
+     *  out of the notification panel and its journal: a refusal or a
+     *  progress line isn't something to come back to (#2191) */
+    showToast?: (
+      message: string,
+      type?: string,
+      durationOrContext?: number | string | null,
+      opts?: {
+        history?: boolean;
+        journal?: boolean;
+        /** a button on the toast (and on its line in the notification panel) */
+        action?: { label: string; run?: () => void; page?: string };
+      },
+    ) => void;
+    /** index.html: the signed-in profile the server rendered in, null when it knows none (#2156) */
+    SOULSYNC_BOOT_PROFILE?: SoulSyncNavProfile | null;
+    /** static/profile-nav.js: the sidebar's permission rule and the landing page (#2154, #2156) */
+    SoulSyncProfileNav?: {
+      MUSIC_LANDING: string[];
+      VIDEO_LANDING: string[];
+      normalizePageId: (pageId: string) => string;
+      allowedSides: (profile: SoulSyncNavProfile | null) => 'music' | 'video' | 'both';
+      navButtonVisible: (
+        profile: SoulSyncNavProfile | null,
+        pageId: string,
+        video: boolean,
+      ) => boolean;
+      apply: (profile: SoulSyncNavProfile | null, root?: Document) => void;
+      featureHiddenPages: () => string[];
+      landingPage: (opts: {
+        home?: string;
+        isAdmin?: boolean;
+        adminPage?: string;
+        order?: string[];
+        allowed?: (pageId: string) => boolean;
+        hidden?: string[];
+        fallback: string;
+      }) => string;
+    };
     /** core.js: the latest server-side active music download count from the status push. */
     __soulsyncMusicActiveDownloads?: number;
     /** src/shell/oidc-signin.ts: sign-in is OIDC only right now (#1839), from /api/auth/oidc/available. */
@@ -624,11 +672,32 @@ declare global {
     _mlmDeleteMatch?: (id: number) => Promise<void>;
     ServerActivity?: {
       toggle: () => void;
-      open: () => void;
+      open: (tab?: string) => void;
       close: () => void;
       refresh: () => Promise<unknown>;
       _onSocket: (d: unknown) => void;
       _wantsLive: () => boolean;
+      /** the open drawer hands each payload over, for the badge */
+      _sawActivity?: (d: unknown) => void;
+    };
+    /** the help sheet (features/help/host.tsx); the ? button's shim in helper.js opens it */
+    SoulSyncHelp?: {
+      open: (view?: string, params?: Record<string, string>) => void;
+      close: () => void;
+      toggle: () => void;
+      isOpen: () => boolean;
+      openSearch: () => void;
+    };
+    /** docs.js: open a docs article on the Help & Docs page */
+    navigateToDocsSection?: (id: string) => void;
+    /** the React drawer (features/server-activity/host.tsx); the shell opens it */
+    SoulSyncActivityDrawer?: {
+      open: (tab?: string) => void;
+      close: () => void;
+      toggle: () => void;
+      isOpen: () => boolean;
+      wantsLive: () => boolean;
+      push: (payload: unknown) => void;
     };
     SoulSyncActivitySocket?: {
       isConnected: () => boolean;
@@ -637,6 +706,8 @@ declare global {
     };
     SoulSyncVideo?: {
       openDetail?: (args: { kind: string; id: number | string; source?: string }) => void;
+      /** video-side.js videoPageAllowed: may this profile open a video page */
+      pageAllowed?: (pageId: string) => boolean;
     };
     /** video-download-view.js: the shared release-picker modal (manual search). */
     VideoDownload?: {
@@ -647,6 +718,18 @@ declare global {
         episode?: number | null;
         year?: number | string | null;
         poster?: string | null;
+        /** the title's id for the grab: a tmdb id with mediaSource 'tmdb' */
+        mediaId?: number | string | null;
+        mediaSource?: string | null;
+        tmdbId?: number | string | null;
+        /** a show's seasons: the modal then offers whole series, a season or an episode (#2233) */
+        seasons?: Array<{
+          season: number;
+          title?: string | null;
+          total?: number;
+          have?: number;
+          episodes?: Array<{ episode: number; title?: string | null; have?: boolean }>;
+        }>;
       }) => void;
     };
     /** video-poster-modal.js: the poster manager (search, then pick art). */
@@ -878,10 +961,6 @@ declare global {
     showLaunchPinScreen?: () => void;
     checkForActiveProcesses?: () => Promise<void>;
     updateDashboardDownloads?: () => void;
-
-    /** Ask the tools page to show whichever tab holds `selector`. True when it
-     *  had to switch, so the caller knows to wait a frame before measuring. */
-    revealToolsTabFor?: (selector: string) => boolean;
   }
 }
 

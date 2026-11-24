@@ -13,11 +13,13 @@ never land it in someone else's playlist.
 import os
 
 from flask import Blueprint, jsonify, request, send_file
+from core.connect.device_access import device_playback
 
 from core.playlists import auto_identify
 from core.playlists import user_playlists as up
 from core.profile_context import get_current_profile_id
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("web_server")
 
@@ -67,6 +69,7 @@ def _not_found():
 
 
 @bp.route('/api/user-playlists', methods=['GET'])
+@requires("music.access")
 def list_user_playlists():
     try:
         database = get_database()
@@ -88,6 +91,7 @@ def list_user_playlists():
 
 
 @bp.route('/api/user-playlists', methods=['POST'])
+@requires("music.access")
 def create_user_playlist():
     data = request.get_json(silent=True) or {}
     try:
@@ -112,6 +116,8 @@ def create_user_playlist():
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/tracks', methods=['POST'])
+@device_playback
+@requires("music.access")
 def add_user_playlist_tracks(playlist_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -141,6 +147,8 @@ def _tracks_arg(data):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/tracks/remove', methods=['POST'])
+@device_playback
+@requires("music.access")
 def remove_matching_user_playlist_tracks(playlist_id):
     """the picker's untick: drop these songs wherever they are in the list."""
     data = request.get_json(silent=True) or {}
@@ -161,6 +169,7 @@ def remove_matching_user_playlist_tracks(playlist_id):
 
 
 @bp.route('/api/user-playlists/membership', methods=['POST'])
+@requires("music.access")
 def user_playlist_membership():
     """which of your playlists already have these songs, for the picker's ticks."""
     data = request.get_json(silent=True) or {}
@@ -181,6 +190,8 @@ def user_playlist_membership():
 
 
 @bp.route('/api/user-playlists/liked', methods=['POST'])
+@device_playback
+@requires("music.access")
 def like_songs():
     data = request.get_json(silent=True) or {}
     tracks = _tracks_arg(data)
@@ -199,6 +210,8 @@ def like_songs():
 
 
 @bp.route('/api/user-playlists/liked/remove', methods=['POST'])
+@device_playback
+@requires("music.access")
 def unlike_songs():
     data = request.get_json(silent=True) or {}
     tracks = _tracks_arg(data)
@@ -214,6 +227,7 @@ def unlike_songs():
 
 
 @bp.route('/api/user-playlists/from-mirror/<int:mirror_id>', methods=['POST'])
+@requires("music.access")
 def copy_mirror_to_user_playlist(mirror_id):
     """make a mirrored playlist yours: an editable copy in My Playlists. the
     mirror itself is untouched and keeps syncing from its source."""
@@ -236,6 +250,7 @@ def copy_mirror_to_user_playlist(mirror_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/tracks/<int:position>', methods=['DELETE'])
+@requires("music.access")
 def remove_user_playlist_track(playlist_id, position):
     try:
         database = get_database()
@@ -252,6 +267,7 @@ def remove_user_playlist_track(playlist_id, position):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/order', methods=['PUT'])
+@requires("music.access")
 def reorder_user_playlist(playlist_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -272,6 +288,7 @@ def reorder_user_playlist(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>', methods=['PATCH'])
+@requires("music.access")
 def update_user_playlist(playlist_id):
     """description for now; rename stays on the mirrored custom-name route."""
     data = request.get_json(silent=True) or {}
@@ -292,6 +309,7 @@ def update_user_playlist(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/duplicate', methods=['POST'])
+@requires("music.access")
 def duplicate_user_playlist(playlist_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -312,6 +330,7 @@ def duplicate_user_playlist(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/cover', methods=['POST'])
+@requires("music.access")
 def upload_user_playlist_cover(playlist_id):
     """multipart 'file': any image pillow reads, re-encoded to a square webp."""
     f = request.files.get('file')
@@ -334,6 +353,7 @@ def upload_user_playlist_cover(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/cover', methods=['PUT'])
+@requires("music.access")
 def set_user_playlist_cover(playlist_id):
     """JSON: {"image_url": "<http(s) url>"} or {"from_track": <1-based position>}."""
     data = request.get_json(silent=True) or {}
@@ -357,6 +377,7 @@ def set_user_playlist_cover(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/cover', methods=['DELETE'])
+@requires("music.access")
 def clear_user_playlist_cover(playlist_id):
     try:
         database = get_database()
@@ -373,6 +394,7 @@ def clear_user_playlist_cover(playlist_id):
 
 
 @bp.route('/api/user-playlists/<int:playlist_id>/cover', methods=['GET'])
+@requires("music.access")
 def get_user_playlist_cover(playlist_id):
     # Reads are NOT owner-scoped: the media-server sync fetches this URL with
     # no session (and Plex fetches it server-side), so get_current_profile_id()

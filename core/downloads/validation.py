@@ -30,13 +30,15 @@ logger = get_logger("downloads.validation")
 matching_engine = None
 download_orchestrator = None
 
-# Structured-metadata sources. Soulseek peers use the sharing username, so they
-# are everything else. A mixed best-quality pool must score each family with
-# its own checker — not whoever happens to be results[0].
-_STREAMING_USERNAMES = frozenset({
-    'youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl', 'soundcloud',
-    'amazon', 'torrent', 'usenet',
-})
+# Structured-metadata sources: their rows carry real artist/title/album fields,
+# so they are scored on those fields instead of on a Soulseek-style filename.
+# Soulseek peers use the sharing username, so they are everything else. A mixed
+# best-quality pool must score each family with its own checker, not whoever
+# happens to be results[0]. This used to be its own copy and lacked 'lidarr',
+# so Lidarr rows (filename "<album mbid>||Artist - Album") went through filename
+# matching and scored 0.0 against every wanted track (#2215): it is the shared
+# set now.
+from core.downloads.source_policy import STREAMING_SOURCE_NAMES as _STREAMING_USERNAMES  # noqa: E402
 
 
 # words a lot of artist names start with. "lil yee" vs "lil jon" scored 0.57
@@ -685,7 +687,10 @@ def _score_streaming_candidates(results, spotify_track, why=None):
         # level releases a fair shot. The Auto-Import sweep then picks
         # the right file out of the downloaded album folder.
         expected_album = getattr(spotify_track, 'album', None) if spotify_track else None
-        if r.username in ('torrent', 'usenet') and expected_album:
+        # Lidarr is an album grabber too, and its album/lookup carries no track
+        # lists (only trackCount), so a Lidarr row is the album itself: titled
+        # with the album name, like a torrent / usenet release.
+        if r.username in ('torrent', 'usenet', 'lidarr') and expected_album:
             album_conf, _ = matching_engine.score_track_match(
                 source_title=expected_album,
                 source_artists=expected_artists,
@@ -782,6 +787,23 @@ def _score_streaming_candidates(results, spotify_track, why=None):
             if _best_artist < 0.5 and _credited_in_title(
                     expected_artists, _cand_artist_raw, r.title):
                 _best_artist = 1.0
+            # #2249: YouTube Topic channels often use romanized artist names (e.g.
+            # "Saishinonana - Topic" for "彩糸乃七"). Check MusicBrainz/known aliases
+            # before rejecting YouTube results on artist score.
+            if r.username == 'youtube' and _best_artist < 0.5 and expected_artists:
+                try:
+                    _yt_aliases = list(_artist_aliases(expected_artists[0]) or [])
+                except Exception:
+                    _yt_aliases = []
+                for _al in _yt_aliases:
+                    _al_norm = matching_engine.normalize_string(str(_al or ''))
+                    if not _al_norm:
+                        continue
+                    if _al_norm == _cand_artist or (
+                        len(_al_norm) > 2 and _re.search(r'\b' + _re.escape(_al_norm) + r'\b', _cand_artist)
+                    ) or _fuzzy_artist_similarity(_al_norm, _cand_artist) >= 0.5:
+                        _best_artist = 1.0
+                        break
             # Raised from 0.4 → 0.5 to close a fencepost bug: SequenceMatcher
             # returns exactly 0.400 for "maduk" vs "tom walker" (5 chars vs
             # 10 chars with 2 coincidental char matches), which bypassed the

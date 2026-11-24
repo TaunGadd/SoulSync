@@ -159,7 +159,25 @@ def _raw_audio_save(audio_file: Any, symbols: Any, target: Any = None) -> None:
         kwargs = {'v2_version': 4} if isinstance(audio_file, (AIFF, WAVE)) else {'v1': 0, 'v2_version': 4}
         audio_file.save(**kwargs) if target is None else audio_file.save(target, **kwargs)
     elif isinstance(audio_file, symbols.FLAC):
-        audio_file.save(deleteid3=True) if target is None else audio_file.save(target, deleteid3=True)
+        # Mutagen removes the last 128 bytes when deleteid3=True
+        # and they begin with TAG. This can conflict with atomic
+        # audio integrity verification and may truncate audio if
+        # the signature occurs naturally in the stream.
+        path = target if target is not None else audio_file.filename
+        deleteid3 = True
+        try:
+            with open(path, "rb") as f:
+                f.seek(-128, 2)
+                if f.read(3) == b"TAG":
+                    deleteid3 = False
+        except (OSError, TypeError, ValueError):
+            # If we cannot inspect the footer, avoid deleting it.
+            deleteid3 = False
+
+        if target is None:
+            audio_file.save(deleteid3=deleteid3)
+        else:
+            audio_file.save(target, deleteid3=deleteid3)
     else:
         audio_file.save() if target is None else audio_file.save(target)
 
@@ -324,6 +342,10 @@ def save_audio_file(audio_file: Any, symbols: Any) -> bool:
         path = None
     if path and _locked_against_tag_writes(path):
         return False
+    if path:
+        # the folder watcher leaves a file SoulSync is retagging alone
+        from core.library import own_writes
+        own_writes.note(path)
     if not path or not os.path.isfile(path):
         _raw_audio_save(audio_file, symbols)
         return True
@@ -338,14 +360,20 @@ def save_audio_file(audio_file: Any, symbols: Any) -> bool:
         shutil.copy2(path, tmp)               # snapshot original (audio + tags)
         _raw_audio_save(audio_file, symbols, target=tmp)  # write new tags into the copy
 
-        check = symbols.File(tmp)             # 1) still a parseable audio file?
+        # The staging filename ends in .sstmp, which can cause
+        # Mutagen's format detection to misidentify valid FLAC files.
+        # Reuse the known FLAC parser without changing the staging suffix.
+        flac_cls = getattr(symbols, "FLAC", None)
+        if flac_cls is not None and isinstance(audio_file, flac_cls):
+            check = flac_cls(tmp)
+        else:
+            check = symbols.File(tmp)
         if check is None:
             raise _AudioIntegrityError("temp is not a parseable audio file")
 
         # 2) audio stream intact? FLAC → exact frame byte-compare (definitive,
         #    and robust to legit unknown-length STREAMINFO); other formats →
         #    structural signature + duration vs the ORIGINAL.
-        flac_cls = getattr(symbols, "FLAC", None)
         if flac_cls is not None and isinstance(audio_file, flac_cls):
             identical = _flac_audio_identical(path, tmp)
             if identical is False:
